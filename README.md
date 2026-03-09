@@ -12,7 +12,7 @@ Edge voice pipelines need sub-second latency. Cloud TTS/ASR adds 200-500ms netwo
 | **ASR (offline)** | SenseVoice 5-lang | ~200ms | Batch mode, lazy-loaded |
 | **TTS** | Kokoro v1.1 | ~130ms TTFT | 7.5x realtime, streaming PCM |
 
-Total voice-to-voice: **~400ms** (ASR finalize + TTS first chunk), competitive with cloud APIs but fully offline.
+ASR + TTS combined: **~180ms** (ASR finalize + TTS first chunk). Full voice-to-voice latency depends on LLM inference time (not included here).
 
 ## Quick Start
 
