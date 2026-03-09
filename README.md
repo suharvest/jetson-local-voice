@@ -1,25 +1,45 @@
 # Jetson Voice
 
-Turn a Jetson into a local voice device — GPU-accelerated ASR + TTS, zero cloud dependency.
+**~110ms ASR + TTS on edge devices — GPU-accelerated voice stack powered by [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), zero cloud dependency.**
 
-## Why Jetson?
+[![sherpa-onnx](https://img.shields.io/badge/speech-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
+[![Docker](https://img.shields.io/badge/deploy-Docker-blue.svg)](https://www.docker.com/)
+[![Jetson](https://img.shields.io/badge/platform-Jetson%20Orin-76b900.svg)](https://developer.nvidia.com/embedded-computing)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Edge voice pipelines need sub-second latency. Cloud TTS/ASR adds 200-500ms network round-trip before the first audio byte. Jetson Orin NX with CUDA runs the full voice stack locally:
+<!-- TODO: Add a demo GIF showing curl commands hitting the API and getting ASR/TTS results -->
+
+Turn any CUDA-capable edge device into a local voice server. Jetson Voice wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models (Paraformer ASR, Matcha TTS, SenseVoice) in a FastAPI service with HTTP and WebSocket endpoints. Clients send audio, get text back (and vice versa) — no cloud, no API keys, sub-200ms latency.
+
+### Latency (Jetson Orin NX 16GB, CUDA 12.6, MAXN)
 
 | Stage | Model | Latency | Note |
 |-------|-------|---------|------|
-| **ASR (streaming)** | Paraformer zh+en | ~50ms TTFT | Real-time, partial results via WebSocket |
-| **ASR (offline)** | SenseVoice 5-lang | ~200ms | Batch mode, lazy-loaded |
-| **TTS** | Kokoro v1.1 | ~130ms TTFT | 7.5x realtime, streaming PCM |
+| **ASR** | Paraformer zh+en (streaming) | ~50ms TTFT | Primary. Real-time partial results via WebSocket |
+| **TTS** | Matcha-TTS + Vocos (streaming) | ~60ms TTFT | Primary. Best Chinese quality, streaming PCM |
+| ASR (fallback) | SenseVoice 5-lang | ~200ms | Batch mode, offline, lazy-loaded |
 
-ASR + TTS combined: **~180ms** (ASR finalize + TTS first chunk). Full voice-to-voice latency depends on LLM inference time (not included here).
+ASR + TTS combined: **~110ms** (ASR finalize + TTS first chunk). Full voice-to-voice latency depends on LLM inference time (not included here).
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Services](#services)
+- [API Reference](#api-reference)
+- [Performance](#performance)
+- [Configuration](#configuration)
+- [Patched sherpa-onnx](#patched-sherpa-onnx)
+- [Requirements](#requirements)
+- [Project Structure](#project-structure)
+- [Acknowledgements](#acknowledgements)
 
 ## Quick Start
 
 ```bash
-# On Jetson (JetPack 6.2)
-git clone <this-repo>
-cd jetson-voice
+# On Jetson (JetPack 6.2) or any CUDA device with Docker
+git clone https://github.com/suharvest/jetson-local-voice.git
+cd jetson-local-voice
 
 # Build & run
 docker compose build
@@ -41,8 +61,8 @@ Models (~1.5 GB total) are auto-downloaded on first start.
 │  FastAPI service (:8000)                         │
 │  ├── WS /asr/stream    Paraformer streaming ASR  │
 │  ├── POST /asr          SenseVoice offline ASR   │
-│  ├── POST /tts          Kokoro batch TTS         │
-│  └── POST /tts/stream   Kokoro streaming TTS     │
+│  ├── POST /tts          Matcha batch TTS         │
+│  └── POST /tts/stream   Matcha streaming TTS     │
 │                                                  │
 │  sherpa-onnx + ONNX Runtime 1.20 (CUDA)          │
 └──────────────────────────────────────────────────┘
@@ -55,18 +75,18 @@ The service is model-agnostic at the API level — clients send audio/text, get 
 
 ## Services
 
-| Service | Model | Endpoint | Protocol |
-|---------|-------|----------|----------|
-| Streaming ASR | Paraformer bilingual zh+en | `WS /asr/stream` | WebSocket: int16 PCM in, JSON out |
-| Offline ASR | SenseVoice zh+en+ja+ko+yue | `POST /asr` | HTTP: WAV upload, JSON out |
-| TTS | Kokoro v1.1 multilingual | `POST /tts` | HTTP: JSON in, WAV out |
-| TTS Streaming | Kokoro v1.1 multilingual | `POST /tts/stream` | HTTP: JSON in, raw PCM stream |
+| Service | Model | Endpoint | Protocol | Role |
+|---------|-------|----------|----------|------|
+| **Streaming ASR** | Paraformer bilingual zh+en | `WS /asr/stream` | WebSocket: int16 PCM in, JSON out | Primary ASR |
+| **Streaming TTS** | Matcha-TTS + Vocos zh+en | `POST /tts/stream` | HTTP: JSON in, raw PCM stream | Primary TTS |
+| Batch TTS | Matcha-TTS + Vocos zh+en | `POST /tts` | HTTP: JSON in, WAV out | |
+| Offline ASR | SenseVoice zh+en+ja+ko+yue | `POST /asr` | HTTP: WAV upload, JSON out | Fallback |
 
 ## API Reference
 
 ### Streaming ASR (WebSocket)
 
-```
+```text
 WS /asr/stream?sample_rate=16000&language=auto
 ```
 
@@ -109,14 +129,14 @@ Parameters: `text` (required), `sid` (speaker ID, default 3), `speed` (rate, def
 
 Returns raw PCM: first 4 bytes = sample rate (uint32 LE), then int16 samples.
 
-```
+```text
 POST /tts/stream
 Content-Type: application/json
 ```
 
 ### Health Check
 
-```
+```text
 GET /health  →  {"asr": bool, "tts": bool, "streaming_asr": bool}
 ```
 
@@ -129,18 +149,17 @@ GET /health  →  {"asr": bool, "tts": bool, "streaming_asr": bool}
 | Paraformer TTFT | ~50ms |
 | Paraformer finalize | ~45ms |
 | Paraformer accuracy | 80.8% (26 synthetic sentences) |
-| Kokoro TTS RTF | 0.133 (7.5x realtime) |
-| Kokoro TTS TTFT | ~130ms (short text) |
-| Kokoro TTS latency | ~1s (typical Chinese sentence) |
+| Matcha TTS TTFT | ~60ms (short text) |
+| Matcha TTS latency | ~150ms (typical Chinese sentence) |
 
 ### TTS Model Comparison
 
-We evaluated 4 TTS models for TTFT (time-to-first-audio-chunk). Kokoro was selected for best latency-quality tradeoff:
+We evaluated 4 TTS models for TTFT (time-to-first-audio-chunk). Matcha-TTS was selected for best Chinese quality and lowest latency:
 
-| Model | TTFT (short) | TTFT (long) | Quality | Selected |
-|-------|-------------|-------------|---------|----------|
-| **Kokoro v1.1** | ~130ms | ~300ms | Good | Yes |
-| Matcha-TTS | ~60ms | ~150ms | Fair | No (quality) |
+| Model | TTFT (short) | TTFT (long) | Chinese Quality | Selected |
+|-------|-------------|-------------|-----------------|----------|
+| **Matcha-TTS + Vocos** | ~60ms | ~150ms | Good | **Yes** |
+| Kokoro v1.1 | ~130ms | ~300ms | Fair | No (Chinese quality) |
 | CosyVoice3 | ~800ms | ~2s | Excellent | No (latency) |
 | F5-TTS | ~2.5s | ~5s | Excellent | No (latency) |
 
@@ -177,9 +196,9 @@ Auto-downloaded on first start via `scripts/download_models.sh`:
 
 | Model | Size | Purpose |
 |-------|------|---------|
-| SenseVoice zh-en-ja-ko-yue | ~500 MB | Offline ASR (5 languages) |
 | Paraformer streaming zh-en | ~230 MB | Streaming ASR (bilingual) |
-| Kokoro v1.1 multilingual | ~800 MB | TTS synthesis |
+| Matcha-TTS + Vocos zh-en | ~125 MB | TTS synthesis |
+| SenseVoice zh-en-ja-ko-yue | ~500 MB | Offline ASR (5 languages) |
 
 ## Patched sherpa-onnx
 
@@ -194,19 +213,19 @@ See `patches/README.md` for rebuild instructions.
 
 ## Requirements
 
-- Jetson Orin NX 16GB (JetPack 6.2, CUDA 12.6)
+- Jetson Orin NX 16GB (JetPack 6.2, CUDA 12.6) — or any CUDA-capable device with Docker
 - Docker with `nvidia` runtime
 - ~5 GB disk for models
 
 ## Project Structure
 
-```
-jetson-voice/
+```text
+jetson-local-voice/
 ├── app/                     # FastAPI service
 │   ├── main.py              # Endpoints and startup
 │   ├── asr_service.py       # SenseVoice offline ASR
 │   ├── streaming_asr_service.py  # Paraformer streaming ASR
-│   ├── tts_service.py       # Kokoro TTS (batch + streaming)
+│   ├── tts_service.py       # Matcha TTS (batch + streaming)
 │   └── vc_service.py        # Voice conversion (experimental)
 ├── benchmarks/              # TTS model TTFT comparisons
 │   ├── test_f5tts_ttft.py   # F5-TTS vs Kokoro TTFT
@@ -219,3 +238,11 @@ jetson-voice/
 ├── docker-compose.yml       # nvidia runtime, GPU, model volume
 └── setup-performance.sh     # Jetson clock/power tuning
 ```
+
+## Acknowledgements
+
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — speech inference engine powering all ASR and TTS models
+- [next-gen Kaldi](https://github.com/k2-fsa) — the research foundation behind sherpa-onnx
+- [Paraformer](https://github.com/modelscope/FunASR) — streaming bilingual ASR model
+- [Matcha-TTS](https://github.com/shivammehta25/Matcha-TTS) — fast flow-matching TTS
+- [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) — multilingual offline ASR
