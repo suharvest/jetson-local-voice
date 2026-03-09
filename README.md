@@ -7,9 +7,13 @@
 [![Jetson](https://img.shields.io/badge/platform-Jetson%20Orin-76b900.svg)](https://developer.nvidia.com/embedded-computing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-<!-- TODO: Add a demo GIF showing curl commands hitting the API and getting ASR/TTS results -->
+<p align="center">
+  <img src="media/hero.png" alt="Jetson Voice — 50ms ASR + 60ms TTS on edge" width="640" />
+</p>
 
-Turn any CUDA-capable edge device into a local voice server. Jetson Voice wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models (Paraformer ASR, Matcha TTS, SenseVoice) in a FastAPI service with HTTP and WebSocket endpoints. Clients send audio, get text back (and vice versa) — no cloud, no API keys, sub-200ms latency.
+Turn any CUDA device into a local voice server. Speak into it, get text back in 50ms. Send text, get speech in 60ms. No cloud, no API keys, no internet needed.
+
+Jetson Voice wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models (Paraformer ASR, Matcha TTS, SenseVoice) in a FastAPI service with HTTP and WebSocket endpoints — deploy with one `docker compose up`.
 
 ### Latency (Jetson Orin NX 16GB, CUDA 12.6, MAXN)
 
