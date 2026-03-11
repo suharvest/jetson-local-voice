@@ -40,10 +40,28 @@ ASR + TTS combined: **~110ms** (ASR finalize + TTS first chunk). Full voice-to-v
 
 ## Quick Start
 
+### Option 1: Pre-built Image (Recommended)
+
+Pull and run the pre-built image — all dependencies and models are baked in, no build or download needed:
+
 ```bash
-# On Jetson (JetPack 6.2) or any CUDA device with Docker
-git clone https://github.com/suharvest/jetson-local-voice.git
-cd jetson-local-voice
+docker run -d --name jetson-voice \
+  --runtime nvidia --ipc host \
+  -p 8621:8000 \
+  -e TTS_DEFAULT_SID=0 \
+  --restart unless-stopped \
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
+
+# Wait ~40s for model warmup, then verify
+curl http://localhost:8621/health
+# {"asr":false,"tts":true,"streaming_asr":true}
+```
+
+### Option 2: Build from Source
+
+```bash
+git clone https://github.com/Seeed-Projects/jetson-voice.git
+cd jetson-voice
 
 # Build & run
 docker compose build
