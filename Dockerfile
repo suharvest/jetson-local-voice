@@ -1,5 +1,7 @@
-# Jetson Voice Assistant — all-in-one image (ASR + TTS + models baked in)
-# Matcha TTS + Paraformer streaming ASR, CUDA accelerated
+# Jetson Voice — GPU-accelerated speech service
+# Models are NOT baked in — downloaded on first start based on LANGUAGE_MODE.
+# zh_en (default): Matcha TTS + Paraformer ASR (~930 MB)
+# en:              Kokoro TTS + Zipformer ASR  (~590 MB)
 # Base: dustynv onnxruntime with CUDAExecutionProvider (JP6.x, CUDA 12.6)
 FROM dustynv/onnxruntime:1.20-r36.4.0
 
@@ -22,9 +24,10 @@ RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
 # sherpa-onnx CUDA wheel for aarch64
 # The +cuda wheel bundles onnxruntime 1.11.0 (CUDA 10/11).
 # We patch it below to use the system's onnxruntime 1.20.0 (CUDA 12.6).
-ARG SHERPA_ONNX_VERSION=1.12.28
-ARG SHERPA_WHEEL_URL=https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/main/cuda/${SHERPA_ONNX_VERSION}/sherpa_onnx-${SHERPA_ONNX_VERSION}+cuda-cp310-cp310-linux_aarch64.whl
-RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple "${SHERPA_WHEEL_URL}"
+# Wheel is pre-downloaded (HuggingFace may be unreachable from some networks).
+COPY wheels/sherpa_onnx-*-cp310-cp310-linux_aarch64.whl /tmp/
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple /tmp/sherpa_onnx-*.whl && \
+    rm /tmp/sherpa_onnx-*.whl
 
 # Patch sherpa-onnx to use system onnxruntime with CUDA 12.6
 COPY scripts/patch_sherpa_ort.py /tmp/
@@ -46,20 +49,9 @@ RUN apt-get purge -y patchelf && apt-get autoremove -y && \
 # Application code
 COPY app/ /opt/speech/app/
 
-# Bake in models — separate layers to stay under registry upload limits
-ARG CDN=https://sensecraft-statics.seeed.cc/solution-app/jetson-voice
-RUN apt-get update && apt-get install -y --no-install-recommends wget && \
-    rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /opt/models && \
-    wget -qO- "${CDN}/models-matcha.tar.gz" | tar xzf - -C /opt/models && \
-    apt-get purge -y wget && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /tmp/*
-
-RUN apt-get update && apt-get install -y --no-install-recommends wget && \
-    rm -rf /var/lib/apt/lists/* && \
-    wget -qO- "${CDN}/models-paraformer.tar.gz" | tar xzf - -C /opt/models && \
-    apt-get purge -y wget && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /tmp/*
+# No models baked in — model_downloader.py auto-downloads on first start
+# based on LANGUAGE_MODE env var. Models cached in /opt/models volume.
+RUN mkdir -p /opt/models
 
 ENV MODEL_DIR=/opt/models \
     NVIDIA_VISIBLE_DEVICES=all \

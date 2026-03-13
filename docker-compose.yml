@@ -9,6 +9,8 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - TTS_PROVIDER=cuda
       - TTS_DEFAULT_SID=3
+      # Language mode: "zh_en" (Chinese+English, default) or "en" (English only)
+      - LANGUAGE_MODE=${LANGUAGE_MODE:-zh_en}
       - SENSEVOICE_LANGUAGE=auto
       # CUDA perf: lazy module loading reduces init time & memory
       - CUDA_MODULE_LOADING=LAZY

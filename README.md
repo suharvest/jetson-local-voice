@@ -42,19 +42,33 @@ ASR + TTS combined: **~110ms** (ASR finalize + TTS first chunk). Full voice-to-v
 
 ### Option 1: Pre-built Image (Recommended)
 
-Pull and run the pre-built image — all dependencies and models are baked in, no build or download needed:
+Pull and run the pre-built image. Models are auto-downloaded on first start (~1 min) and cached in a volume:
+
+```bash
+# Chinese + English (default)
+docker run -d --name jetson-voice \
+  --runtime nvidia --ipc host \
+  -p 8621:8000 \
+  -v jetson-voice-models:/opt/models \
+  --restart unless-stopped \
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
+
+# First start downloads models (~930 MB), then ~40s warmup
+curl http://localhost:8621/health
+# {"asr":false,"tts":true,"streaming_asr":true}
+```
+
+**English-only mode** (Kokoro TTS + Zipformer ASR, ~590 MB):
 
 ```bash
 docker run -d --name jetson-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
-  -e TTS_DEFAULT_SID=0 \
+  -e LANGUAGE_MODE=en \
+  -e TTS_DEFAULT_SID=8 \
+  -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
   sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
-
-# Wait ~40s for model warmup, then verify
-curl http://localhost:8621/health
-# {"asr":false,"tts":true,"streaming_asr":true}
 ```
 
 ### Option 2: Build from Source
@@ -203,6 +217,7 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English) or `en` (English only) |
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
 | `TTS_DEFAULT_SID` | `3` | Default TTS speaker ID |
 | `TTS_NUM_THREADS` | `4` | TTS inference threads |
@@ -216,11 +231,13 @@ Copy `.env.example` to `.env` to customize.
 
 Auto-downloaded on first start via `scripts/download_models.sh`:
 
-| Model | Size | Purpose |
-|-------|------|---------|
-| Paraformer streaming zh-en | ~230 MB | Streaming ASR (bilingual) |
-| Matcha-TTS + Vocos zh-en | ~125 MB | TTS synthesis |
-| SenseVoice zh-en-ja-ko-yue | ~500 MB | Offline ASR (5 languages) |
+| Model | Size | Mode | Purpose |
+|-------|------|------|---------|
+| Paraformer streaming zh-en | ~230 MB | `zh_en` | Streaming ASR (bilingual) |
+| Matcha-TTS + Vocos zh-en | ~125 MB | `zh_en` | TTS synthesis |
+| Zipformer streaming en | ~65 MB | `en` | Streaming ASR (English only) |
+| Kokoro TTS en v0.19 | ~330 MB | `en` | TTS synthesis (English, 11 speakers) |
+| SenseVoice zh-en-ja-ko-yue | ~500 MB | both | Offline ASR (5 languages) |
 
 ## Patched sherpa-onnx
 
