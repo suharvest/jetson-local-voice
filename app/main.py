@@ -21,11 +21,17 @@ app = FastAPI(title="Jetson Speech Service", version="1.0.0")
 class TTSRequest(BaseModel):
     text: str
     sid: int | None = None
-    speed: float = 1.0
+    speed: float | None = None
 
 
 @app.on_event("startup")
 async def startup():
+    # Ensure models are downloaded for current LANGUAGE_MODE
+    import model_downloader
+    mode = os.environ.get("LANGUAGE_MODE", "zh_en")
+    model_dir = os.environ.get("MODEL_DIR", "/opt/models")
+    model_downloader.ensure_models(mode, model_dir)
+
     import tts_service
 
     logger.info("Pre-loading TTS model...")

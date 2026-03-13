@@ -1,7 +1,8 @@
-"""Matcha TTS service using sherpa-onnx (CUDA accelerated).
+"""TTS service using sherpa-onnx (CUDA accelerated).
 
-Matcha TTS + Vocos vocoder: lightweight (125MB), fast TTFT (~60ms streaming),
-sentence-level streaming via sherpa-onnx callback.
+Supports two modes via LANGUAGE_MODE env var:
+  - "zh_en" (default): Matcha TTS + Vocos (Chinese+English, multi-speaker)
+  - "en": Kokoro TTS (English only, 11 speakers, default bf_isabella sid=8)
 """
 
 from __future__ import annotations
@@ -14,45 +15,66 @@ import time
 
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = os.environ.get("TTS_MODEL_DIR", "/opt/models/matcha-icefall-zh-en")
+LANGUAGE_MODE = os.environ.get("LANGUAGE_MODE", "zh_en")  # "zh_en" or "en"
+_DEFAULT_TTS_DIRS = {
+    "zh_en": "/opt/models/matcha-icefall-zh-en",
+    "en": "/opt/models/kokoro-en-v0_19",
+}
+MODEL_DIR = os.environ.get("TTS_MODEL_DIR", _DEFAULT_TTS_DIRS.get(LANGUAGE_MODE, _DEFAULT_TTS_DIRS["zh_en"]))
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "cuda")
 TTS_NUM_THREADS = int(os.environ.get("TTS_NUM_THREADS", "4"))
-DEFAULT_SPEAKER_ID = int(os.environ.get("TTS_DEFAULT_SID", "0"))
+# Default speaker: zh_en=0 (matcha), en=8 (kokoro bf_isabella)
+_DEFAULT_SIDS = {"zh_en": "0", "en": "8"}
+DEFAULT_SPEAKER_ID = int(os.environ.get("TTS_DEFAULT_SID", _DEFAULT_SIDS.get(LANGUAGE_MODE, "0")))
+DEFAULT_SPEED = float(os.environ.get("TTS_DEFAULT_SPEED", "1.0"))
 
 _tts_instance = None
 
 
 def get_tts():
-    """Lazy-initialize Matcha TTS model."""
+    """Lazy-initialize TTS model (Matcha or Kokoro based on LANGUAGE_MODE)."""
     global _tts_instance
     if _tts_instance is not None:
         return _tts_instance
 
     import sherpa_onnx
 
-    acoustic_model = os.path.join(MODEL_DIR, "model-steps-3.onnx")
-    vocoder = os.path.join(MODEL_DIR, "vocos-16khz-univ.onnx")
-    lexicon = os.path.join(MODEL_DIR, "lexicon.txt")
-    tokens = os.path.join(MODEL_DIR, "tokens.txt")
-    data_dir = os.path.join(MODEL_DIR, "espeak-ng-data")
-
-    logger.info("Loading Matcha TTS from %s (provider=%s)", MODEL_DIR, TTS_PROVIDER)
-    config = sherpa_onnx.OfflineTtsConfig(
-        model=sherpa_onnx.OfflineTtsModelConfig(
-            matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-                acoustic_model=acoustic_model,
-                vocoder=vocoder,
-                lexicon=lexicon,
-                tokens=tokens,
-                data_dir=data_dir,
-                dict_dir=MODEL_DIR,
+    if LANGUAGE_MODE == "en":
+        # Kokoro English TTS
+        logger.info("Loading Kokoro TTS from %s (provider=%s)", MODEL_DIR, TTS_PROVIDER)
+        config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                    model=os.path.join(MODEL_DIR, "model.onnx"),
+                    voices=os.path.join(MODEL_DIR, "voices.bin"),
+                    tokens=os.path.join(MODEL_DIR, "tokens.txt"),
+                    data_dir=os.path.join(MODEL_DIR, "espeak-ng-data"),
+                    dict_dir=MODEL_DIR,
+                ),
+                provider=TTS_PROVIDER,
+                num_threads=TTS_NUM_THREADS,
             ),
-            provider=TTS_PROVIDER,
-            num_threads=TTS_NUM_THREADS,
-        ),
-    )
+        )
+    else:
+        # Matcha Chinese+English TTS
+        logger.info("Loading Matcha TTS from %s (provider=%s)", MODEL_DIR, TTS_PROVIDER)
+        config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                    acoustic_model=os.path.join(MODEL_DIR, "model-steps-3.onnx"),
+                    vocoder=os.path.join(MODEL_DIR, "vocos-16khz-univ.onnx"),
+                    lexicon=os.path.join(MODEL_DIR, "lexicon.txt"),
+                    tokens=os.path.join(MODEL_DIR, "tokens.txt"),
+                    data_dir=os.path.join(MODEL_DIR, "espeak-ng-data"),
+                    dict_dir=MODEL_DIR,
+                ),
+                provider=TTS_PROVIDER,
+                num_threads=TTS_NUM_THREADS,
+            ),
+        )
+
     _tts_instance = sherpa_onnx.OfflineTts(config)
-    logger.info("Matcha TTS loaded (sample_rate=%d).", _tts_instance.sample_rate)
+    logger.info("TTS loaded (sample_rate=%d).", _tts_instance.sample_rate)
     return _tts_instance
 
 
@@ -82,12 +104,14 @@ def samples_to_wav(samples: list, sample_rate: int) -> bytes:
 def synthesize(
     text: str,
     speaker_id: int | None = None,
-    speed: float = 1.0,
+    speed: float | None = None,
     **kwargs,
 ) -> tuple[bytes, dict]:
     """Synthesize text to WAV bytes. Returns (wav_bytes, metadata)."""
     if speaker_id is None:
         speaker_id = DEFAULT_SPEAKER_ID
+    if speed is None:
+        speed = DEFAULT_SPEED
 
     tts = get_tts()
     start = time.time()
@@ -107,34 +131,37 @@ def synthesize(
 
 
 def preload() -> None:
-    """Pre-load TTS model and warmup CUDA kernels.
-
-    CUDA kernels are JIT-compiled per unique tensor shape. Matcha TTS
-    generates different shapes based on phoneme sequence length, so we
-    warm up with varied text lengths (ZH + EN) across multiple rounds
-    to pre-compile all common kernel variants.
-    """
+    """Pre-load TTS model and warmup CUDA kernels."""
     tts = get_tts()
 
-    warmup_texts = [
-        # ZH: cover 1-15 char lengths for full phoneme shape coverage
-        "好",
-        "你好",
-        "好的呢",
-        "没问题。",
-        "今天天气不错",
-        "你好，很高兴认识你。",
-        "没问题，我来看一下。",
-        "我来帮你看一下这个问题",
-        "今天天气真不错，我们出去走走吧。",
-        "你好，我是你的智能助手，很高兴认识你。",
-        # EN: cover short to medium
-        "OK",
-        "Sure, no problem.",
-        "Hello, nice to meet you.",
-        "Let me help you with that.",
-        "I'd be happy to help you with that question.",
-    ]
+    if LANGUAGE_MODE == "en":
+        warmup_texts = [
+            "OK",
+            "Sure.",
+            "No problem.",
+            "Hello, nice to meet you.",
+            "Let me help you with that.",
+            "I'd be happy to help you with that question.",
+            "The weather is really nice today, let's go for a walk.",
+        ]
+    else:
+        warmup_texts = [
+            "好",
+            "你好",
+            "好的呢",
+            "没问题。",
+            "今天天气不错",
+            "你好，很高兴认识你。",
+            "没问题，我来看一下。",
+            "我来帮你看一下这个问题",
+            "今天天气真不错，我们出去走走吧。",
+            "你好，我是你的智能助手，很高兴认识你。",
+            "OK",
+            "Sure, no problem.",
+            "Hello, nice to meet you.",
+            "Let me help you with that.",
+            "I'd be happy to help you with that question.",
+        ]
     n_rounds = 5 if TTS_PROVIDER == "cuda" else 1
 
     start = time.time()
