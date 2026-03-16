@@ -25,8 +25,8 @@ _DEFAULT_TTS_DIRS = {
 MODEL_DIR = os.environ.get("TTS_MODEL_DIR", _DEFAULT_TTS_DIRS.get(LANGUAGE_MODE, _DEFAULT_TTS_DIRS["zh_en"]))
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "cuda")
 TTS_NUM_THREADS = int(os.environ.get("TTS_NUM_THREADS", "4"))
-# Default speaker: zh_en=0 (matcha), en=3 (kokoro af_heart)
-_DEFAULT_SIDS = {"zh_en": "0", "en": "3"}
+# Default speaker: zh_en=0 (matcha), en=52 (kokoro af_cute, replaces zm_yunyang)
+_DEFAULT_SIDS = {"zh_en": "0", "en": "52"}
 DEFAULT_SPEAKER_ID = int(os.environ.get("TTS_DEFAULT_SID", _DEFAULT_SIDS.get(LANGUAGE_MODE, "0")))
 DEFAULT_SPEED = float(os.environ.get("TTS_DEFAULT_SPEED", "1.0"))
 PITCH_SHIFT = float(os.environ.get("TTS_PITCH_SHIFT", "0"))
@@ -119,6 +119,7 @@ def synthesize(
     text: str,
     speaker_id: int | None = None,
     speed: float | None = None,
+    pitch_shift: float | None = None,
     **kwargs,
 ) -> tuple[bytes, dict]:
     """Synthesize text to WAV bytes. Returns (wav_bytes, metadata)."""
@@ -126,13 +127,19 @@ def synthesize(
         speaker_id = DEFAULT_SPEAKER_ID
     if speed is None:
         speed = DEFAULT_SPEED
+    if pitch_shift is None:
+        pitch_shift = PITCH_SHIFT
 
     tts = get_tts()
     start = time.time()
     audio = tts.generate(text, sid=speaker_id, speed=speed)
+    # Fallback: if invalid speaker ID produces empty audio, retry with default
+    if not audio.samples or len(audio.samples) == 0:
+        logger.warning("Speaker %d produced empty audio, falling back to default %d", speaker_id, DEFAULT_SPEAKER_ID)
+        audio = tts.generate(text, sid=DEFAULT_SPEAKER_ID, speed=speed)
     elapsed = time.time() - start
 
-    samples = pitch_shift_samples(audio.samples, PITCH_SHIFT)
+    samples = pitch_shift_samples(audio.samples, pitch_shift)
     duration = len(samples) / audio.sample_rate
     wav_bytes = samples_to_wav(samples, audio.sample_rate)
 

@@ -22,6 +22,7 @@ class TTSRequest(BaseModel):
     text: str
     sid: int | None = None
     speed: float | None = None
+    pitch: float | None = None
 
 
 @app.on_event("startup")
@@ -86,6 +87,7 @@ async def tts(req: TTSRequest):
         text=req.text,
         speaker_id=req.sid,
         speed=req.speed,
+        pitch_shift=req.pitch,
     )
     return Response(
         content=wav_bytes,
@@ -123,10 +125,11 @@ async def tts_stream(req: TTSRequest):
     def _generate_blocking():
         tts = tts_service.get_tts()
         sid = req.sid if req.sid is not None else tts_service.DEFAULT_SPEAKER_ID
+        effective_pitch = req.pitch if req.pitch is not None else tts_service.PITCH_SHIFT
 
         def callback(samples, progress):
             import numpy as np
-            shifted = tts_service.pitch_shift_samples(samples, tts_service.PITCH_SHIFT)
+            shifted = tts_service.pitch_shift_samples(samples, effective_pitch)
             arr = np.array(shifted, dtype=np.float32)
             np.clip(arr, -1.0, 1.0, out=arr)
             pcm = (arr * 32767).astype(np.int16).tobytes()

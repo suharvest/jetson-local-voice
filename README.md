@@ -77,7 +77,7 @@ docker run -d --name jetson-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
   -e LANGUAGE_MODE=en \
-  -e TTS_DEFAULT_SID=3 \
+  -e TTS_DEFAULT_SID=52 \
   -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
   sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
@@ -245,7 +245,7 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 |----------|---------|-------------|
 | `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English) or `en` (English only) |
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
-| `TTS_DEFAULT_SID` | `3` | Default TTS speaker ID |
+| `TTS_DEFAULT_SID` | `52` | Default TTS speaker ID (52=af_cute, 3=af_heart) |
 | `TTS_NUM_THREADS` | `4` | TTS inference threads |
 | `TTS_PITCH_SHIFT` | `0` | Pitch shift in semitones (e.g. `2` = higher, `-2` = lower) |
 | `SENSEVOICE_LANGUAGE` | `auto` | SenseVoice language hint |
