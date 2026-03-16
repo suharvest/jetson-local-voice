@@ -125,9 +125,9 @@ async def tts_stream(req: TTSRequest):
         sid = req.sid if req.sid is not None else tts_service.DEFAULT_SPEAKER_ID
 
         def callback(samples, progress):
-            # Vectorized float32 → int16 PCM conversion (numpy, ~100x faster)
             import numpy as np
-            arr = np.array(samples, dtype=np.float32)
+            shifted = tts_service.pitch_shift_samples(samples, tts_service.PITCH_SHIFT)
+            arr = np.array(shifted, dtype=np.float32)
             np.clip(arr, -1.0, 1.0, out=arr)
             pcm = (arr * 32767).astype(np.int16).tobytes()
             audio_queue.put(pcm)
