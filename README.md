@@ -1,6 +1,6 @@
 # Jetson Voice
 
-**Sub-200ms bilingual voice server on edge — one Docker image, one Jetson, faster than any cloud API.**
+**Sub-200ms bilingual voice server under $500 — one Docker image, one Jetson, faster than any cloud API.**
 
 [![GitHub stars](https://img.shields.io/github/stars/Seeed-Projects/jetson-voice?style=social)](https://github.com/Seeed-Projects/jetson-voice)
 [![sherpa-onnx](https://img.shields.io/badge/engine-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
@@ -20,12 +20,13 @@ One Docker image turns any Jetson (or CUDA device) into a local voice server. AS
 ## Key Features
 
 - **Sub-200ms latency** — ASR-to-first-audio in ~110ms (zh+en) / ~180ms (en), beating cloud APIs by 3-5x
+- **Under $500 total cost** — runs on a Jetson Orin Nano (~$250) or NX (~$400). No cloud bills, no API fees, ever
 - **Bilingual** — Chinese+English (Paraformer + Matcha-TTS) or English-only (Zipformer + Kokoro v1.0), switch with one env var
 - **One-command deploy** — `docker run` and you're done. Models auto-download on first start
+- **Lightweight** — only ~650 MB RAM, ~32% CPU idle. Leaves room for LLM, vision, and other workloads on the same device
 - **Streaming** — real-time WebSocket ASR with partial results; streaming TTS with sentence-level chunking
 - **53 TTS voices** — Kokoro v1.0 with 53 speakers across 8 languages, plus custom voice support via pitch shift
 - **Zero cloud dependency** — fully offline, runs on-device with CUDA acceleration
-- **Production-ready** — FastAPI service with health checks, configurable via env vars, auto-restart
 
 ## Quick Start
 
@@ -180,6 +181,28 @@ GET /health  →  {"asr": bool, "tts": bool, "streaming_asr": bool}
 
 Full voice-to-voice latency depends on LLM inference time (not included above).
 
+### Resource Usage (Jetson Orin NX 16GB)
+
+| State | CPU (8-core) | RAM | GPU |
+|-------|-------------|-----|-----|
+| Idle (models loaded) | ~32% | ~650 MB | 0% |
+| During TTS inference | ~63% | ~658 MB | burst |
+| During ASR streaming | ~32% | ~650 MB | minimal |
+
+The service uses only ~650 MB RAM, leaving plenty of headroom for LLM inference (Ollama), computer vision, or robot control on the same device.
+
+### Cost Comparison
+
+| Setup | Hardware Cost | Per-request Cost | Latency |
+|-------|-------------|-----------------|---------|
+| **Jetson Voice (Orin Nano)** | **~$250 one-time** | **$0** | **~110-180ms** |
+| **Jetson Voice (Orin NX)** | **~$400 one-time** | **$0** | **~110-180ms** |
+| Google Cloud Speech + TTS | $0 | ~$0.01/request | 300-800ms |
+| Azure Speech Services | $0 | ~$0.01/request | 200-500ms |
+| OpenAI TTS + Whisper | $0 | ~$0.02/request | 500ms-2s |
+
+At ~1000 requests/day, a Jetson pays for itself in under 2 months vs cloud APIs.
+
 ### Benchmarks
 
 **zh_en mode:**
@@ -266,8 +289,9 @@ See `patches/README.md` for rebuild instructions.
 
 ## Requirements
 
-- **Jetson Orin NX / Nano** (JetPack 6.2, CUDA 12.6) — or any CUDA-capable device with Docker
+- **Jetson Orin Nano** (~$250) or **Orin NX** (~$400) with JetPack 6.2, CUDA 12.6 — or any CUDA-capable device with Docker
 - Docker with `nvidia` runtime
+- ~650 MB RAM (leaves room for LLM + other workloads)
 - ~5 GB disk for models
 
 ## Project Structure
