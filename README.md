@@ -1,60 +1,35 @@
 # Jetson Voice
 
-**~110ms ASR + TTS on edge devices — GPU-accelerated voice stack powered by [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), zero cloud dependency.**
+**Sub-200ms bilingual voice server on edge — one Docker image, one Jetson, faster than any cloud API.**
 
-[![sherpa-onnx](https://img.shields.io/badge/speech-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
+[![GitHub stars](https://img.shields.io/github/stars/Seeed-Projects/jetson-voice?style=social)](https://github.com/Seeed-Projects/jetson-voice)
+[![sherpa-onnx](https://img.shields.io/badge/engine-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
+[![Kokoro TTS](https://img.shields.io/badge/TTS-Kokoro%20v1.0-orange.svg)](https://huggingface.co/hexgrad/Kokoro-82M)
 [![Docker](https://img.shields.io/badge/deploy-Docker-blue.svg)](https://www.docker.com/)
 [![Jetson](https://img.shields.io/badge/platform-Jetson%20Orin-76b900.svg)](https://developer.nvidia.com/embedded-computing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 <p align="center">
-  <img src="media/hero.png" alt="Jetson Voice — 50ms ASR + 60ms TTS on edge" width="640" />
+  <img src="media/hero.png" alt="Jetson Voice — sub-200ms ASR + TTS on edge" width="640" />
 </p>
 
-Turn any CUDA device into a local voice server. Speak into it, get text back in 50ms. Send text, get speech in 60ms. No cloud, no API keys, no internet needed.
+<!-- TODO: Add demo GIF showing voice-in → text → voice-out round-trip -->
 
-Jetson Voice wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models in a FastAPI service with HTTP and WebSocket endpoints — deploy with one `docker compose up`. Two language modes: **Chinese+English** (Paraformer + Matcha-TTS) and **English-only** (Zipformer + Kokoro TTS), switchable via `LANGUAGE_MODE` env var.
+One Docker image turns any Jetson (or CUDA device) into a local voice server. ASR + TTS in under 200ms — no cloud, no API keys, no internet. Bilingual Chinese+English out of the box, or English-only with 53 Kokoro voices.
 
-### Latency (Jetson Orin NX 16GB, CUDA 12.6, MAXN)
+## Key Features
 
-**Chinese + English mode** (`LANGUAGE_MODE=zh_en`, default):
-
-| Stage | Model | Latency | Note |
-|-------|-------|---------|------|
-| **ASR** | Paraformer zh+en (streaming) | ~50ms TTFT | Real-time partial results via WebSocket |
-| **TTS** | Matcha-TTS + Vocos zh+en (streaming) | ~60ms TTFT | Best Chinese quality, streaming PCM |
-
-**English-only mode** (`LANGUAGE_MODE=en`):
-
-| Stage | Model | Latency | Note |
-|-------|-------|---------|------|
-| **ASR** | Zipformer en (streaming) | ~50ms TTFT | Transducer model, English optimized |
-| **TTS** | Kokoro v1.0 en (streaming) | ~130ms TTFT | 53 speakers, high English quality |
-
-| Stage | Model | Latency | Note |
-|-------|-------|---------|------|
-| ASR (fallback) | SenseVoice 5-lang | ~200ms | Batch mode, offline, lazy-loaded (both modes) |
-
-ASR + TTS combined: **~110ms** (zh_en) / **~180ms** (en). Full voice-to-voice latency depends on LLM inference time (not included here).
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-- [Services](#services)
-- [API Reference](#api-reference)
-- [Performance](#performance)
-- [Configuration](#configuration)
-- [Patched sherpa-onnx](#patched-sherpa-onnx)
-- [Requirements](#requirements)
-- [Project Structure](#project-structure)
-- [Acknowledgements](#acknowledgements)
+- **Sub-200ms latency** — ASR-to-first-audio in ~110ms (zh+en) / ~180ms (en), beating cloud APIs by 3-5x
+- **Bilingual** — Chinese+English (Paraformer + Matcha-TTS) or English-only (Zipformer + Kokoro v1.0), switch with one env var
+- **One-command deploy** — `docker run` and you're done. Models auto-download on first start
+- **Streaming** — real-time WebSocket ASR with partial results; streaming TTS with sentence-level chunking
+- **53 TTS voices** — Kokoro v1.0 with 53 speakers across 8 languages, plus custom voice support via pitch shift
+- **Zero cloud dependency** — fully offline, runs on-device with CUDA acceleration
+- **Production-ready** — FastAPI service with health checks, configurable via env vars, auto-restart
 
 ## Quick Start
 
-### Option 1: Pre-built Image (Recommended)
-
-Pull and run the pre-built image. Models are auto-downloaded on first start (~1 min) and cached in a volume:
+Pull and run. Models auto-download on first start (~1 min) and are cached in a Docker volume:
 
 ```bash
 # Chinese + English (default)
@@ -63,48 +38,51 @@ docker run -d --name jetson-voice \
   -p 8621:8000 \
   -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.1
 
-# First start downloads models (~930 MB), then ~40s warmup
+# Verify (wait ~40s for warmup)
 curl http://localhost:8621/health
 # {"asr":false,"tts":true,"streaming_asr":true}
 ```
 
-**English-only mode** (Kokoro TTS + Zipformer ASR, ~980 MB):
+**English-only mode** (Kokoro TTS + Zipformer ASR):
 
 ```bash
 docker run -d --name jetson-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
   -e LANGUAGE_MODE=en \
-  -e TTS_DEFAULT_SID=52 \
   -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.1
 ```
 
-### Option 2: Build from Source
+**Build from source:**
 
 ```bash
 git clone https://github.com/Seeed-Projects/jetson-voice.git
 cd jetson-voice
-
-# Build & run
-docker compose build
-docker compose up -d
-
-# Verify
-curl http://localhost:8000/health
-# {"asr":true,"tts":true,"streaming_asr":true}
+docker compose build && docker compose up -d
 ```
 
-Models (~1.5 GB total) are auto-downloaded on first start.
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [API Reference](#api-reference)
+- [Performance](#performance)
+- [Configuration](#configuration)
+- [Models](#models)
+- [Patched sherpa-onnx](#patched-sherpa-onnx)
+- [Requirements](#requirements)
+- [Project Structure](#project-structure)
+- [Acknowledgements](#acknowledgements)
 
 ## Architecture
 
 ```text
 ┌───────────────────────────────────────────────────────────┐
-│  Jetson Orin NX (CUDA 12.6)                               │
+│  Jetson Orin NX / Nano (CUDA 12.6)                        │
 │                                                           │
 │  FastAPI service (:8000)                                  │
 │  ├── WS /asr/stream    Streaming ASR                      │
@@ -112,18 +90,14 @@ Models (~1.5 GB total) are auto-downloaded on first start.
 │  ├── POST /asr          SenseVoice offline ASR (both)     │
 │  ├── POST /tts          Batch TTS                         │
 │  └── POST /tts/stream   Streaming TTS                     │
-│        └─ zh_en: Matcha-TTS  │  en: Kokoro                │
+│        └─ zh_en: Matcha-TTS  │  en: Kokoro v1.0           │
 │                                                           │
 │  sherpa-onnx + ONNX Runtime 1.20 (CUDA)                   │
 └───────────────────────────────────────────────────────────┘
-         ▲ HTTP/WebSocket
+         ▲ HTTP / WebSocket
          │
    Any client (SBC, laptop, robot, ...)
 ```
-
-The service is model-agnostic at the API level — clients send audio/text, get audio/text back. Swap models without changing client code.
-
-## Services
 
 Models are selected automatically based on `LANGUAGE_MODE`:
 
@@ -134,11 +108,13 @@ Models are selected automatically based on `LANGUAGE_MODE`:
 | **Batch TTS** | `POST /tts` | Matcha-TTS + Vocos | Kokoro v1.0 | HTTP: JSON in, WAV out |
 | Offline ASR | `POST /asr` | SenseVoice (zh+en+ja+ko+yue) | SenseVoice (same) | HTTP: WAV upload, JSON out |
 
+The service is model-agnostic at the API level — clients send audio/text, get audio/text back. Swap models without changing client code.
+
 ## API Reference
 
 ### Streaming ASR (WebSocket)
 
-```text
+```
 WS /asr/stream?sample_rate=16000&language=auto
 ```
 
@@ -171,30 +147,40 @@ curl -X POST http://jetson:8000/asr \
 ```bash
 curl -X POST http://jetson:8000/tts \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello world", "sid": 3, "speed": 1.2}' \
+  -d '{"text": "Hello world", "sid": 52, "speed": 1.0}' \
   --output output.wav
 ```
 
-Parameters: `text` (required), `sid` (speaker ID, default 3), `speed` (rate, default 1.0)
+Parameters: `text` (required), `sid` (speaker ID, default 52), `speed` (rate, default 1.0)
 
 ### TTS Streaming (HTTP)
 
 Returns raw PCM: first 4 bytes = sample rate (uint32 LE), then int16 samples.
 
-```text
+```
 POST /tts/stream
 Content-Type: application/json
+{"text": "Hello world", "sid": 52}
 ```
 
 ### Health Check
 
-```text
+```
 GET /health  →  {"asr": bool, "tts": bool, "streaming_asr": bool}
 ```
 
 ## Performance
 
-### Benchmarks (Jetson Orin NX 16GB, CUDA 12.6, MAXN mode)
+### Latency (Jetson Orin NX 16GB, CUDA 12.6, MAXN)
+
+| | ASR TTFT | TTS TTFT | ASR + TTS | vs Cloud |
+|---|---------|---------|-----------|----------|
+| **zh_en** (Chinese+English) | ~50ms | ~60ms | **~110ms** | 3-5x faster |
+| **en** (English only) | ~50ms | ~130ms | **~180ms** | 2-4x faster |
+
+Full voice-to-voice latency depends on LLM inference time (not included above).
+
+### Benchmarks
 
 **zh_en mode:**
 
@@ -246,17 +232,18 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 | `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English) or `en` (English only) |
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
 | `TTS_DEFAULT_SID` | `52` | Default TTS speaker ID (52=af_cute, 3=af_heart) |
+| `TTS_DEFAULT_SPEED` | `1.0` | TTS playback speed |
 | `TTS_NUM_THREADS` | `4` | TTS inference threads |
 | `TTS_PITCH_SHIFT` | `0` | Pitch shift in semitones (e.g. `2` = higher, `-2` = lower) |
 | `SENSEVOICE_LANGUAGE` | `auto` | SenseVoice language hint |
-| `STREAMING_ASR_PROVIDER` | `cuda` | Paraformer execution provider |
+| `STREAMING_ASR_PROVIDER` | `cuda` | Streaming ASR execution provider |
 | `MODEL_DIR` | `/opt/models` | Model storage directory |
 
 Copy `.env.example` to `.env` to customize.
 
-### Models
+## Models
 
-Auto-downloaded on first start via `scripts/download_models.sh`:
+Auto-downloaded on first start and cached in a Docker volume:
 
 | Model | Size | Mode | Purpose |
 |-------|------|------|---------|
@@ -279,25 +266,22 @@ See `patches/README.md` for rebuild instructions.
 
 ## Requirements
 
-- Jetson Orin NX 16GB (JetPack 6.2, CUDA 12.6) — or any CUDA-capable device with Docker
+- **Jetson Orin NX / Nano** (JetPack 6.2, CUDA 12.6) — or any CUDA-capable device with Docker
 - Docker with `nvidia` runtime
 - ~5 GB disk for models
 
 ## Project Structure
 
 ```text
-jetson-local-voice/
+jetson-voice/
 ├── app/                     # FastAPI service
 │   ├── main.py              # Endpoints and startup
 │   ├── asr_service.py       # SenseVoice offline ASR
-│   ├── streaming_asr_service.py  # Paraformer streaming ASR
-│   ├── tts_service.py       # Matcha TTS (batch + streaming)
-│   └── vc_service.py        # Voice conversion (experimental)
+│   ├── streaming_asr_service.py  # Paraformer/Zipformer streaming ASR
+│   ├── tts_service.py       # TTS (Matcha / Kokoro, batch + streaming)
+│   └── model_downloader.py  # On-demand model download + voice patching
+├── voices/                  # Custom voice embeddings (auto-patched into model)
 ├── benchmarks/              # TTS model TTFT comparisons
-│   ├── test_f5tts_ttft.py   # F5-TTS vs Kokoro TTFT
-│   ├── test_matcha_ttft.py  # Matcha vs Kokoro TTFT
-│   ├── test_cosyvoice3_ttft.py  # CosyVoice3 per-stage timing
-│   └── archive/             # Detailed F5-TTS optimization experiments
 ├── patches/                 # Paraformer EOF truncation fix
 ├── scripts/                 # Model download, ORT patching
 ├── Dockerfile               # Multi-stage build for JetPack 6.2
