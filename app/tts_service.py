@@ -2,7 +2,7 @@
 
 Supports two modes via LANGUAGE_MODE env var:
   - "zh_en" (default): Matcha TTS + Vocos (Chinese+English, multi-speaker)
-  - "en": Kokoro TTS (English only, 11 speakers, default bf_isabella sid=8)
+  - "en": Kokoro TTS v1.0 (English, 53 speakers, default af_heart sid=3)
 """
 
 from __future__ import annotations
@@ -13,22 +13,36 @@ import os
 import struct
 import time
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 LANGUAGE_MODE = os.environ.get("LANGUAGE_MODE", "zh_en")  # "zh_en" or "en"
 _DEFAULT_TTS_DIRS = {
     "zh_en": "/opt/models/matcha-icefall-zh-en",
-    "en": "/opt/models/kokoro-en-v0_19",
+    "en": "/opt/models/kokoro-multi-lang-v1_0",
 }
 MODEL_DIR = os.environ.get("TTS_MODEL_DIR", _DEFAULT_TTS_DIRS.get(LANGUAGE_MODE, _DEFAULT_TTS_DIRS["zh_en"]))
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "cuda")
 TTS_NUM_THREADS = int(os.environ.get("TTS_NUM_THREADS", "4"))
-# Default speaker: zh_en=0 (matcha), en=8 (kokoro bf_isabella)
-_DEFAULT_SIDS = {"zh_en": "0", "en": "8"}
+# Default speaker: zh_en=0 (matcha), en=3 (kokoro af_heart)
+_DEFAULT_SIDS = {"zh_en": "0", "en": "3"}
 DEFAULT_SPEAKER_ID = int(os.environ.get("TTS_DEFAULT_SID", _DEFAULT_SIDS.get(LANGUAGE_MODE, "0")))
 DEFAULT_SPEED = float(os.environ.get("TTS_DEFAULT_SPEED", "1.0"))
+PITCH_SHIFT = float(os.environ.get("TTS_PITCH_SHIFT", "0"))
 
 _tts_instance = None
+
+
+def pitch_shift_samples(samples: list, semitones: float) -> list:
+    """Shift pitch by resampling. semitones > 0 = higher pitch."""
+    if semitones == 0:
+        return samples
+    ratio = 2 ** (semitones / 12)
+    arr = np.array(samples, dtype=np.float32)
+    new_len = int(len(arr) / ratio)
+    indices = np.linspace(0, len(arr) - 1, new_len)
+    return np.interp(indices, np.arange(len(arr)), arr).tolist()
 
 
 def get_tts():
@@ -48,6 +62,7 @@ def get_tts():
                     model=os.path.join(MODEL_DIR, "model.onnx"),
                     voices=os.path.join(MODEL_DIR, "voices.bin"),
                     tokens=os.path.join(MODEL_DIR, "tokens.txt"),
+                    lexicon=os.path.join(MODEL_DIR, "lexicon-us-en.txt"),
                     data_dir=os.path.join(MODEL_DIR, "espeak-ng-data"),
                     dict_dir=MODEL_DIR,
                 ),
@@ -93,7 +108,6 @@ def samples_to_wav(samples: list, sample_rate: int) -> bytes:
     buf.write(b"data")
     buf.write(struct.pack("<I", data_size))
 
-    import numpy as np
     arr = np.array(samples, dtype=np.float32)
     np.clip(arr, -1.0, 1.0, out=arr)
     buf.write((arr * 32767).astype(np.int16).tobytes())
@@ -118,8 +132,9 @@ def synthesize(
     audio = tts.generate(text, sid=speaker_id, speed=speed)
     elapsed = time.time() - start
 
-    duration = len(audio.samples) / audio.sample_rate
-    wav_bytes = samples_to_wav(audio.samples, audio.sample_rate)
+    samples = pitch_shift_samples(audio.samples, PITCH_SHIFT)
+    duration = len(samples) / audio.sample_rate
+    wav_bytes = samples_to_wav(samples, audio.sample_rate)
 
     meta = {
         "duration": round(duration, 3),

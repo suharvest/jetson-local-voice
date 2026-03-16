@@ -27,7 +27,7 @@ MODELS = {
         "paraformer-streaming": ("models-paraformer.tar.gz", "Paraformer streaming ASR (zh+en)"),
     },
     "en": {
-        "kokoro-en-v0_19": ("models-kokoro.tar.gz", "Kokoro TTS (English)"),
+        "kokoro-multi-lang-v1_0": ("kokoro-multi-lang-v1_0.tar.bz2", "Kokoro TTS v1.0 (English, 53 speakers)"),
         "zipformer-en": ("models-zipformer-en.tar.gz", "Zipformer streaming ASR (English)"),
     },
     "shared": {
@@ -36,14 +36,24 @@ MODELS = {
 }
 
 
+def _detect_tar_mode(filename: str) -> str:
+    """Return tar open mode based on filename extension."""
+    if filename.endswith(".tar.bz2"):
+        return "bz2"
+    return "gz"
+
+
 def _download_and_extract(url: str, dest_dir: str) -> None:
-    """Download a .tar.gz from URL and extract to dest_dir.
+    """Download a .tar.gz or .tar.bz2 from URL and extract to dest_dir.
 
     Uses curl (fast, with progress) if available, falls back to Python stdlib.
     """
+    compress = _detect_tar_mode(url)
+
     if shutil.which("curl"):
         # curl + tar streaming: no temp file, shows progress
-        cmd = f'curl -fSL --progress-bar "{url}" | tar xzf - -C "{dest_dir}"'
+        tar_flag = "j" if compress == "bz2" else "z"
+        cmd = f'curl -fSL --progress-bar "{url}" | tar x{tar_flag}f - -C "{dest_dir}"'
         subprocess.run(cmd, shell=True, check=True)
     else:
         # Pure Python fallback
@@ -51,8 +61,9 @@ def _download_and_extract(url: str, dest_dir: str) -> None:
         import tempfile
         import urllib.request
 
+        suffix = ".tar.bz2" if compress == "bz2" else ".tar.gz"
         logger.info("  Fetching %s ...", url)
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
             req = urllib.request.Request(url, headers={"User-Agent": "jetson-voice/1.0"})
             resp = urllib.request.urlopen(req, timeout=600)
@@ -71,7 +82,7 @@ def _download_and_extract(url: str, dest_dir: str) -> None:
                     logger.info("  Progress: %d/%d MB (%d%%)", mb, total_mb, pct)
         try:
             logger.info("  Extracting to %s ...", dest_dir)
-            with tarfile.open(tmp_path, "r:gz") as tar:
+            with tarfile.open(tmp_path, f"r:{compress}") as tar:
                 tar.extractall(path=dest_dir)
         finally:
             os.unlink(tmp_path)
@@ -103,7 +114,13 @@ def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") 
     os.makedirs(model_dir, exist_ok=True)
 
     for dir_name, cdn_file, desc in missing:
-        url = f"{CDN_BASE}/{cdn_file}"
+        # Use GitHub releases for models not hosted on CDN
+        if cdn_file.startswith("http"):
+            url = cdn_file
+        elif cdn_file == "kokoro-multi-lang-v1_0.tar.bz2":
+            url = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/{cdn_file}"
+        else:
+            url = f"{CDN_BASE}/{cdn_file}"
         logger.info("Downloading %s ...", desc)
         try:
             _download_and_extract(url, model_dir)
