@@ -29,7 +29,7 @@ Jetson Voice wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models i
 | Stage | Model | Latency | Note |
 |-------|-------|---------|------|
 | **ASR** | Zipformer en (streaming) | ~50ms TTFT | Transducer model, English optimized |
-| **TTS** | Kokoro v0.19 en (streaming) | ~130ms TTFT | 11 speakers, high English quality |
+| **TTS** | Kokoro v1.0 en (streaming) | ~130ms TTFT | 53 speakers, high English quality |
 
 | Stage | Model | Latency | Note |
 |-------|-------|---------|------|
@@ -70,14 +70,14 @@ curl http://localhost:8621/health
 # {"asr":false,"tts":true,"streaming_asr":true}
 ```
 
-**English-only mode** (Kokoro TTS + Zipformer ASR, ~590 MB):
+**English-only mode** (Kokoro TTS + Zipformer ASR, ~980 MB):
 
 ```bash
 docker run -d --name jetson-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
   -e LANGUAGE_MODE=en \
-  -e TTS_DEFAULT_SID=8 \
+  -e TTS_DEFAULT_SID=3 \
   -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
   sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0
@@ -130,8 +130,8 @@ Models are selected automatically based on `LANGUAGE_MODE`:
 | Service | Endpoint | zh_en (default) | en | Protocol |
 |---------|----------|-----------------|-----|----------|
 | **Streaming ASR** | `WS /asr/stream` | Paraformer bilingual | Zipformer English | WebSocket: int16 PCM in, JSON out |
-| **Streaming TTS** | `POST /tts/stream` | Matcha-TTS + Vocos | Kokoro v0.19 (11 speakers) | HTTP: JSON in, raw PCM stream |
-| **Batch TTS** | `POST /tts` | Matcha-TTS + Vocos | Kokoro v0.19 | HTTP: JSON in, WAV out |
+| **Streaming TTS** | `POST /tts/stream` | Matcha-TTS + Vocos | Kokoro v1.0 (53 speakers) | HTTP: JSON in, raw PCM stream |
+| **Batch TTS** | `POST /tts` | Matcha-TTS + Vocos | Kokoro v1.0 | HTTP: JSON in, WAV out |
 | Offline ASR | `POST /asr` | SenseVoice (zh+en+ja+ko+yue) | SenseVoice (same) | HTTP: WAV upload, JSON out |
 
 ## API Reference
@@ -221,7 +221,7 @@ We evaluated 4 TTS models for TTFT (time-to-first-audio-chunk). Matcha-TTS was s
 | Model | TTFT (short) | TTFT (long) | Chinese Quality | English Quality | Used in |
 |-------|-------------|-------------|-----------------|-----------------|---------|
 | **Matcha-TTS + Vocos** | ~60ms | ~150ms | Good | Fair | **zh_en** |
-| **Kokoro v0.19** | ~130ms | ~300ms | — | Excellent | **en** |
+| **Kokoro v1.0** | ~130ms | ~300ms | — | Excellent | **en** |
 | CosyVoice3 | ~800ms | ~2s | Excellent | — | — |
 | F5-TTS | ~2.5s | ~5s | Excellent | — | — |
 
@@ -247,6 +247,7 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
 | `TTS_DEFAULT_SID` | `3` | Default TTS speaker ID |
 | `TTS_NUM_THREADS` | `4` | TTS inference threads |
+| `TTS_PITCH_SHIFT` | `0` | Pitch shift in semitones (e.g. `2` = higher, `-2` = lower) |
 | `SENSEVOICE_LANGUAGE` | `auto` | SenseVoice language hint |
 | `STREAMING_ASR_PROVIDER` | `cuda` | Paraformer execution provider |
 | `MODEL_DIR` | `/opt/models` | Model storage directory |
@@ -262,7 +263,7 @@ Auto-downloaded on first start via `scripts/download_models.sh`:
 | Paraformer streaming zh-en | ~230 MB | `zh_en` | Streaming ASR (bilingual) |
 | Matcha-TTS + Vocos zh-en | ~125 MB | `zh_en` | TTS synthesis |
 | Zipformer streaming en | ~65 MB | `en` | Streaming ASR (English only) |
-| Kokoro TTS en v0.19 | ~330 MB | `en` | TTS synthesis (English, 11 speakers) |
+| Kokoro TTS v1.0 | ~719 MB | `en` | TTS synthesis (English, 53 speakers) |
 | SenseVoice zh-en-ja-ko-yue | ~500 MB | both | Offline ASR (5 languages) |
 
 ## Patched sherpa-onnx
@@ -310,6 +311,6 @@ jetson-local-voice/
 - [next-gen Kaldi](https://github.com/k2-fsa) — the research foundation behind sherpa-onnx
 - [Paraformer](https://github.com/modelscope/FunASR) — streaming bilingual ASR model
 - [Matcha-TTS](https://github.com/shivammehta25/Matcha-TTS) — fast flow-matching TTS (zh+en mode)
-- [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) — high-quality English TTS with 11 speakers (en mode)
+- [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) — high-quality English TTS with 53 speakers (en mode)
 - [Zipformer](https://github.com/k2-fsa/icefall) — efficient transducer ASR (en mode)
 - [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) — multilingual offline ASR
