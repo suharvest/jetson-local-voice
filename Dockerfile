@@ -49,6 +49,9 @@ RUN apt-get purge -y patchelf && apt-get autoremove -y && \
 # Application code
 COPY app/ /opt/speech/app/
 
+# Custom voice embeddings (patched into voices.bin on first start)
+COPY voices/ /opt/speech/voices/
+
 # No models baked in — model_downloader.py auto-downloads on first start
 # based on LANGUAGE_MODE env var. Models cached in /opt/models volume.
 RUN mkdir -p /opt/models

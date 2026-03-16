@@ -104,6 +104,8 @@ def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") 
 
     if not missing:
         logger.info("All models for mode '%s' are ready.", language_mode)
+        if language_mode == "en":
+            _patch_kokoro_voices(model_dir)
         return
 
     logger.info(
@@ -132,6 +134,51 @@ def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") 
                 url, model_dir,
             )
             sys.exit(1)
+
+    if language_mode == "en":
+        _patch_kokoro_voices(model_dir)
+
+
+# Custom voice patches: replace unused speakers in voices.bin with custom voices.
+# Each voice embedding is (510, 1, 256) float32 = 522240 bytes.
+# Patches are stored in /opt/speech/voices/ (baked into Docker image).
+_VOICE_PATCHES = {
+    52: "af_cute.bin",  # replaces zm_yunyang (sid=52) with cute voice
+}
+_VOICE_BYTES = 510 * 1 * 256 * 4  # 522240
+
+
+def _patch_kokoro_voices(model_dir: str) -> None:
+    """Patch voices.bin with custom voice embeddings if not already applied."""
+    voices_bin = os.path.join(model_dir, "kokoro-multi-lang-v1_0", "voices.bin")
+    if not os.path.isfile(voices_bin):
+        return
+
+    patch_dir = os.path.join(os.path.dirname(__file__), "..", "voices")
+    marker = voices_bin + ".patched"
+
+    if os.path.isfile(marker):
+        return
+
+    for sid, patch_file in _VOICE_PATCHES.items():
+        patch_path = os.path.join(patch_dir, patch_file)
+        if not os.path.isfile(patch_path):
+            logger.warning("Voice patch %s not found, skipping", patch_path)
+            continue
+        with open(patch_path, "rb") as f:
+            patch_data = f.read()
+        if len(patch_data) != _VOICE_BYTES:
+            logger.warning("Voice patch %s has wrong size %d, skipping", patch_file, len(patch_data))
+            continue
+        offset = sid * _VOICE_BYTES
+        with open(voices_bin, "r+b") as f:
+            f.seek(offset)
+            f.write(patch_data)
+        logger.info("Patched voices.bin sid=%d with %s", sid, patch_file)
+
+    # Write marker so we don't re-patch on every startup
+    with open(marker, "w") as f:
+        f.write("patched\n")
 
 
 if __name__ == "__main__":
