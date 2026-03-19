@@ -234,6 +234,7 @@ async def asr_stream(
         logger.debug("ASR stream client disconnected")
     except Exception as e:
         logger.error(f"ASR stream error: {e}")
+    finally:
         try:
             await ws.close()
         except Exception:

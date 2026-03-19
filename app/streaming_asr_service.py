@@ -108,6 +108,8 @@ def get_recognizer():
             tokens=tokens,
             provider=ASR_PROVIDER,
             num_threads=ASR_NUM_THREADS,
+            enable_endpoint_detection=True,
+            rule2_min_trailing_silence=0.6,
         )
         logger.info("Streaming Zipformer (en) loaded.")
     else:
@@ -122,6 +124,10 @@ def get_recognizer():
             tokens=tokens,
             provider=ASR_PROVIDER,
             num_threads=ASR_NUM_THREADS,
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=2.4,
+            rule2_min_trailing_silence=0.6,
+            rule3_min_utterance_length=20,
         )
         logger.info("Streaming Paraformer loaded.")
 
