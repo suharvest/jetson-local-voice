@@ -1,6 +1,6 @@
 # Jetson Voice
 
-**Sub-200ms bilingual voice server under $500 — one Docker image, one Jetson, faster than any cloud API.**
+**A fully local bilingual voice server with sub-200ms latency and zero cloud dependency — built for edge AI, robots, and real-time voice interaction.**
 
 [![GitHub stars](https://img.shields.io/github/stars/Seeed-Projects/jetson-voice?style=social)](https://github.com/Seeed-Projects/jetson-voice)
 [![sherpa-onnx](https://img.shields.io/badge/engine-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
@@ -15,7 +15,7 @@
 
 <!-- TODO: Add demo GIF showing voice-in → text → voice-out round-trip -->
 
-One Docker image turns any Jetson (or CUDA device) into a local voice server. ASR + TTS in under 200ms — no cloud, no API keys, no internet. Bilingual Chinese+English out of the box, or English-only with 53 Kokoro voices.
+Run ASR and TTS locally on Jetson or any CUDA device with one Docker image. No cloud, no API keys, no internet — just fast, deployable voice infrastructure for edge AI systems.
 
 ## Key Features
 
