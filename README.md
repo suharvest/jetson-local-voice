@@ -39,7 +39,7 @@ docker run -d --name jetson-voice \
   -p 8621:8000 \
   -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.1
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.2
 
 # Verify (wait ~40s for warmup)
 curl http://localhost:8621/health
@@ -55,13 +55,25 @@ docker run -d --name jetson-voice \
   -e LANGUAGE_MODE=en \
   -v jetson-voice-models:/opt/models \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.1
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.2
 ```
 
-**Build from source:**
+**Deploy with compose** (recommended for production):
 
 ```bash
 git clone https://github.com/Seeed-Projects/jetson-voice.git
+cd jetson-voice
+
+# Chinese + English (default)
+docker compose -f deploy/docker-compose.yml up -d
+
+# English only
+LANGUAGE_MODE=en docker compose -f deploy/docker-compose.yml up -d
+```
+
+**Build from source** (for development):
+
+```bash
 cd jetson-voice
 docker compose build && docker compose up -d
 ```
@@ -308,10 +320,30 @@ jetson-voice/
 ├── benchmarks/              # TTS model TTFT comparisons
 ├── patches/                 # Paraformer EOF truncation fix
 ├── scripts/                 # Model download, ORT patching
+├── deploy/
+│   └── docker-compose.yml   # Production deploy (pre-built image)
 ├── Dockerfile               # Multi-stage build for JetPack 6.2
-├── docker-compose.yml       # nvidia runtime, GPU, model volume
+├── docker-compose.yml       # Development build (build from source)
 └── setup-performance.sh     # Jetson clock/power tuning
 ```
+
+## Changelog
+
+### v2.2
+
+- **Enable endpoint detection** — server now proactively sends `is_final` when the speaker pauses (0.6s trailing silence), reducing response latency
+- **Fix WebSocket lifecycle** — properly close connections after finalize to prevent stale connection reuse
+- **Production deploy compose** — `deploy/docker-compose.yml` with pre-built image (no build step needed)
+
+### v2.1
+
+- Streaming TTS with sentence-level callback
+- Custom voice embedding support via pitch shift
+
+### v2.0
+
+- Initial release: Paraformer + Matcha (zh_en), Zipformer + Kokoro (en)
+- Patched sherpa-onnx for Paraformer streaming EOF fix
 
 ## Acknowledgements
 
