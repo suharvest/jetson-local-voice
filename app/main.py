@@ -136,7 +136,8 @@ async def tts_stream(req: TTSRequest):
             audio_queue.put(pcm)
             return 1
 
-        tts.generate(req.text, sid=sid, speed=req.speed, callback=callback)
+        effective_speed = req.speed if req.speed is not None else tts_service.DEFAULT_SPEED
+        tts.generate(req.text, sid=sid, speed=effective_speed, callback=callback)
         audio_queue.put(None)  # sentinel
 
     async def stream():
