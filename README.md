@@ -38,8 +38,12 @@ docker run -d --name jetson-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
   -v jetson-voice-models:/opt/models \
+  -v /usr/local/cuda/lib64:/host-cuda:ro \
+  -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
+  -v /lib/aarch64-linux-gnu:/host-libs:ro \
+  -e LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-nvidia-libs:/host-libs:/host-cuda \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.2
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v3.0-slim
 
 # Verify (wait ~40s for warmup)
 curl http://localhost:8621/health
@@ -54,8 +58,12 @@ docker run -d --name jetson-voice \
   -p 8621:8000 \
   -e LANGUAGE_MODE=en \
   -v jetson-voice-models:/opt/models \
+  -v /usr/local/cuda/lib64:/host-cuda:ro \
+  -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
+  -v /lib/aarch64-linux-gnu:/host-libs:ro \
+  -e LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-nvidia-libs:/host-libs:/host-cuda \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.2
+  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v3.0-slim
 ```
 
 **Deploy with compose** (recommended for production):
@@ -322,12 +330,21 @@ jetson-voice/
 ├── scripts/                 # Model download, ORT patching
 ├── deploy/
 │   └── docker-compose.yml   # Production deploy (pre-built image)
-├── Dockerfile               # Multi-stage build for JetPack 6.2
+├── Dockerfile               # Full build from dustynv base (development)
+├── Dockerfile.slim          # Slim multi-stage build (898MB, production)
 ├── docker-compose.yml       # Development build (build from source)
 └── setup-performance.sh     # Jetson clock/power tuning
 ```
 
 ## Changelog
+
+### v3.0-slim
+
+- **95% smaller image** — 898 MB vs 17.7 GB. Multi-stage build extracts only the runtime Python packages (onnxruntime + sherpa-onnx) from the full build image into an `ubuntu:22.04` base
+- **Host GPU library mounts** — CUDA/TensorRT/cuDNN libraries are bind-mounted from the host JetPack installation instead of baked into the image, improving cross-JetPack version compatibility
+- **Same performance** — identical TTS/ASR latency and CUDA provider support (TRT + CUDA + CPU)
+
+> **Note:** v3.0-slim requires host GPU lib mounts at runtime (see Quick Start). This is standard practice for Jetson containers and matches the pattern used by vision-trt and other optimized images.
 
 ### v2.2
 
