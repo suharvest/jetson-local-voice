@@ -1,0 +1,69 @@
+# Jetson Voice — Slim multi-stage build
+# Target: ~1.5 GB (vs 17.7 GB original)
+#
+# Requires host GPU lib mounts at runtime (JetPack 6.x):
+#   -v /usr/local/cuda/lib64:/host-cuda:ro
+#   -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro
+#   -v /lib/aarch64-linux-gnu:/host-libs:ro
+#   -e LD_LIBRARY_PATH=/host-nvidia-libs:/host-libs:/host-cuda
+
+# === Build stage: extract runtime deps from the existing fat image ===
+# Uses the already-pulled v2.2 image (no network needed for builder)
+ARG BUILDER_IMAGE=sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.2
+FROM ${BUILDER_IMAGE} AS builder
+
+# Everything is already installed in v2.2 — just verify
+RUN python3 -c "import onnxruntime; print('ort', onnxruntime.__version__)" && \
+    python3 -c "import sherpa_onnx; print('sherpa', sherpa_onnx.__version__)"
+
+# === Runtime stage: lightweight base ===
+# Ubuntu 22.04 has Python 3.10 via apt (same as the builder)
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+# System deps (minimal)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip \
+    libasound2 libsndfile1 sox \
+    && rm -rf /var/lib/apt/lists/*
+
+# FastAPI stack
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
+    fastapi \
+    "uvicorn[standard]" \
+    soundfile \
+    python-multipart \
+    'numpy<2'
+
+# Copy onnxruntime (with CUDA EP) from builder — only the Python package
+COPY --from=builder /usr/local/lib/python3.10/dist-packages/onnxruntime \
+     /usr/local/lib/python3.10/dist-packages/onnxruntime
+
+# Create SONAME symlink (sherpa-onnx patched to look for libonnxruntime.so.1)
+RUN ln -sf /usr/local/lib/python3.10/dist-packages/onnxruntime/capi/libonnxruntime.so.1.20.0 \
+           /usr/local/lib/python3.10/dist-packages/onnxruntime/capi/libonnxruntime.so.1
+
+# Copy sherpa-onnx (patched for ort 1.20) from builder
+COPY --from=builder /usr/local/lib/python3.10/dist-packages/sherpa_onnx \
+     /usr/local/lib/python3.10/dist-packages/sherpa_onnx
+
+# Application code
+COPY app/ /opt/speech/app/
+
+# Custom voice embeddings
+COPY voices/ /opt/speech/voices/
+
+# Model dir (populated at runtime via volume mount)
+RUN mkdir -p /opt/models
+
+ENV MODEL_DIR=/opt/models \
+    NVIDIA_VISIBLE_DEVICES=all \
+    CUDA_MODULE_LOADING=LAZY \
+    ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
+
+WORKDIR /opt/speech/app
+EXPOSE 8000
+
+CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

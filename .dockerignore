@@ -1,0 +1,11 @@
+wheels/
+benchmarks/
+media/
+deploy/
+.git/
+*.md
+LICENSE
+docker-compose.yml
+Dockerfile
+Dockerfile.update
+setup-performance.sh
