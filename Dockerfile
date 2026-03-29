@@ -21,13 +21,10 @@ RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
     python-multipart \
     numpy
 
-# sherpa-onnx CUDA wheel for aarch64
-# The +cuda wheel bundles onnxruntime 1.11.0 (CUDA 10/11).
+# sherpa-onnx for aarch64 (installed from PyPI)
+# The +cuda wheel (if available) bundles onnxruntime 1.11.0 (CUDA 10/11).
 # We patch it below to use the system's onnxruntime 1.20.0 (CUDA 12.6).
-# Wheel is pre-downloaded (HuggingFace may be unreachable from some networks).
-COPY wheels/sherpa_onnx-*-cp310-cp310-linux_aarch64.whl /tmp/
-RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple /tmp/sherpa_onnx-*.whl && \
-    rm /tmp/sherpa_onnx-*.whl
+RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple 'sherpa-onnx==1.12.28'
 
 # Patch sherpa-onnx to use system onnxruntime with CUDA 12.6
 COPY scripts/patch_sherpa_ort.py /tmp/
@@ -37,7 +34,7 @@ RUN python3 /tmp/patch_sherpa_ort.py && rm /tmp/patch_sherpa_ort.py
 # Pre-built from v1.12.28 source with IsReady/DecodeStream/CIF patches.
 # See patches/README.md for details; to rebuild, see patches/paraformer-eof-fix.patch
 COPY patches/sherpa-onnx-lib/ /tmp/sherpa-onnx-lib/
-RUN SITE_LIB=$(python3 -c "import sherpa_onnx, os; print(os.path.join(os.path.dirname(sherpa_onnx.__file__), 'lib'))") && \
+RUN SITE_LIB=/usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib && \
     cp /tmp/sherpa-onnx-lib/*.so "$SITE_LIB/" && \
     rm -rf /tmp/sherpa-onnx-lib && \
     python3 -c "import sherpa_onnx; print(f'sherpa_onnx {sherpa_onnx.__version__} patched OK')"
