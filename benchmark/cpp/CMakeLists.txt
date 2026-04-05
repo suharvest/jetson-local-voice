@@ -73,5 +73,38 @@ target_link_libraries(qwen3_tts
     pthread
 )
 
+# --- pybind11 module (optional) ---
+find_package(pybind11 QUIET)
+if(NOT pybind11_FOUND)
+    # Try pip-installed pybind11
+    execute_process(
+        COMMAND python3 -c "import pybind11; print(pybind11.get_cmake_dir())"
+        OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(PYBIND11_CMAKE_DIR)
+        set(pybind11_DIR "${PYBIND11_CMAKE_DIR}")
+        find_package(pybind11 REQUIRED)
+    endif()
+endif()
+
+if(pybind11_FOUND)
+    message(STATUS "pybind11 found — building Python module")
+    pybind11_add_module(qwen3_tts_engine
+        tts_binding.cpp
+        tts_trt_engine.cpp
+        tts_ort_models.cpp
+        tts_pipeline.cpp
+    )
+    target_link_libraries(qwen3_tts_engine PRIVATE
+        ${TRT_LIB}
+        ${ORT_LIB}
+        ${CUDA_RUNTIME_LIB}
+    )
+else()
+    message(STATUS "pybind11 not found — skipping Python module")
+endif()
+
 # Install
 install(TARGETS qwen3_tts DESTINATION bin)
