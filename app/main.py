@@ -33,8 +33,15 @@ class CloneRequest(BaseModel):
     language: str | None = None
 
 
+_asr_backend = None
+
+def _get_asr_backend():
+    return _asr_backend
+
 @app.on_event("startup")
 async def startup():
+    global _asr_backend
+
     import model_downloader
     mode = os.environ.get("LANGUAGE_MODE", "zh_en")
     model_dir = os.environ.get("MODEL_DIR", "/opt/models")
@@ -44,11 +51,22 @@ async def startup():
     logger.info("Pre-loading TTS model...")
     tts_service.preload()
 
+    # ASR backend
+    asr_backend_name = os.environ.get("ASR_BACKEND", "sherpa")
     try:
-        import streaming_asr_service
-        streaming_asr_service.preload()
+        from asr_backend import create_asr_backend
+        _asr_backend = create_asr_backend(asr_backend_name)
+        logger.info("Pre-loading ASR (%s)...", _asr_backend.name)
+        _asr_backend.preload()
+        logger.info("ASR backend: %s (capabilities: %s)",
+                     _asr_backend.name, [c.value for c in _asr_backend.capabilities])
     except Exception as e:
-        logger.info(f"Streaming ASR not available: {e}")
+        logger.warning("ASR backend '%s' failed: %s. Falling back to sherpa.", asr_backend_name, e)
+        try:
+            import streaming_asr_service
+            streaming_asr_service.preload()
+        except Exception as e2:
+            logger.info(f"Streaming ASR also not available: {e2}")
 
     logger.info("Speech service ready.")
 
@@ -57,20 +75,45 @@ async def startup():
 
 @app.get("/health")
 async def health():
-    import asr_service, tts_service
+    import tts_service
 
     result = {
-        "asr": asr_service.is_ready(),
         "tts": tts_service.is_ready(),
         "tts_backend": tts_service.backend_name() if tts_service.is_ready() else None,
         "tts_capabilities": [c.value for c in tts_service.capabilities()] if tts_service.is_ready() else [],
     }
+
+    # ASR
+    try:
+        from asr_backend import create_asr_backend
+        asr_be = _get_asr_backend()
+        result["asr"] = asr_be.is_ready() if asr_be else False
+        result["asr_backend"] = asr_be.name if asr_be and asr_be.is_ready() else None
+        result["asr_capabilities"] = [c.value for c in asr_be.capabilities] if asr_be and asr_be.is_ready() else []
+    except Exception:
+        result["asr"] = False
+        result["asr_backend"] = None
+        result["asr_capabilities"] = []
+
     try:
         import streaming_asr_service
         result["streaming_asr"] = streaming_asr_service.is_ready()
     except ImportError:
         result["streaming_asr"] = False
     return result
+
+
+@app.get("/asr/capabilities")
+async def asr_capabilities():
+    """Return ASR backend info and supported capabilities."""
+    asr_be = _get_asr_backend()
+    if not asr_be or not asr_be.is_ready():
+        return JSONResponse({"error": "ASR not ready"}, status_code=503)
+    return {
+        "backend": asr_be.name,
+        "capabilities": [c.value for c in asr_be.capabilities],
+        "sample_rate": asr_be.sample_rate,
+    }
 
 
 @app.get("/tts/capabilities")
@@ -224,10 +267,22 @@ async def asr(
     file: UploadFile = File(...),
     language: str = Query("auto"),
 ):
-    import asr_service
     audio_bytes = await file.read()
-    text = asr_service.transcribe_audio(audio_bytes, language=language)
-    return {"text": text}
+
+    asr_be = _get_asr_backend()
+    if asr_be and asr_be.is_ready():
+        result = asr_be.transcribe(audio_bytes, language=language)
+        return {
+            "text": result.text,
+            "language": result.language,
+            "backend": asr_be.name,
+            **result.meta,
+        }
+    else:
+        # Legacy fallback
+        import asr_service
+        text = asr_service.transcribe_audio(audio_bytes, language=language)
+        return {"text": text}
 
 
 @app.websocket("/asr/stream")
