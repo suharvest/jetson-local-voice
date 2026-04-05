@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +29,24 @@ class TranscriptionResult:
         self.text = text
         self.language = language
         self.meta = meta
+
+
+class ASRStream(ABC):
+    """A streaming ASR session that accumulates audio and produces text."""
+
+    @abstractmethod
+    def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        """Feed audio samples (float32, [-1,1]) into the stream."""
+        ...
+
+    @abstractmethod
+    def finalize(self) -> str:
+        """Signal end-of-audio and return final transcription text."""
+        ...
+
+    def get_partial(self) -> tuple[str, bool]:
+        """Return (partial_text, is_endpoint). Default: no partial results."""
+        return "", False
 
 
 class ASRBackend(ABC):
@@ -51,6 +71,10 @@ class ASRBackend(ABC):
 
     @abstractmethod
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult: ...
+
+    def create_stream(self, language: str = "auto") -> ASRStream:
+        """Create a streaming ASR session. Requires STREAMING capability."""
+        raise NotImplementedError(f"{self.name} does not support streaming")
 
     def has_capability(self, cap: ASRCapability) -> bool:
         return cap in self.capabilities
