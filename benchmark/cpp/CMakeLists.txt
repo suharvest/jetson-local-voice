@@ -1,0 +1,77 @@
+cmake_minimum_required(VERSION 3.18)
+project(qwen3_tts_trt LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- CUDA (runtime only, no nvcc needed) ---
+set(CUDA_ROOT "/usr/local/cuda" CACHE PATH "CUDA root")
+set(CUDA_INCLUDE_DIR "${CUDA_ROOT}/include")
+find_library(CUDA_RUNTIME_LIB cudart HINTS "${CUDA_ROOT}/lib64" "${CUDA_ROOT}/lib")
+if(NOT CUDA_RUNTIME_LIB)
+    message(FATAL_ERROR "cudart not found. Set CUDA_ROOT.")
+endif()
+include_directories(${CUDA_INCLUDE_DIR})
+
+# --- TensorRT ---
+# On Jetson, headers are in /usr/include/aarch64-linux-gnu/
+# Libs are in /usr/lib/aarch64-linux-gnu/
+find_path(TRT_INCLUDE_DIR NvInfer.h
+    HINTS /usr/include/aarch64-linux-gnu /usr/include /usr/local/include)
+find_library(TRT_LIB nvinfer
+    HINTS /usr/lib/aarch64-linux-gnu /usr/lib /usr/local/lib)
+
+if(NOT TRT_INCLUDE_DIR OR NOT TRT_LIB)
+    message(FATAL_ERROR "TensorRT not found. Set TRT_INCLUDE_DIR and TRT_LIB.")
+endif()
+message(STATUS "TensorRT include: ${TRT_INCLUDE_DIR}")
+message(STATUS "TensorRT lib: ${TRT_LIB}")
+
+# --- ONNX Runtime ---
+# Download: https://github.com/microsoft/onnxruntime/releases
+# Or set ORT_ROOT to extracted directory
+set(ORT_ROOT "" CACHE PATH "ONNX Runtime root directory")
+if(ORT_ROOT)
+    set(ORT_INCLUDE_DIR "${ORT_ROOT}/include")
+    find_library(ORT_LIB onnxruntime HINTS "${ORT_ROOT}/lib")
+else()
+    # Try system paths and Python site-packages
+    find_path(ORT_INCLUDE_DIR onnxruntime_cxx_api.h
+        HINTS /usr/include /usr/local/include
+              /usr/local/lib/python3.10/dist-packages/onnxruntime/capi/include)
+    find_library(ORT_LIB onnxruntime
+        HINTS /usr/lib /usr/local/lib
+              /usr/local/lib/python3.10/dist-packages/onnxruntime/capi)
+endif()
+
+if(NOT ORT_INCLUDE_DIR OR NOT ORT_LIB)
+    message(FATAL_ERROR
+        "ONNX Runtime not found. Set -DORT_ROOT=/path/to/onnxruntime\n"
+        "Download from: https://github.com/microsoft/onnxruntime/releases")
+endif()
+message(STATUS "ORT include: ${ORT_INCLUDE_DIR}")
+message(STATUS "ORT lib: ${ORT_LIB}")
+
+# --- Build ---
+include_directories(
+    ${TRT_INCLUDE_DIR}
+    ${ORT_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(qwen3_tts
+    main.cpp
+    tts_trt_engine.cpp
+    tts_ort_models.cpp
+    tts_pipeline.cpp
+)
+
+target_link_libraries(qwen3_tts
+    ${TRT_LIB}
+    ${ORT_LIB}
+    ${CUDA_RUNTIME_LIB}
+    pthread
+)
+
+# Install
+install(TARGETS qwen3_tts DESTINATION bin)
