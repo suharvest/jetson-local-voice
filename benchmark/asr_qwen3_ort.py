@@ -17,13 +17,24 @@ import onnxruntime as ort
 
 
 def load_audio(path, target_sr=16000):
-    """Load WAV and resample to 16kHz if needed."""
-    with wave.open(path) as w:
-        sr = w.getframerate()
-        raw = w.readframes(w.getnframes())
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    """Load audio file and resample to 16kHz."""
+    try:
+        import soundfile as sf
+        audio, sr = sf.read(path, dtype='float32')
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)  # mono
+    except ImportError:
+        with wave.open(path) as w:
+            sr = w.getframerate()
+            raw = w.readframes(w.getnframes())
+            bps = w.getsampwidth()
+            if bps == 2:
+                audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif bps == 4:
+                audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                audio = np.frombuffer(raw, dtype=np.float32)
     if sr != target_sr:
-        # Simple linear interpolation resample (no scipy needed)
         ratio = target_sr / sr
         new_len = int(len(audio) * ratio)
         indices = np.linspace(0, len(audio) - 1, new_len)
@@ -32,7 +43,19 @@ def load_audio(path, target_sr=16000):
 
 
 def compute_fbank(audio, sr=16000, n_mels=128, n_fft=400, hop=160, win=400, fmax=8000):
-    """Compute 128-dim Fbank features at 100Hz (matching Qwen3-ASR)."""
+    """Compute mel features. Tries WhisperFeatureExtractor first, fallback to manual."""
+    try:
+        from transformers import WhisperFeatureExtractor
+        fe = WhisperFeatureExtractor(
+            feature_size=n_mels, sampling_rate=sr,
+            n_fft=n_fft, hop_length=hop, chunk_length=30,
+        )
+        features = fe(audio, sampling_rate=sr, return_tensors="np")
+        mel = features["input_features"][0].T  # [time, n_mels]
+        print(f"  (using WhisperFeatureExtractor)")
+        return mel.astype(np.float32)
+    except ImportError:
+        pass  # Fall through to manual
     # STFT
     padding = (n_fft - hop) // 2
     audio_padded = np.pad(audio, (padding, padding), mode='reflect')
@@ -140,34 +163,36 @@ class Qwen3ASR:
         print(f"  Encoder: {encoder_hidden.shape} ({enc_ms:.0f}ms)")
 
         # 3. Build prompt tokens for Qwen3-ASR
-        # Format: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
-        #         <|im_start|>user\n<|audio_start|>[audio_pad × N]<|audio_end|>\n
-        #         <asr_text><|im_end|>\n<|im_start|>assistant\n
-        audio_len = encoder_hidden.shape[1]  # number of audio tokens from encoder
+        # From andrewleech/qwen3-asr-onnx/src/prompt.py:
+        #   <|im_start|>system\n<|im_end|>\n
+        #   <|im_start|>user\n<|audio_start|>[audio_pad × N]<|audio_end|><|im_end|>\n
+        #   <|im_start|>assistant\n
+        audio_len = encoder_hidden.shape[1]
 
-        # Special token IDs
-        im_start = 151644
-        im_end = 151645
-        audio_start = 151669
-        audio_end = 151670
-        audio_pad = 151676
-        asr_text = 151704
+        IM_START = 151644
+        IM_END = 151645
+        AUDIO_START = 151669
+        AUDIO_END = 151670
+        AUDIO_PAD = 151676
+        NL = 198  # \n
 
-        # Build token sequence
-        system_text = "You are a helpful assistant."
-        if self.tokenizer:
-            sys_ids = self.tokenizer.encode(system_text).ids
-        else:
-            sys_ids = [2610, 525, 264, 10950, 17847, 13]
+        prompt_ids = [
+            IM_START, 9125, NL, IM_END, NL,          # system\n<|im_end|>\n
+            IM_START, 882, NL,                         # user\n
+            AUDIO_START,
+            *([AUDIO_PAD] * audio_len),                # audio_pad × N
+            AUDIO_END, IM_END, NL,                     # <|audio_end|><|im_end|>\n
+            IM_START, 77091, NL,                       # assistant\n
+        ]
 
-        prompt_ids = (
-            [im_start] + [8948, 198] +  # system\n
-            sys_ids + [im_end, 198] +    # text<|im_end|>\n
-            [im_start] + [872, 198] +    # user\n
-            [audio_start] + [audio_pad] * audio_len + [audio_end, 198] +  # audio
-            [asr_text, im_end, 198] +    # <asr_text><|im_end|>\n
-            [im_start] + [77091, 198]    # assistant\n
-        )
+        if language and language != "auto":
+            # Force language: append "language English<asr_text>" after assistant\n
+            if self.tokenizer:
+                lang_ids = self.tokenizer.encode(f"language {language}").ids
+            else:
+                lang_ids = []
+            prompt_ids.extend(lang_ids + [151704])  # <asr_text>
+
         prompt_ids = np.array([prompt_ids], dtype=np.int64)
         print(f"  Prompt: {prompt_ids.shape[1]} tokens (audio_pad×{audio_len})")
 
@@ -175,7 +200,7 @@ class Qwen3ASR:
         t0 = time.perf_counter()
         seq_len = prompt_ids.shape[1]
         # audio_offset = index of first audio_pad token in prompt
-        audio_offset = list(prompt_ids[0]).index(audio_pad)
+        audio_offset = list(prompt_ids[0]).index(AUDIO_PAD)
         init_inputs = {}
         for inp in self.decoder_init.get_inputs():
             if inp.name == "input_ids":
@@ -209,17 +234,19 @@ class Qwen3ASR:
         # 5. Autoregressive decode
         t0 = time.perf_counter()
         output_ids = []
-        eos_token_id = 151645  # <|im_end|>
+        eos_token_ids = {151643, 151645}  # <|endoftext|> and <|im_end|>
 
         for step in range(max_tokens):
             if logits is None:
                 break
             # Sample (greedy)
             next_token = int(np.argmax(logits[0, -1, :]))
-            if next_token == eos_token_id:
-                print(f"  EOS at step {step}")
+            if next_token in eos_token_ids:
+                print(f"  EOS at step {step} (token {next_token})")
                 break
             output_ids.append(next_token)
+            if step < 5:
+                print(f"    step {step}: token {next_token} = {self.tokenizer.decode([next_token]) if self.tokenizer else '?'}")
 
             # Prepare decoder_step input
             if self.embed_tokens is not None:
