@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,6 +49,24 @@ struct SynthResult {
   double rtf = 0;
 };
 
+// Streaming chunk delivered via callback
+struct StreamChunk {
+  std::vector<float> audio;  // new audio samples since last chunk
+  int total_frames;          // total codec frames generated so far
+  bool is_final;             // true on last chunk
+};
+
+// Callback type for streaming synthesis
+using AudioChunkCallback = std::function<void(const StreamChunk&)>;
+
+// Streaming configuration
+struct StreamConfig {
+  int first_chunk_frames = 10;   // smaller first chunk for low TTFA (~800ms)
+  int chunk_frames = 25;         // subsequent chunks (~2s audio each)
+  int max_frames = 200;
+  int seed = 42;
+};
+
 class TTSPipeline {
  public:
   TTSPipeline(const std::string& model_dir, const std::string& sherpa_dir,
@@ -74,11 +93,31 @@ class TTSPipeline {
                                      const std::vector<float>* speaker_embed,
                                      int max_frames = 200, int seed = 42);
 
+  // Streaming TTS with callback per audio chunk
+  void SynthesizeStreaming(const std::string& text, const std::string& lang,
+                           const std::vector<int64_t>& token_ids,
+                           const StreamConfig& config,
+                           AudioChunkCallback callback);
+
+  // Streaming with voice clone
+  void SynthesizeStreamingWithSpeaker(const std::string& text,
+                                      const std::string& lang,
+                                      const std::vector<int64_t>& token_ids,
+                                      const std::vector<float>& speaker_embed,
+                                      const StreamConfig& config,
+                                      AudioChunkCallback callback);
+
   // Extract speaker embedding from mel spectrogram
   std::vector<float> ExtractSpeakerEmbedding(const float* mel,
                                               int mel_frames);
 
  private:
+  // Core streaming generation loop
+  void GenerateStreaming(const std::string& text, const std::string& lang,
+                         const float* speaker_embed,
+                         const std::vector<int64_t>* token_ids,
+                         const StreamConfig& config,
+                         AudioChunkCallback callback);
   // Core generation loop
   SynthResult GenerateInternal(const std::string& text, const std::string& lang,
                                const float* speaker_embed,  // nullptr if none

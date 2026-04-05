@@ -40,7 +40,8 @@ class Qwen3TRTBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE}
+        caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE,
+                TTSCapability.STREAMING}
         if os.path.exists(QWEN3_SPEAKER_ENCODER):
             caps.add(TTSCapability.VOICE_CLONE)
         return caps
@@ -163,6 +164,36 @@ class Qwen3TRTBackend(TTSBackend):
             "sample_rate": self.sample_rate,
         }
         return wav_bytes, meta
+
+    def generate_streaming(self, text: str, **kwargs):
+        """Yield PCM int16 chunks via chunked vocoder streaming.
+
+        First chunk uses fewer frames (10) for low TTFA (~800ms),
+        subsequent chunks use 25 frames (~2s audio each).
+        """
+
+        language = kwargs.get("language", "english")
+        first_chunk_frames = kwargs.get("first_chunk_frames", 10)
+        chunk_frames = kwargs.get("chunk_frames", 25)
+        max_frames = kwargs.get("max_frames", 200)
+
+        token_ids = self._tokenize(text)
+
+        chunks = self._engine.synthesize_streaming(
+            text=text,
+            lang=language,
+            token_ids=token_ids,
+            first_chunk_frames=first_chunk_frames,
+            chunk_frames=chunk_frames,
+            max_frames=max_frames,
+        )
+
+        for chunk in chunks:
+            # Convert WAV bytes to raw PCM int16 (strip 44-byte WAV header)
+            wav_bytes = chunk["wav_bytes"]
+            if len(wav_bytes) > 44:
+                pcm_data = wav_bytes[44:]  # WAV header is 44 bytes
+                yield pcm_data
 
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
         """Extract speaker embedding using Python mel computation + ORT."""
