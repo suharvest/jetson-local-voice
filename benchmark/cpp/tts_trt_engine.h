@@ -75,6 +75,8 @@ class TRTTalkerEngine {
   std::vector<std::string> kv_names_;       // "past_key_0", "past_value_0", ...
   std::vector<std::string> new_kv_names_;   // "new_past_key_0", ...
   bool first_step_ = true;
+  bool has_position_ids_ = false;
+  void* d_position_id_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
