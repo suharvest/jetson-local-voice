@@ -247,7 +247,9 @@ def export_talker_decode(model, output_dir, opset=14):
                        input_names=["inputs_embeds", "attention_mask"] + in_kv,
                        output_names=["logits", "last_hidden"] + out_kv,
                        dynamic_axes={
+                           "inputs_embeds": {1: "seq_len"},
                            "attention_mask": {1: "full_len"},
+                           "last_hidden": {1: "seq_len"},
                            **{n: {2: "past_len"} for n in in_kv},
                            **{n: {2: "new_len"} for n in out_kv},
                        },
