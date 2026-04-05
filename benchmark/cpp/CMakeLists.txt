@@ -64,6 +64,7 @@ add_executable(qwen3_tts
     tts_trt_engine.cpp
     tts_ort_models.cpp
     tts_pipeline.cpp
+    asr_pipeline.cpp
 )
 
 target_link_libraries(qwen3_tts
@@ -96,6 +97,7 @@ if(pybind11_FOUND)
         tts_trt_engine.cpp
         tts_ort_models.cpp
         tts_pipeline.cpp
+        asr_pipeline.cpp
     )
     target_link_libraries(qwen3_tts_engine PRIVATE
         ${TRT_LIB}
