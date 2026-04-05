@@ -1,0 +1,8 @@
+# Jetson Voice v2.0 — lightweight, models downloaded on demand
+# Based on v1.0 but strips baked-in models via multi-stage copy
+FROM sensecraft-missionpack.seeed.cn/solution/jetson-voice:v1.0 AS base
+
+# Fresh final stage: copy everything EXCEPT /opt/models content
+FROM base
+RUN rm -rf /opt/models/* && mkdir -p /opt/models
+COPY app/ /opt/speech/app/

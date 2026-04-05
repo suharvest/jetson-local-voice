@@ -358,3 +358,26 @@ ASRResult ASRPipeline::Transcribe(const float* mel, int mel_len,
 
   return result;
 }
+
+void ASRPipeline::EnableProfiling(bool enable) {
+  if (decoder_) decoder_->EnableProfiling(enable);
+}
+
+void ASRPipeline::PrintProfilingStats() {
+  if (decoder_ && decoder_->stats().n_samples > 0) {
+    auto& s = decoder_->stats();
+    std::cout << "\n  === ASR DECODER PROFILING (" << s.n_samples
+              << " steps) ===" << std::endl;
+    std::cout << "  H2D:     avg=" << s.AvgH2D() << " ms, max=" << s.max_h2d
+              << " ms" << std::endl;
+    std::cout << "  Kernel:  avg=" << s.AvgKernel()
+              << " ms, max=" << s.max_kernel << " ms" << std::endl;
+    std::cout << "  D2H:     avg=" << s.AvgD2H() << " ms, max=" << s.max_d2h
+              << " ms" << std::endl;
+    std::cout << "  Total:   avg=" << s.AvgTotal()
+              << " ms, max=" << s.max_total << " ms" << std::endl;
+    std::cout << "  Overhead (bind+sync): avg=" << s.AvgOverhead() << " ms"
+              << std::endl;
+    decoder_->ResetStats();
+  }
+}

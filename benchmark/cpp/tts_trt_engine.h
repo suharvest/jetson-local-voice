@@ -10,6 +10,39 @@
 #include <string>
 #include <vector>
 
+// Per-step timing breakdown (CUDA events)
+struct StepTiming {
+  float h2d_ms = 0;      // Host-to-device copy
+  float kernel_ms = 0;   // TRT enqueue (GPU kernel)
+  float d2h_ms = 0;      // Device-to-host copy
+  float total_ms = 0;    // Wall clock (for comparison)
+};
+
+// Aggregate profiling stats
+struct ProfilingStats {
+  int n_samples = 0;
+  double sum_h2d = 0, sum_kernel = 0, sum_d2h = 0, sum_total = 0;
+  double max_h2d = 0, max_kernel = 0, max_d2h = 0, max_total = 0;
+
+  void Add(const StepTiming& t) {
+    n_samples++;
+    sum_h2d += t.h2d_ms;     sum_kernel += t.kernel_ms;
+    sum_d2h += t.d2h_ms;     sum_total += t.total_ms;
+    if (t.h2d_ms > max_h2d) max_h2d = t.h2d_ms;
+    if (t.kernel_ms > max_kernel) max_kernel = t.kernel_ms;
+    if (t.d2h_ms > max_d2h) max_d2h = t.d2h_ms;
+    if (t.total_ms > max_total) max_total = t.total_ms;
+  }
+
+  double AvgH2D()    const { return n_samples ? sum_h2d / n_samples : 0; }
+  double AvgKernel() const { return n_samples ? sum_kernel / n_samples : 0; }
+  double AvgD2H()    const { return n_samples ? sum_d2h / n_samples : 0; }
+  double AvgTotal()  const { return n_samples ? sum_total / n_samples : 0; }
+  double AvgOverhead() const { return AvgTotal() - AvgH2D() - AvgKernel() - AvgD2H(); }
+
+  void Reset() { *this = ProfilingStats{}; }
+};
+
 // TRT logger
 class TRTLogger : public nvinfer1::ILogger {
  public:
@@ -39,6 +72,12 @@ class TRTTalkerEngine {
     seq_len_ = 0;
     parity_ = 0;
   }
+
+  // Profiling control
+  void EnableProfiling(bool enable) { profiling_ = enable; }
+  bool profiling() const { return profiling_; }
+  const ProfilingStats& stats() const { return stats_; }
+  void ResetStats() { stats_.Reset(); }
 
  private:
   void AllocateBuffers();
@@ -77,6 +116,17 @@ class TRTTalkerEngine {
   bool first_step_ = true;
   bool has_position_ids_ = false;
   void* d_position_id_ = nullptr;
+
+  // CUDA event profiling
+  bool profiling_ = false;
+  ProfilingStats stats_;
+  cudaEvent_t ev_start_ = nullptr;
+  cudaEvent_t ev_h2d_done_ = nullptr;
+  cudaEvent_t ev_kernel_done_ = nullptr;
+  cudaEvent_t ev_d2h_done_ = nullptr;
+
+  // Cached emb tensor name for binding (avoid re-detection)
+  std::string emb_name_;
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +161,12 @@ class TRTCPEngine {
   void AppendEmbeddingFromTable(int layer_idx, int token_id);
   bool has_embed_table() const { return d_embed_table_ != nullptr; }
 
+  // Profiling control
+  void EnableProfiling(bool enable) { profiling_ = enable; }
+  bool profiling() const { return profiling_; }
+  const ProfilingStats& stats() const { return stats_; }
+  void ResetStats() { stats_.Reset(); }
+
  private:
   TRTLogger logger_;
   std::unique_ptr<nvinfer1::IRuntime> runtime_;
@@ -131,4 +187,12 @@ class TRTCPEngine {
   int embed_n_layers_ = 0;
   int embed_vocab_ = 0;
   int embed_dim_ = 0;
+
+  // CUDA event profiling
+  bool profiling_ = false;
+  ProfilingStats stats_;
+  cudaEvent_t ev_start_ = nullptr;
+  cudaEvent_t ev_h2d_done_ = nullptr;
+  cudaEvent_t ev_kernel_done_ = nullptr;
+  cudaEvent_t ev_d2h_done_ = nullptr;
 };

@@ -231,6 +231,12 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("max_frames") = 200,
            py::arg("seed") = 42)
 
+      .def("enable_profiling", &TTSPipeline::EnableProfiling,
+           py::arg("enable") = true,
+           "Enable CUDA event profiling for per-step timing breakdown")
+      .def("print_profiling_stats", &TTSPipeline::PrintProfilingStats,
+           "Print and reset CUDA event profiling stats")
+
       .def("synthesize_streaming_callback",
            [](TTSPipeline& self, const std::string& text,
               const std::string& lang,
@@ -330,6 +336,12 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            },
            py::arg("mel"),
            "Run encoder only and return audio feature length (T').")
+
+      .def("enable_profiling", &ASRPipeline::EnableProfiling,
+           py::arg("enable") = true,
+           "Enable CUDA event profiling for per-step timing breakdown")
+      .def("print_profiling_stats", &ASRPipeline::PrintProfilingStats,
+           "Print and reset CUDA event profiling stats")
 
       .def_property_readonly("hidden_dim", &ASRPipeline::hidden_dim)
       .def_property_readonly("vocab_size", &ASRPipeline::vocab_size)

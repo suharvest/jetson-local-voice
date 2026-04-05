@@ -46,6 +46,10 @@ class ASRPipeline {
   int vocab_size() const { return vocab_size_; }
   int n_layers() const { return n_layers_; }
 
+  // Enable CUDA event profiling for per-step timing breakdown
+  void EnableProfiling(bool enable);
+  void PrintProfilingStats();
+
   // Run encoder only: mel [1, 128, T] → EncoderOutput with audio_len
   struct EncoderOutput {
     std::vector<float> features;  // flattened [1, T', 1024]
