@@ -91,17 +91,19 @@ class Qwen3ASRBackend(ASRBackend):
         if os.path.exists(emb_path):
             self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
 
-        # TRT decoder via pybind11
-        engine_path = os.path.join(_BASE, "asr_decoder_fp16.engine")
-        if os.path.exists(engine_path):
-            try:
-                import qwen3_tts_engine
-                self._decoder = qwen3_tts_engine.ASRDecoder(
-                    engine_path, 28, 1024, 8, 128, 151936, 500)
-                self._trt_max_seq = 500
-                logger.info("ASR TRT decoder loaded: %s", engine_path)
-            except Exception as e:
-                logger.warning("TRT decoder failed: %s, using ORT fallback", e)
+        # TRT decoder via pybind11 — prefer BF16 engine (FP16 has QK^T overflow)
+        for engine_name in ["asr_decoder_bf16.engine", "asr_decoder_fp16.engine"]:
+            engine_path = os.path.join(_BASE, engine_name)
+            if os.path.exists(engine_path):
+                try:
+                    import qwen3_tts_engine
+                    self._decoder = qwen3_tts_engine.ASRDecoder(
+                        engine_path, 28, 1024, 8, 128, 151936, 500)
+                    self._trt_max_seq = 500
+                    logger.info("ASR TRT decoder loaded: %s", engine_path)
+                    break
+                except Exception as e:
+                    logger.warning("TRT decoder %s failed: %s", engine_name, e)
 
         # ORT decoder fallback (only if TRT not available)
         if self._decoder is None:
