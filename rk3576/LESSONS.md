@@ -175,6 +175,29 @@ RK3576 内核 (6.1.99) 缺少 `iptable_raw` 模块。Docker 默认修改 iptable
 | INT8 顺序 15 次 | 166ms | ❌ 精度不可用（top-1 仅 10%） |
 | **每次调用开销实测** | **0.9ms** | 之前估 16ms 是错的，瓶颈是纯计算 |
 | **RKLLM v1.2.3 + A55 核绑定** | **120ms** | ✅ 突破！cache 复用 + 消除 CPU 缓存争用 |
+| RKNN per-layer ONNX (W4A16) | 205ms | ❌ 75 次调用开销太大 |
+| RKNN full transformer (W4A16) | 150ms | ❌ 精度崩溃（cosine 0.01），需 disable_rules 破坏正确性 |
+| MatMul API approach | **69ms** | ✅ 目前最快 |
+
+### code_predictor per-layer ONNX 实验 (2026-04-05)
+
+**方案**：每层 transformer 导出为独立 ONNX，包含 RMSNorm + GQA attention + FFN。
+
+**关键发现**：
+1. **exSDPAttention 融合成功** — 所有 5 层的 MatMul+Softmax+MatMul 都被融合为 exSDPAttention（NPU FLOAT16）
+2. **W4A16 精度问题** — Layer 2 的 cosine similarity 仅 0.76（其余层 0.98+），与 calibration 数据无关（W4A16 只量化权重）
+3. **调用开销主导延迟** — 单层 2.4ms，75 次调用 = 180ms 纯开销
+4. **全模型 RKNN 编译 bug** — `input_output_align_nd_expand` 规则在 5 层模型上崩溃；disable 后编译通过但输出完全错误（fp16 也一样）
+5. **RMSNorm 的 rsqrt 分解** — 导出为 1/sqrt(x) = Div 算子，fallback CPU，增加 NPU↔CPU 切换开销
+
+**数据**：
+| 模型 | 大小 | 单次推理 | 15 步总时间 | 精度 (cosine) |
+|------|------|---------|-----------|-------------|
+| 单层 W4A16 ×5 | 46 MB | 2.4ms/层 | 205ms | 0.78 (cascaded) |
+| 全模型 W4A16 | 44 MB | 8.5ms | 150ms | 0.01 ❌ |
+| 全模型 FP16 | 161 MB | 18ms | ~290ms | 0.01 ❌ |
+
+**结论**：per-layer ONNX 方案不可行。exSDPAttention 融合虽然成功，但 (1) 调用开销抵消了计算优化，(2) W4A16 在 Layer 2 精度不足，(3) 全模型编译需要 disable 影响正确性的规则。MatMul API (69ms) 仍是 code_predictor 最优方案。
 
 ### 完整 pipeline
 
