@@ -156,40 +156,40 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
   auto& read = (parity_ == 0) ? kv_a_ : kv_b_;
   auto& write = (parity_ == 0) ? kv_b_ : kv_a_;
 
-  // Copy inputs_embeds to GPU (4KB for D=1024 FP32)
+  // Copy inputs_embeds to GPU (4KB)
   size_t emb_bytes = 1 * 1 * hidden_dim_ * sizeof(float);
   CHECK_CUDA(cudaMemcpyAsync(d_emb_, inputs_embeds, emb_bytes,
                              cudaMemcpyHostToDevice, stream_));
 
-  // Bind inputs_embeds
-  ctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, hidden_dim_});
-  ctx->setTensorAddress("inputs_embeds", d_emb_);
-
-  // Bind KV cache — pointer swap, no memcpy
-  char name_buf[64];
-  for (int i = 0; i < n_layers_; ++i) {
-    // past_key_i
-    snprintf(name_buf, sizeof(name_buf), "past_key_%d", i);
-    ctx->setInputShape(name_buf,
-                       nvinfer1::Dims4{1, n_heads_, seq_len_, head_dim_});
-    ctx->setTensorAddress(name_buf, read[2 * i]);
-
-    snprintf(name_buf, sizeof(name_buf), "new_past_key_%d", i);
-    ctx->setTensorAddress(name_buf, write[2 * i]);
-
-    // past_value_i
-    snprintf(name_buf, sizeof(name_buf), "past_value_%d", i);
-    ctx->setInputShape(name_buf,
-                       nvinfer1::Dims4{1, n_heads_, seq_len_, head_dim_});
-    ctx->setTensorAddress(name_buf, read[2 * i + 1]);
-
-    snprintf(name_buf, sizeof(name_buf), "new_past_value_%d", i);
-    ctx->setTensorAddress(name_buf, write[2 * i + 1]);
+  // Initialize cached names on first call
+  if (first_step_) {
+    kv_names_.resize(2 * n_layers_);
+    new_kv_names_.resize(2 * n_layers_);
+    for (int i = 0; i < n_layers_; ++i) {
+      kv_names_[2 * i] = "past_key_" + std::to_string(i);
+      kv_names_[2 * i + 1] = "past_value_" + std::to_string(i);
+      new_kv_names_[2 * i] = "new_past_key_" + std::to_string(i);
+      new_kv_names_[2 * i + 1] = "new_past_value_" + std::to_string(i);
+    }
+    // Bind static tensors (only need to do once)
+    ctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, hidden_dim_});
+    ctx->setTensorAddress("inputs_embeds", d_emb_);
+    ctx->setTensorAddress("logits", d_logits_);
+    ctx->setTensorAddress("last_hidden", d_hidden_);
+    first_step_ = false;
   }
 
-  // Bind outputs
-  ctx->setTensorAddress("logits", d_logits_);
-  ctx->setTensorAddress("last_hidden", d_hidden_);
+  // Bind KV cache — only shapes and addresses change per step
+  nvinfer1::Dims4 kv_shape{1, n_heads_, seq_len_, head_dim_};
+  for (int i = 0; i < n_layers_; ++i) {
+    ctx->setInputShape(kv_names_[2 * i].c_str(), kv_shape);
+    ctx->setTensorAddress(kv_names_[2 * i].c_str(), read[2 * i]);
+    ctx->setTensorAddress(new_kv_names_[2 * i].c_str(), write[2 * i]);
+
+    ctx->setInputShape(kv_names_[2 * i + 1].c_str(), kv_shape);
+    ctx->setTensorAddress(kv_names_[2 * i + 1].c_str(), read[2 * i + 1]);
+    ctx->setTensorAddress(new_kv_names_[2 * i + 1].c_str(), write[2 * i + 1]);
+  }
 
   // Execute
   ctx->enqueueV3(stream_);
