@@ -297,11 +297,89 @@ async def asr_stream(
     Client sends: raw int16 PCM bytes
     Client sends: empty bytes b"" to signal end
     Server sends: JSON {"text": "...", "is_final": bool, "is_stable": bool}
+
+    Uses Qwen3-ASR backend (accumulate-then-transcribe) if it has STREAMING
+    capability; otherwise falls back to sherpa streaming_asr_service.
     """
     import asyncio
     import numpy as np
+    from asr_backend import ASRCapability
 
     await ws.accept()
+
+    # Choose backend: prefer ASR backend with STREAMING, fall back to sherpa
+    asr_be = _get_asr_backend()
+    use_backend_stream = (
+        asr_be is not None
+        and asr_be.is_ready()
+        and asr_be.has_capability(ASRCapability.STREAMING)
+    )
+
+    if use_backend_stream:
+        await _asr_stream_backend(ws, asr_be, language, sample_rate)
+    else:
+        await _asr_stream_sherpa(ws, language, sample_rate)
+
+
+async def _asr_stream_backend(
+    ws: WebSocket,
+    asr_be,
+    language: str,
+    sample_rate: int,
+):
+    """Streaming ASR using ASR backend (accumulate-then-transcribe)."""
+    import asyncio
+    import numpy as np
+
+    stream = asr_be.create_stream(language=language)
+    logger.info("ASR stream opened (backend=%s)", asr_be.name)
+
+    try:
+        while True:
+            data = await ws.receive_bytes()
+
+            if len(data) == 0:
+                # End of audio -- run full pipeline
+                final_text = await asyncio.to_thread(stream.finalize)
+                await ws.send_json({
+                    "text": final_text,
+                    "is_final": True,
+                    "is_stable": True,
+                })
+                break
+
+            # Buffer audio
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            stream.accept_waveform(sample_rate, samples)
+
+            # Check for partial results (V2 feature, no-op by default)
+            partial_text, is_endpoint = stream.get_partial()
+            if partial_text:
+                await ws.send_json({
+                    "text": partial_text,
+                    "is_final": is_endpoint,
+                    "is_stable": False,
+                })
+
+    except WebSocketDisconnect:
+        logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)
+    except Exception as e:
+        logger.error("ASR stream error (backend=%s): %s", asr_be.name, e)
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+async def _asr_stream_sherpa(
+    ws: WebSocket,
+    language: str,
+    sample_rate: int,
+):
+    """Streaming ASR using sherpa-onnx OnlineRecognizer (original path)."""
+    import asyncio
+    import numpy as np
 
     try:
         import streaming_asr_service
@@ -352,9 +430,9 @@ async def asr_stream(
                 prev_text = text
 
     except WebSocketDisconnect:
-        logger.debug("ASR stream client disconnected")
+        logger.debug("ASR stream client disconnected (sherpa)")
     except Exception as e:
-        logger.error(f"ASR stream error: {e}")
+        logger.error("ASR stream error (sherpa): %s", e)
     finally:
         try:
             await ws.close()

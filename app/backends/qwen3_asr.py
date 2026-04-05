@@ -1,6 +1,6 @@
 """Qwen3-ASR backend — C++ pipeline (encoder + prefill + TRT decoder) via pybind11.
 
-Supports: OFFLINE, MULTI_LANGUAGE, LANGUAGE_ID
+Supports: OFFLINE, STREAMING, MULTI_LANGUAGE, LANGUAGE_ID
 Models loaded once at preload(), stays resident.
 
 The C++ pipeline (ASRPipeline) handles encoder, prefill, and TRT decode loop.
@@ -20,7 +20,7 @@ from typing import Optional
 
 import numpy as np
 
-from asr_backend import ASRBackend, ASRCapability, TranscriptionResult
+from asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,49 @@ AUDIO_END = 151670
 AUDIO_PAD = 151676
 ASR_TEXT = 151704
 EOS_IDS = {151643, 151645}
+
+
+class Qwen3ASRStream(ASRStream):
+    """Accumulate-then-transcribe streaming session for Qwen3-ASR.
+
+    Audio chunks are buffered; full pipeline runs on finalize().
+    """
+
+    def __init__(self, backend: "Qwen3ASRBackend", language: str = "auto"):
+        self._backend = backend
+        self._language = language
+        self._chunks: list[np.ndarray] = []
+        self._total_samples = 0
+
+    def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(samples) * ratio)
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, new_len),
+                np.arange(len(samples)),
+                samples,
+            ).astype(np.float32)
+        self._chunks.append(samples)
+        self._total_samples += len(samples)
+
+    def finalize(self) -> str:
+        if not self._chunks:
+            return ""
+        audio = np.concatenate(self._chunks)
+        duration = len(audio) / 16000
+        logger.info("Qwen3ASR stream finalize: %.1fs audio (%d samples)",
+                     duration, len(audio))
+
+        result = self._backend.transcribe_audio(audio, language=self._language)
+        return result.text
+
+    def get_partial(self) -> tuple[str, bool]:
+        # V1: no partial results; could add duration-based hints later
+        return "", False
 
 
 class Qwen3ASRBackend(ASRBackend):
@@ -57,7 +100,7 @@ class Qwen3ASRBackend(ASRBackend):
 
     @property
     def capabilities(self) -> set[ASRCapability]:
-        return {ASRCapability.OFFLINE, ASRCapability.MULTI_LANGUAGE, ASRCapability.LANGUAGE_ID}
+        return {ASRCapability.OFFLINE, ASRCapability.STREAMING, ASRCapability.MULTI_LANGUAGE, ASRCapability.LANGUAGE_ID}
 
     @property
     def sample_rate(self) -> int:
@@ -151,8 +194,18 @@ class Qwen3ASRBackend(ASRBackend):
                      time.time() - t0, backend_name)
         self._ready = True
 
+    def create_stream(self, language: str = "auto") -> Qwen3ASRStream:
+        """Create an accumulate-then-transcribe streaming session."""
+        if not self._ready:
+            raise RuntimeError("Qwen3-ASR backend not ready")
+        return Qwen3ASRStream(self, language=language)
+
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         audio = self._bytes_to_float(audio_bytes)
+        return self.transcribe_audio(audio, language=language)
+
+    def transcribe_audio(self, audio: np.ndarray, language: str = "auto") -> TranscriptionResult:
+        """Transcribe float32 audio array (16kHz, [-1,1])."""
         t_total = time.perf_counter()
 
         # 1. Mel spectrogram (always computed in Python)
