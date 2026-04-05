@@ -156,38 +156,50 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
     const std::string& text, const std::string& lang,
     const float* speaker_embed,
     const std::vector<int64_t>* token_ids_ptr) {
-  // Exactly mirrors Python tts_sherpa_trt.py build_prefill():
-  //   prefill[0..2] = role_emb (text_proj([151644, 77091, 198]))
-  //   prefill[3]    = tts_pad + codec[NOTHINK]
-  //   prefill[4]    = tts_pad + codec[THINK_BOS]
-  //   prefill[5]    = tts_pad + codec[THINK_EOS]
-  //   prefill[6]    = tts_bos + codec[PAD]
-  //   prefill[7]    = body[0] + codec[BOS]
-  //   trailing[i]   = body[i+1] + codec[PAD]  (then tts_eos + codec[PAD])
+  // Official Qwen3-TTS prefill layout (multi-language):
+  //   [0..2]  = role_emb (text_proj([151644, 77091, 198]))
+  //   [3]     = tts_pad + codec[THINK]
+  //   [4]     = tts_pad + codec[THINK_BOS]
+  //   [5]     = tts_pad + codec[lang_id]
+  //   [6]     = tts_pad + codec[THINK_EOS]
+  //   [6+s]   = speaker_embed             (only if voice clone, s=1)
+  //   [7+s]   = tts_bos + codec[PAD]
+  //   [8+s]   = body[0]  + codec[BOS]
+  //   trailing = body[1:] + codec[PAD], then tts_eos + codec[PAD]
 
   int D = cfg_.hidden_dim;
   PrefillData pf;
 
-  // role_emb = text_proj([151644, 77091, 198])  → [1, 3, D]
+  // role_emb = text_proj([<|im_start|>, assistant, \n])
   auto role_emb = ort_->TextProject({151644, 77091, 198});
 
-  // special_emb = text_proj([TTS_BOS, TTS_EOS, TTS_PAD])  → [1, 3, D]
+  // special_emb = text_proj([TTS_BOS, TTS_EOS, TTS_PAD])
   auto special_emb = ort_->TextProject(
       {cfg_.tts_bos_token_id, cfg_.tts_eos_token_id, cfg_.tts_pad_token_id});
   const float* tts_bos_e = special_emb.data();
   const float* tts_eos_e = special_emb.data() + D;
   const float* tts_pad_e = special_emb.data() + 2 * D;
 
-  // codec_prefix = codec_emb([NOTHINK, THINK_BOS, THINK_EOS, PAD, BOS])  → [1, 5, D]
-  auto codec_prefix = ort_->CodecEmbed({
-      cfg_.codec_nothink_id, cfg_.codec_think_bos_id,
-      cfg_.codec_think_eos_id, cfg_.codec_pad_id, cfg_.codec_bos_id});
+  // Codec prefix: [THINK, THINK_BOS, lang_id, THINK_EOS, PAD, BOS]
+  int lang_id = cfg_.GetLangId(lang);
+  std::vector<int64_t> codec_ids;
+  if (lang_id >= 0) {
+    codec_ids = {cfg_.codec_think_id, cfg_.codec_think_bos_id,
+                 (int64_t)lang_id, cfg_.codec_think_eos_id,
+                 cfg_.codec_pad_id, cfg_.codec_bos_id};
+  } else {
+    // Fallback: no language token (like old simplified version)
+    codec_ids = {cfg_.codec_nothink_id, cfg_.codec_think_bos_id,
+                 cfg_.codec_think_eos_id,
+                 cfg_.codec_pad_id, cfg_.codec_bos_id};
+  }
+  auto codec_prefix = ort_->CodecEmbed(codec_ids);
+  int n_codec = (int)codec_ids.size();  // 6 (with lang) or 5 (without)
 
-  // codec_pad_e = codec_emb([PAD])  → [1, 1, D]
+  // codec_pad for decode loop
   auto codec_pad_v = ort_->CodecEmbed({cfg_.codec_pad_id});
   const float* codec_pad_e = codec_pad_v.data();
 
-  // Save for decode loop
   pf.tts_pad_e.assign(tts_pad_e, tts_pad_e + D);
   pf.codec_pad_e.assign(codec_pad_e, codec_pad_e + D);
 
@@ -203,49 +215,42 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
     body_emb = ort_->TextProject(text_ids);
   }
 
-  // Build prefill: 8 tokens (no clone) or 9 tokens (x-vector clone)
-  //
-  // Without speaker_embed (8 tokens):
-  //   [0..2] = role, [3]=pad+NOTHINK, [4]=pad+THINK_BOS,
-  //   [5]=pad+THINK_EOS, [6]=bos+PAD, [7]=body[0]+BOS
-  //
-  // With speaker_embed (9 tokens, official Qwen3-TTS x-vector mode):
-  //   [0..2] = role, [3]=pad+NOTHINK, [4]=pad+THINK_BOS,
-  //   [5]=pad+THINK_EOS, [6]=pad+speaker_embed, [7]=bos+PAD, [8]=body[0]+BOS
-
-  int n_prefix = speaker_embed ? 9 : 8;
+  // Assemble prefill:
+  //   role(3) + tts_pad+codec[0..N-3](N-2 tokens) + speaker?(1) + tts_bos+codec[N-2] + body[0]+codec[N-1]
+  // codec layout: [0..N-3] = think prefix, [N-2] = PAD, [N-1] = BOS
+  int has_spk = speaker_embed ? 1 : 0;
+  int n_prefix = 3 + (n_codec - 2) + has_spk + 1 + (body_emb.empty() ? 0 : 1);
   std::vector<float> prefill(n_prefix * D, 0.0f);
+  int pos = 0;
 
-  // [0..2] = role_emb
-  VecCopy(prefill.data(), role_emb.data(), 3 * D);
+  // [0..2] = role
+  VecCopy(prefill.data() + pos * D, role_emb.data(), 3 * D);
+  pos += 3;
 
-  // [3] = tts_pad + codec[NOTHINK]
-  VecAdd(prefill.data() + 3 * D, tts_pad_e, codec_prefix.data(), D);
-  // [4] = tts_pad + codec[THINK_BOS]
-  VecAdd(prefill.data() + 4 * D, tts_pad_e, codec_prefix.data() + D, D);
-  // [5] = tts_pad + codec[THINK_EOS]
-  VecAdd(prefill.data() + 5 * D, tts_pad_e, codec_prefix.data() + 2 * D, D);
+  // [3..3+N-3] = tts_pad + codec[0..N-3] (think prefix tokens)
+  for (int i = 0; i < n_codec - 2; ++i) {
+    VecAdd(prefill.data() + pos * D, tts_pad_e, codec_prefix.data() + i * D, D);
+    pos++;
+  }
 
+  // Optional speaker embed
   if (speaker_embed) {
-    // [6] = speaker_embed (raw, as codec-space embedding per official code)
-    VecCopy(prefill.data() + 6 * D, speaker_embed, D);
-    // [7] = tts_bos + codec[PAD]
-    VecAdd(prefill.data() + 7 * D, tts_bos_e, codec_prefix.data() + 3 * D, D);
-    // [8] = body[0] + codec[BOS]
-    if (!body_emb.empty()) {
-      VecAdd(prefill.data() + 8 * D, body_emb.data(), codec_prefix.data() + 4 * D, D);
-    }
-  } else {
-    // [6] = tts_bos + codec[PAD]
-    VecAdd(prefill.data() + 6 * D, tts_bos_e, codec_prefix.data() + 3 * D, D);
-    // [7] = body[0] + codec[BOS]
-    if (!body_emb.empty()) {
-      VecAdd(prefill.data() + 7 * D, body_emb.data(), codec_prefix.data() + 4 * D, D);
-    }
+    VecCopy(prefill.data() + pos * D, speaker_embed, D);
+    pos++;
+  }
+
+  // tts_bos + codec[PAD] (second-to-last codec token)
+  VecAdd(prefill.data() + pos * D, tts_bos_e, codec_prefix.data() + (n_codec - 2) * D, D);
+  pos++;
+
+  // body[0] + codec[BOS] (last codec token)
+  if (!body_emb.empty()) {
+    VecAdd(prefill.data() + pos * D, body_emb.data(), codec_prefix.data() + (n_codec - 1) * D, D);
+    pos++;
   }
 
   pf.embeds = std::move(prefill);
-  pf.seq_len = n_prefix;
+  pf.seq_len = pos;
 
   // Trailing text: body[1:] + codec_pad, then tts_eos + codec_pad
   int n_text = body_emb.empty() ? 0 : (int)(body_emb.size() / D);
