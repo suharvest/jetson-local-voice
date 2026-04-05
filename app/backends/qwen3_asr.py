@@ -21,7 +21,8 @@ from asr_backend import ASRBackend, ASRCapability, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
-_BASE = os.environ.get("QWEN3_ASR_MODEL_BASE", "/opt/models/qwen3-asr")
+# Self-exported v2 with per-layer KV cache (validated with ORT 1.20 CUDA EP)
+_BASE = os.environ.get("QWEN3_ASR_MODEL_BASE", "/opt/models/qwen3-asr-v2")
 
 # Prompt constants (from andrewleech/qwen3-asr-onnx/src/prompt.py)
 IM_START = 151644
@@ -62,55 +63,55 @@ class Qwen3ASRBackend(ASRBackend):
     def preload(self) -> None:
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 
         logger.info("Loading Qwen3-ASR from %s", _BASE)
         t0 = time.time()
 
+        logger.info("Loading encoder...")
         self._encoder = ort.InferenceSession(
             os.path.join(_BASE, "encoder.onnx"), so, providers=providers)
+        logger.info("Encoder OK")
 
         # Prefill: try decoder_prefill (v2) then decoder_init (community)
         for name in ["decoder_prefill.onnx", "decoder_init.onnx"]:
             path = os.path.join(_BASE, name)
+            if not os.path.exists(path):
+                path = os.path.join("/opt/models/qwen3-asr", name)
             if os.path.exists(path):
-                self._prefill = ort.InferenceSession(path, so, providers=providers)
-                break
+                try:
+                    self._prefill = ort.InferenceSession(path, so, providers=providers)
+                    logger.info("Prefill loaded: %s", path)
+                    break
+                except Exception as e:
+                    logger.warning("Prefill %s failed: %s", name, e)
 
         # Embed tokens
         emb_path = os.path.join(_BASE, "embed_tokens.bin")
         if os.path.exists(emb_path):
             self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
 
-        # TRT decoder via pybind11 (same C++ engine as TTS talker)
+        # TRT decoder via pybind11
         engine_path = os.path.join(_BASE, "asr_decoder_fp16.engine")
-        if not os.path.exists(engine_path):
-            # Also check v2 directory
-            engine_path = os.path.join(_BASE.replace("qwen3-asr", "qwen3-asr-v2"), "asr_decoder_fp16.engine")
+        if os.path.exists(engine_path):
+            try:
+                import qwen3_tts_engine
+                self._decoder = qwen3_tts_engine.ASRDecoder(
+                    engine_path, 28, 1024, 8, 128, 151936, 500)
+                self._trt_max_seq = 500
+                logger.info("ASR TRT decoder loaded: %s", engine_path)
+            except Exception as e:
+                logger.warning("TRT decoder failed: %s, using ORT fallback", e)
 
-        # TODO: TRT decoder needs KV dtype/position_ids alignment with ORT prefill
-        # Disabled for now — ORT decode works correctly
-        # if os.path.exists(engine_path):
-        #     try:
-        #         import qwen3_tts_engine
-        #         self._decoder = qwen3_tts_engine.ASRDecoder(
-        #             engine_path, 28, 1024, 8, 128, 151936, 500)
-        #         logger.info("ASR TRT decoder loaded: %s", engine_path)
-        #     except Exception as e:
-        #         logger.warning("TRT decoder failed: %s, using ORT fallback", e)
-        if False:
-            pass  # TRT disabled until KV alignment fixed
-
-        # ORT decoder fallback
+        # ORT decoder fallback (only if TRT not available)
         if self._decoder is None:
-            for name in ["decoder_step.onnx"]:
-                path = os.path.join(_BASE, name)
-                if os.path.exists(path):
-                    try:
-                        self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
-                        logger.info("ASR ORT decoder loaded")
-                    except Exception as e:
-                        logger.warning("ORT decoder failed: %s", e)
+            path = os.path.join(_BASE, "decoder_step.onnx")
+            if os.path.exists(path):
+                try:
+                    self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
+                    logger.info("ASR ORT decoder loaded: %s", path)
+                except Exception as e:
+                    logger.warning("ORT decoder load failed: %s", e)
 
         # Tokenizer
         tok_path = os.path.join(_BASE, "tokenizer.json")
@@ -161,9 +162,16 @@ class Qwen3ASRBackend(ASRBackend):
         kv = {k.replace("present_", "past_"): v for k, v in out_map.items()
               if k.startswith("past_") or k.startswith("present_")}
 
-        # Seed TRT KV
-        if self._decoder:
+        # Seed TRT KV (only if seq fits in engine's max profile)
+        use_trt = self._decoder and seq_len <= getattr(self, '_trt_max_seq', 500)
+        if use_trt:
+            self._decoder.reset()
+            # Ensure KV arrays are contiguous FP32
+            for k in list(kv.keys()):
+                kv[k] = np.ascontiguousarray(kv[k].astype(np.float32))
             self._decoder.seed_kv(kv, seq_len)
+        elif self._decoder:
+            logger.debug("seq_len %d > TRT max %d, using ORT fallback", seq_len, self._trt_max_seq)
 
         # 5. Decode
         t0 = time.perf_counter()
@@ -177,7 +185,7 @@ class Qwen3ASRBackend(ASRBackend):
             embeds = self._embed_tokens[next_token][np.newaxis, np.newaxis, :]
             cur_pos = seq_len + step
 
-            if self._decoder:
+            if use_trt:
                 logits = self._decoder.decode_step(embeds, 151936)
             elif self._decoder_ort:
                 step_in = {"input_embeds": embeds,
@@ -230,8 +238,11 @@ class Qwen3ASRBackend(ASRBackend):
 
     def _compute_mel(self, audio):
         from transformers import WhisperFeatureExtractor
+        # Use chunk_length matching actual audio to avoid excessive padding
+        audio_secs = len(audio) / 16000
+        chunk_len = min(30, int(audio_secs) + 1)  # Round up, max 30s
         fe = WhisperFeatureExtractor(feature_size=128, sampling_rate=16000,
-                                     n_fft=400, hop_length=160, chunk_length=30)
+                                     n_fft=400, hop_length=160, chunk_length=chunk_len)
         features = fe(audio, sampling_rate=16000, return_tensors="np")
         return features["input_features"]  # [1, 128, T]
 
