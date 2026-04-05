@@ -203,27 +203,49 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
     body_emb = ort_->TextProject(text_ids);
   }
 
-  // Build fixed 8-token prefill
-  std::vector<float> prefill(8 * D, 0.0f);
+  // Build prefill: 8 tokens (no clone) or 9 tokens (x-vector clone)
+  //
+  // Without speaker_embed (8 tokens):
+  //   [0..2] = role, [3]=pad+NOTHINK, [4]=pad+THINK_BOS,
+  //   [5]=pad+THINK_EOS, [6]=bos+PAD, [7]=body[0]+BOS
+  //
+  // With speaker_embed (9 tokens, official Qwen3-TTS x-vector mode):
+  //   [0..2] = role, [3]=pad+NOTHINK, [4]=pad+THINK_BOS,
+  //   [5]=pad+THINK_EOS, [6]=pad+speaker_embed, [7]=bos+PAD, [8]=body[0]+BOS
+
+  int n_prefix = speaker_embed ? 9 : 8;
+  std::vector<float> prefill(n_prefix * D, 0.0f);
 
   // [0..2] = role_emb
   VecCopy(prefill.data(), role_emb.data(), 3 * D);
 
-  // [3] = tts_pad + codec_prefix[0] (NOTHINK)
+  // [3] = tts_pad + codec[NOTHINK]
   VecAdd(prefill.data() + 3 * D, tts_pad_e, codec_prefix.data(), D);
-  // [4] = tts_pad + codec_prefix[1] (THINK_BOS)
+  // [4] = tts_pad + codec[THINK_BOS]
   VecAdd(prefill.data() + 4 * D, tts_pad_e, codec_prefix.data() + D, D);
-  // [5] = tts_pad + codec_prefix[2] (THINK_EOS)
+  // [5] = tts_pad + codec[THINK_EOS]
   VecAdd(prefill.data() + 5 * D, tts_pad_e, codec_prefix.data() + 2 * D, D);
-  // [6] = tts_bos + codec_prefix[3] (PAD)
-  VecAdd(prefill.data() + 6 * D, tts_bos_e, codec_prefix.data() + 3 * D, D);
-  // [7] = body[0] + codec_prefix[4] (BOS)
-  if (!body_emb.empty()) {
-    VecAdd(prefill.data() + 7 * D, body_emb.data(), codec_prefix.data() + 4 * D, D);
+
+  if (speaker_embed) {
+    // [6] = speaker_embed (raw, as codec-space embedding per official code)
+    VecCopy(prefill.data() + 6 * D, speaker_embed, D);
+    // [7] = tts_bos + codec[PAD]
+    VecAdd(prefill.data() + 7 * D, tts_bos_e, codec_prefix.data() + 3 * D, D);
+    // [8] = body[0] + codec[BOS]
+    if (!body_emb.empty()) {
+      VecAdd(prefill.data() + 8 * D, body_emb.data(), codec_prefix.data() + 4 * D, D);
+    }
+  } else {
+    // [6] = tts_bos + codec[PAD]
+    VecAdd(prefill.data() + 6 * D, tts_bos_e, codec_prefix.data() + 3 * D, D);
+    // [7] = body[0] + codec[BOS]
+    if (!body_emb.empty()) {
+      VecAdd(prefill.data() + 7 * D, body_emb.data(), codec_prefix.data() + 4 * D, D);
+    }
   }
 
   pf.embeds = std::move(prefill);
-  pf.seq_len = 8;
+  pf.seq_len = n_prefix;
 
   // Trailing text: body[1:] + codec_pad, then tts_eos + codec_pad
   int n_text = body_emb.empty() ? 0 : (int)(body_emb.size() / D);
