@@ -42,7 +42,13 @@ ORTModels::ORTModels(const std::string& model_dir,
   text_project_ = load(sherpa_dir + "/text_project.onnx");
   codec_embed_ = load(sherpa_dir + "/codec_embed.onnx");
   cp_embed_ = load(sherpa_dir + "/code_predictor_embed.onnx");
+  // talker_prefill: optional — load if present (used as fallback when TRT
+  // engine doesn't support dynamic inputs_embeds seq_len)
   talker_prefill_ = load(sherpa_dir + "/talker_prefill.onnx");
+  if (!talker_prefill_) {
+    std::cout << "  talker_prefill.onnx not found — will use TRT unified prefill"
+              << std::endl;
+  }
 
   // Vocoder: try multiple names/paths
   if (fs::exists(sherpa_dir + "/vocoder.onnx"))
@@ -141,13 +147,45 @@ std::vector<float> ORTModels::CPEmbed(int64_t token_id, int64_t layer_idx) {
 ORTModels::PrefillResult ORTModels::TalkerPrefill(const float* embeds,
                                                    int seq_len,
                                                    int hidden_dim) {
-  assert(talker_prefill_);
+  assert(talker_prefill_ &&
+         "TalkerPrefill called but ORT session not loaded. "
+         "Use TRTTalkerEngine::Prefill() with unified engine instead.");
   PrefillResult result;
 
-  int64_t shape[] = {1, seq_len, hidden_dim};
-  size_t count = 1 * seq_len * hidden_dim;
-  auto val = Ort::Value::CreateTensor<float>(mem_info_, const_cast<float*>(embeds),
-                                             count, shape, 3);
+  // Build inputs dynamically based on what the model expects
+  size_t n_inputs = talker_prefill_->GetInputCount();
+  std::vector<Ort::AllocatedStringPtr> in_name_ptrs;
+  std::vector<const char*> in_names;
+  for (size_t i = 0; i < n_inputs; ++i) {
+    in_name_ptrs.push_back(
+        talker_prefill_->GetInputNameAllocated(i, Ort::AllocatorWithDefaultOptions()));
+    in_names.push_back(in_name_ptrs.back().get());
+  }
+
+  // Prepare tensors
+  int64_t emb_shape[] = {1, seq_len, hidden_dim};
+  size_t emb_count = 1 * seq_len * hidden_dim;
+  // attention_mask: all ones [1, T]
+  std::vector<int64_t> attn_mask(seq_len, 1);
+  int64_t mask_shape[] = {1, (int64_t)seq_len};
+
+  std::vector<Ort::Value> inputs;
+  for (size_t i = 0; i < n_inputs; ++i) {
+    std::string name = in_names[i];
+    if (name == "inputs_embeds") {
+      inputs.push_back(Ort::Value::CreateTensor<float>(
+          mem_info_, const_cast<float*>(embeds), emb_count, emb_shape, 3));
+    } else if (name == "attention_mask") {
+      inputs.push_back(Ort::Value::CreateTensor<int64_t>(
+          mem_info_, attn_mask.data(), seq_len, mask_shape, 2));
+    } else {
+      std::cerr << "[TTS] Unknown prefill input: " << name << std::endl;
+      int64_t dummy = 0;
+      int64_t dummy_shape[] = {1};
+      inputs.push_back(Ort::Value::CreateTensor<int64_t>(
+          mem_info_, &dummy, 1, dummy_shape, 1));
+    }
+  }
 
   // Get all output names
   size_t n_outputs = talker_prefill_->GetOutputCount();
@@ -159,11 +197,9 @@ ORTModels::PrefillResult ORTModels::TalkerPrefill(const float* embeds,
     out_names.push_back(out_name_ptrs.back().get());
   }
 
-  auto in_name = talker_prefill_->GetInputNameAllocated(0, Ort::AllocatorWithDefaultOptions());
-  const char* in_ptr = in_name.get();
-
-  auto outputs = talker_prefill_->Run(Ort::RunOptions{nullptr}, &in_ptr, &val,
-                                       1, out_names.data(), n_outputs);
+  auto outputs = talker_prefill_->Run(Ort::RunOptions{nullptr}, in_names.data(),
+                                       inputs.data(), n_inputs,
+                                       out_names.data(), n_outputs);
 
   // Parse outputs: logits, last_hidden, past_key_0, past_value_0, ...
   for (size_t i = 0; i < n_outputs; ++i) {

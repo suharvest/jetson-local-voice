@@ -290,29 +290,40 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
   auto pf = BuildPrefill(text, lang, speaker_embed, token_ids);
   std::cout << "  Prefill: " << pf.seq_len << " tokens" << std::endl;
 
-  // Run prefill (ORT CUDA)
+  // Run prefill: try TRT unified engine first, fall back to ORT
   auto t0 = Clock::now();
-  auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
-  result.prefill_ms =
-      std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-
-  // Seed TRT KV cache
-  std::vector<const float*> kv_ptrs;
-  for (auto& kv : pf_result.kv_data) {
-    kv_ptrs.push_back(kv.data());
-  }
-  talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
-
-  // Logits and hidden from prefill (last position)
   std::vector<float> logits(cfg_.vocab_size);
   std::vector<float> last_hidden(D);
-  // Extract last position from prefill output
-  int last_pos = pf.seq_len - 1;
-  VecCopy(logits.data(),
-          pf_result.logits.data() + last_pos * cfg_.vocab_size,
-          cfg_.vocab_size);
-  VecCopy(last_hidden.data(),
-          pf_result.last_hidden.data() + last_pos * D, D);
+
+  if (ort_->HasTalkerPrefill()) {
+    // ORT prefill (loads ~1.7GB but reliable for any seq_len)
+    auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
+    result.prefill_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    // Seed TRT KV cache from ORT output
+    std::vector<const float*> kv_ptrs;
+    for (auto& kv : pf_result.kv_data) {
+      kv_ptrs.push_back(kv.data());
+    }
+    talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
+    int last_pos = pf.seq_len - 1;
+    VecCopy(logits.data(),
+            pf_result.logits.data() + last_pos * cfg_.vocab_size,
+            cfg_.vocab_size);
+    VecCopy(last_hidden.data(),
+            pf_result.last_hidden.data() + last_pos * D, D);
+  } else {
+    // TRT unified prefill (requires engine compiled with dynamic seq_len)
+    auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
+    result.prefill_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    int last_pos = pf.seq_len - 1;
+    VecCopy(logits.data(),
+            pf_result.logits.data() + last_pos * cfg_.vocab_size,
+            cfg_.vocab_size);
+    VecCopy(last_hidden.data(),
+            pf_result.last_hidden.data() + last_pos * D, D);
+  }
 
   // Decode loop
   std::vector<std::vector<int>> all_codes;
@@ -582,29 +593,37 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
   std::cout << "  Prefill: " << pf.seq_len << " tokens (streaming)"
             << std::endl;
 
-  // Run prefill
+  // Run prefill: ORT or TRT unified
   auto t0 = Clock::now();
-  auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
-  double prefill_ms =
-      std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-  std::cout << "  Prefill: " << prefill_ms << " ms" << std::endl;
-
-  // Seed TRT KV cache
-  std::vector<const float*> kv_ptrs;
-  for (auto& kv : pf_result.kv_data) {
-    kv_ptrs.push_back(kv.data());
-  }
-  talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
-
-  // Logits and hidden from prefill (last position)
   std::vector<float> logits(cfg_.vocab_size);
   std::vector<float> last_hidden(D);
-  int last_pos_pf = pf.seq_len - 1;
-  VecCopy(logits.data(),
-          pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
-          cfg_.vocab_size);
-  VecCopy(last_hidden.data(),
-          pf_result.last_hidden.data() + last_pos_pf * D, D);
+
+  if (ort_->HasTalkerPrefill()) {
+    auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
+    double prefill_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    std::cout << "  Prefill: " << prefill_ms << " ms (ORT)" << std::endl;
+    std::vector<const float*> kv_ptrs;
+    for (auto& kv : pf_result.kv_data) kv_ptrs.push_back(kv.data());
+    talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
+    int last_pos_pf = pf.seq_len - 1;
+    VecCopy(logits.data(),
+            pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
+            cfg_.vocab_size);
+    VecCopy(last_hidden.data(),
+            pf_result.last_hidden.data() + last_pos_pf * D, D);
+  } else {
+    auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
+    double prefill_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    std::cout << "  Prefill: " << prefill_ms << " ms (TRT unified)" << std::endl;
+    int last_pos_pf = pf.seq_len - 1;
+    VecCopy(logits.data(),
+            pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
+            cfg_.vocab_size);
+    VecCopy(last_hidden.data(),
+            pf_result.last_hidden.data() + last_pos_pf * D, D);
+  }
 
   // Decode loop with chunked vocoder
   std::vector<std::vector<int>> all_codes;

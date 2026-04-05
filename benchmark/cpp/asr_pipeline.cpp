@@ -48,14 +48,19 @@ ASRPipeline::ASRPipeline(const std::string& model_dir,
     std::cerr << "[ASR]   Encoder not found: " << enc_path << std::endl;
   }
 
-  // Prefill
+  // Prefill ORT session (optional — only loaded if present, for fallback)
   for (auto& name : {"decoder_prefill.onnx", "decoder_init.onnx"}) {
     std::string pf_path = model_dir + "/" + name;
     if (fs::exists(pf_path)) {
       prefill_ = std::make_unique<Ort::Session>(env_, pf_path.c_str(), opts);
-      std::cout << "[ASR]   Prefill loaded: " << pf_path << std::endl;
+      std::cout << "[ASR]   Prefill ORT loaded (fallback): " << pf_path
+                << std::endl;
       break;
     }
+  }
+  if (!prefill_) {
+    std::cout << "[ASR]   No prefill ONNX found — will use unified TRT prefill"
+              << std::endl;
   }
 
   // Embed tokens (FP16 binary → FP32)
@@ -280,27 +285,58 @@ ASRResult ASRPipeline::Transcribe(const float* mel, int mel_len,
   std::cout << "[ASR] Encoder: " << mel_len << " mel → " << enc.audio_len
             << " features (" << result.encoder_ms << " ms)" << std::endl;
 
-  // 2. Prefill
-  t0 = Clock::now();
-  auto pf = RunPrefill(prompt_ids, enc.features.data(), enc.audio_len,
-                        audio_offset);
-  result.prefill_ms =
-      std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-  std::cout << "[ASR] Prefill: seq_len=" << pf.seq_len << " ("
-            << result.prefill_ms << " ms)" << std::endl;
-
-  // 3. Seed TRT KV cache
+  // 2. Prefill: use ORT if available, else TRT unified
   assert(decoder_);
-  decoder_->Reset();
-  std::vector<const float*> kv_ptrs;
-  for (auto& kv : pf.kv_data) {
-    kv_ptrs.push_back(kv.data());
+  int pf_seq_len;
+  std::vector<float> pf_logits;
+
+  if (prefill_) {
+    // ORT prefill (reliable, handles audio injection internally)
+    t0 = Clock::now();
+    auto pf = RunPrefill(prompt_ids, enc.features.data(), enc.audio_len,
+                          audio_offset);
+    result.prefill_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    std::cout << "[ASR] Prefill: seq_len=" << pf.seq_len << " ("
+              << result.prefill_ms << " ms, ORT)" << std::endl;
+
+    // Seed TRT KV cache
+    decoder_->Reset();
+    std::vector<const float*> kv_ptrs;
+    for (auto& kv : pf.kv_data) kv_ptrs.push_back(kv.data());
+    decoder_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
+    pf_seq_len = pf.seq_len;
+    pf_logits = std::move(pf.logits);
+  } else {
+    // TRT unified prefill (embed lookup + audio injection in C++)
+    t0 = Clock::now();
+    int seq_len = (int)prompt_ids.size();
+    std::vector<float> prefill_embeds(seq_len * hidden_dim_);
+    for (int i = 0; i < seq_len; ++i) {
+      const float* emb = EmbedLookup(prompt_ids[i]);
+      std::memcpy(prefill_embeds.data() + i * hidden_dim_, emb,
+                  hidden_dim_ * sizeof(float));
+    }
+    int audio_end = audio_offset + enc.audio_len;
+    if (audio_end > seq_len) audio_end = seq_len;
+    for (int i = audio_offset; i < audio_end; ++i) {
+      int ai = i - audio_offset;
+      std::memcpy(prefill_embeds.data() + i * hidden_dim_,
+                  enc.features.data() + ai * hidden_dim_,
+                  hidden_dim_ * sizeof(float));
+    }
+    auto pf = decoder_->Prefill(prefill_embeds.data(), seq_len);
+    result.prefill_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    std::cout << "[ASR] TRT Prefill: seq_len=" << seq_len << " ("
+              << result.prefill_ms << " ms)" << std::endl;
+    pf_seq_len = pf.seq_len;
+    pf_logits = std::move(pf.logits);
   }
-  decoder_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
 
   // Get logits from last prefill position
-  int last_pos = pf.seq_len - 1;
-  const float* last_logits = pf.logits.data() + (size_t)last_pos * vocab_size_;
+  int last_pos = pf_seq_len - 1;
+  const float* last_logits = pf_logits.data() + (size_t)last_pos * vocab_size_;
 
   // 4. Decode loop — greedy argmax
   t0 = Clock::now();

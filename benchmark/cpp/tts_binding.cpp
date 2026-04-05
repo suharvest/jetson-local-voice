@@ -343,6 +343,8 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
       .def("print_profiling_stats", &ASRPipeline::PrintProfilingStats,
            "Print and reset CUDA event profiling stats")
 
+      .def_property_readonly("has_prefill", &ASRPipeline::has_prefill,
+           "True if ORT prefill session is loaded (needed for correct results)")
       .def_property_readonly("hidden_dim", &ASRPipeline::hidden_dim)
       .def_property_readonly("vocab_size", &ASRPipeline::vocab_size)
       .def_property_readonly("n_layers", &ASRPipeline::n_layers);

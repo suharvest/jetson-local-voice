@@ -1,5 +1,6 @@
 // asr_pipeline.h — C++ ASR pipeline for Qwen3-ASR
-// Encoder (ORT CUDA) + Prefill (ORT CUDA) + Decoder (TRT BF16) + Embed lookup
+// Encoder (ORT CUDA) + Unified TRT Decoder (prefill + step) + Embed lookup
+// ORT prefill session kept as optional fallback
 #pragma once
 
 #include <onnxruntime_cxx_api.h>
@@ -23,9 +24,9 @@ struct ASRResult {
 
 class ASRPipeline {
  public:
-  // model_dir: directory containing encoder.onnx, decoder_prefill.onnx,
-  //            embed_tokens.bin
-  // engine_path: TRT engine for decoder step (asr_decoder_bf16.engine)
+  // model_dir: directory containing encoder.onnx, embed_tokens.bin
+  //            (decoder_prefill.onnx optional — kept as fallback)
+  // engine_path: unified TRT engine for both prefill and decode step
   ASRPipeline(const std::string& model_dir,
               const std::string& engine_path,
               int device_id = 0);
@@ -40,6 +41,9 @@ class ASRPipeline {
                        const std::vector<int64_t>& prompt_ids,
                        int audio_offset,
                        int max_tokens = 200);
+
+  // Check if ORT prefill is available (needed for correct results)
+  bool has_prefill() const { return prefill_ != nullptr; }
 
   // Config
   int hidden_dim() const { return hidden_dim_; }

@@ -46,6 +46,9 @@ class ORTModels {
   // Returns empty if not loaded
   std::vector<int64_t> TokenizerEncode(const float* audio, int num_samples);
 
+  // Check if ORT talker_prefill session is loaded
+  bool HasTalkerPrefill() const { return talker_prefill_ != nullptr; }
+
   int hidden_dim() const { return hidden_dim_; }
   int n_layers() const { return n_layers_; }
   int n_heads() const { return n_heads_; }
