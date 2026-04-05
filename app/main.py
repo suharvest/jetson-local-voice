@@ -47,11 +47,7 @@ async def startup():
     model_dir = os.environ.get("MODEL_DIR", "/opt/models")
     model_downloader.ensure_models(mode, model_dir)
 
-    import tts_service
-    logger.info("Pre-loading TTS model...")
-    tts_service.preload()
-
-    # ASR backend
+    # ASR backend (load before TTS to avoid ORT session conflicts)
     asr_backend_name = os.environ.get("ASR_BACKEND", "sherpa")
     try:
         from asr_backend import create_asr_backend
@@ -67,6 +63,10 @@ async def startup():
             streaming_asr_service.preload()
         except Exception as e2:
             logger.info(f"Streaming ASR also not available: {e2}")
+
+    import tts_service
+    logger.info("Pre-loading TTS model...")
+    tts_service.preload()
 
     logger.info("Speech service ready.")
 

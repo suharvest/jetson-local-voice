@@ -179,6 +179,7 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       std::string tn = engine_->getIOTensorName(i);
       if (tn == "input_embeds") { emb_name = "input_embeds"; break; }
     }
+    std::cout << "  TRT bind: emb_name=" << emb_name << std::endl;
     ctx->setInputShape(emb_name.c_str(), nvinfer1::Dims3{1, 1, hidden_dim_});
     ctx->setTensorAddress(emb_name.c_str(), d_emb_);
     ctx->setTensorAddress("logits", d_logits_);
@@ -200,6 +201,8 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
         break;
       }
     }
+    std::cout << "  TRT bind: has_position_ids=" << has_position_ids_
+              << " seq_len=" << seq_len_ << std::endl;
     first_step_ = false;
   }
 
