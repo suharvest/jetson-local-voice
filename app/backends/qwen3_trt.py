@@ -15,15 +15,15 @@ from tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
 
-# Paths (configurable via env)
-QWEN3_SHERPA_DIR = os.environ.get("QWEN3_SHERPA_DIR", "/tmp/qwen3-v2")
-QWEN3_MODEL_DIR = os.environ.get("QWEN3_MODEL_DIR", "/tmp/qwen3-v2")
-QWEN3_TALKER_ENGINE = os.environ.get("QWEN3_TALKER_ENGINE", "/tmp/talker_decode_fp16.engine")
-QWEN3_CP_ENGINE = os.environ.get("QWEN3_CP_ENGINE", "/tmp/cp_bf16.engine")
-QWEN3_SPEAKER_ENCODER = os.environ.get("QWEN3_SPEAKER_ENCODER", "/tmp/qwen3-v2/speaker_encoder.onnx")
-QWEN3_TOKENIZER_DIR = os.environ.get("QWEN3_TOKENIZER_DIR", "/tmp/qwen3-tts-bench/model/tokenizer")
-# Path to extract_speaker_emb.py for mel computation
-QWEN3_EXTRACT_SCRIPT = os.environ.get("QWEN3_EXTRACT_SCRIPT", "/tmp/extract_speaker_emb.py")
+# Paths — all under /opt/models/qwen3-tts (persistent volume)
+_BASE = os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts")
+QWEN3_SHERPA_DIR = os.environ.get("QWEN3_SHERPA_DIR", os.path.join(_BASE, "onnx"))
+QWEN3_MODEL_DIR = os.environ.get("QWEN3_MODEL_DIR", os.path.join(_BASE, "onnx"))
+QWEN3_TALKER_ENGINE = os.environ.get("QWEN3_TALKER_ENGINE", os.path.join(_BASE, "engines", "talker_decode_fp16.engine"))
+QWEN3_CP_ENGINE = os.environ.get("QWEN3_CP_ENGINE", os.path.join(_BASE, "engines", "cp_bf16.engine"))
+QWEN3_SPEAKER_ENCODER = os.environ.get("QWEN3_SPEAKER_ENCODER", os.path.join(_BASE, "onnx", "speaker_encoder.onnx"))
+QWEN3_TOKENIZER_DIR = os.environ.get("QWEN3_TOKENIZER_DIR", os.path.join(_BASE, "tokenizer"))
+QWEN3_EXTRACT_SCRIPT = os.environ.get("QWEN3_EXTRACT_SCRIPT", os.path.join(_BASE, "extract_speaker_emb.py"))
 
 
 class Qwen3TRTBackend(TTSBackend):
@@ -58,7 +58,7 @@ class Qwen3TRTBackend(TTSBackend):
         for path, desc in [
             (QWEN3_TALKER_ENGINE, "talker engine"),
             (QWEN3_CP_ENGINE, "CP engine"),
-            (os.path.join(QWEN3_SHERPA_DIR, "config.json"), "config.json"),
+            (os.path.join(_BASE, "config.json"), "config.json"),
         ]:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Missing {desc}: {path}")

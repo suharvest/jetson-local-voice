@@ -7,6 +7,8 @@ services:
       - "8000:8000"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      # TTS backend: "sherpa" (Matcha/Kokoro) or "qwen3_trt" (Qwen3-TTS C++ TRT)
+      - TTS_BACKEND=${TTS_BACKEND:-sherpa}
       - TTS_PROVIDER=cuda
       - TTS_DEFAULT_SID=52
       # Language mode: "zh_en" (Chinese+English, default) or "en" (English only)
