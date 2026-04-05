@@ -62,6 +62,16 @@ class TRTTalkerEngine {
   // kv_data: flat array of all 2*n_layers KV tensors, each [1, n_heads, seq_len, head_dim]
   void SeedKV(const float* const* kv_ptrs, int n_kv, int seq_len);
 
+  // Unified prefill: run TRT with inputs_embeds [1, S, D] and empty KV cache.
+  // Returns logits [1, S, vocab_size] and last_hidden [1, S, D] on CPU.
+  // KV cache is stored directly in GPU buffers (no SeedKV needed).
+  struct PrefillResult {
+    std::vector<float> logits;       // [1, S, vocab_size]
+    std::vector<float> last_hidden;  // [1, S, D] (empty if engine has no last_hidden)
+    int seq_len;
+  };
+  PrefillResult Prefill(const float* inputs_embeds, int seq_len);
+
   // Single decode step. Only copies emb (4KB) in, logits+hidden (16KB) out.
   // KV cache stays on GPU via pointer swap.
   void DecodeStep(const float* inputs_embeds,  // [1, 1, hidden_dim]

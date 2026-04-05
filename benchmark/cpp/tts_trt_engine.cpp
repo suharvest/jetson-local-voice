@@ -121,14 +121,33 @@ void TRTTalkerEngine::AllocateBuffers() {
   }
 
   // I/O buffers — detect dtype from engine (TRT 10.x)
-  size_t emb_elem = TrtDtypeSize(engine_->getTensorDataType("inputs_embeds"));
+  // Auto-detect embed tensor name: "inputs_embeds" (TTS) or "input_embeds" (ASR)
+  std::string emb_tname = "inputs_embeds";
+  for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+    std::string tn = engine_->getIOTensorName(i);
+    if (tn == "input_embeds") { emb_tname = "input_embeds"; break; }
+  }
+  size_t emb_elem = TrtDtypeSize(engine_->getTensorDataType(emb_tname.c_str()));
   size_t logits_elem = TrtDtypeSize(engine_->getTensorDataType("logits"));
-  size_t hidden_elem = TrtDtypeSize(engine_->getTensorDataType("last_hidden"));
 
-  CHECK_CUDA(cudaMalloc(&d_emb_, 1 * 1 * hidden_dim_ * emb_elem));
-  CHECK_CUDA(cudaMalloc(&d_logits_, 1 * 1 * vocab_size_ * logits_elem));
-  CHECK_CUDA(cudaMalloc(&d_hidden_, 1 * 1 * hidden_dim_ * hidden_elem));
-  CHECK_CUDA(cudaMalloc(&d_position_id_, sizeof(int64_t)));
+  // Check if last_hidden output exists (TTS has it, ASR does not)
+  bool has_hidden = false;
+  size_t hidden_elem = 4;
+  for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+    std::string tn = engine_->getIOTensorName(i);
+    if (tn == "last_hidden") {
+      has_hidden = true;
+      hidden_elem = TrtDtypeSize(engine_->getTensorDataType("last_hidden"));
+      break;
+    }
+  }
+
+  // Allocate max-size buffers for both prefill (seq_len=max_seq_) and decode (1)
+  CHECK_CUDA(cudaMalloc(&d_emb_, 1 * max_seq_ * hidden_dim_ * emb_elem));
+  CHECK_CUDA(cudaMalloc(&d_logits_, 1 * max_seq_ * vocab_size_ * logits_elem));
+  // Always allocate d_hidden_ (TTS uses it, ASR ignores but needs buffer for TRT binding)
+  CHECK_CUDA(cudaMalloc(&d_hidden_, 1 * max_seq_ * hidden_dim_ * hidden_elem));
+  CHECK_CUDA(cudaMalloc(&d_position_id_, max_seq_ * sizeof(int64_t)));
 }
 
 void TRTTalkerEngine::FreeBuffers() {
@@ -161,6 +180,122 @@ void TRTTalkerEngine::SeedKV(const float* const* kv_ptrs, int n_kv,
   CHECK_CUDA(cudaStreamSynchronize(stream_));
   seq_len_ = seq_len;
   parity_ = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Prefill: run TRT engine with inputs_embeds [1, S, D] and empty KV cache.
+// KV outputs go directly to GPU buffer A; caller gets logits + last_hidden.
+// ---------------------------------------------------------------------------
+TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
+    const float* inputs_embeds, int seq_len) {
+  assert(seq_len > 0 && seq_len <= max_seq_);
+  Reset();  // seq_len_=0, parity_=0
+
+  auto* ctx = context_.get();
+
+  // Initialize tensor names on first call (same as DecodeStep)
+  if (first_step_) {
+    kv_names_.resize(2 * n_layers_);
+    new_kv_names_.resize(2 * n_layers_);
+    for (int i = 0; i < n_layers_; ++i) {
+      kv_names_[2 * i] = "past_key_" + std::to_string(i);
+      kv_names_[2 * i + 1] = "past_value_" + std::to_string(i);
+      new_kv_names_[2 * i] = "new_past_key_" + std::to_string(i);
+      new_kv_names_[2 * i + 1] = "new_past_value_" + std::to_string(i);
+    }
+    emb_name_ = "inputs_embeds";
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "input_embeds") { emb_name_ = "input_embeds"; break; }
+    }
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "position_ids") { has_position_ids_ = true; break; }
+    }
+    first_step_ = false;
+  }
+
+  // Copy full embeddings to GPU: [1, S, D]
+  size_t emb_bytes = 1 * seq_len * hidden_dim_ * sizeof(float);
+  CHECK_CUDA(cudaMemcpyAsync(d_emb_, inputs_embeds, emb_bytes,
+                             cudaMemcpyHostToDevice, stream_));
+
+  // Set input shape for dynamic seq_len
+  ctx->setInputShape(emb_name_.c_str(),
+                     nvinfer1::Dims3{1, seq_len, hidden_dim_});
+  ctx->setTensorAddress(emb_name_.c_str(), d_emb_);
+
+  // Position IDs: [0, 1, 2, ..., S-1]
+  if (has_position_ids_) {
+    std::vector<int64_t> pos(seq_len);
+    for (int i = 0; i < seq_len; ++i) pos[i] = i;
+    CHECK_CUDA(cudaMemcpyAsync(d_position_id_, pos.data(),
+                               seq_len * sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+    ctx->setInputShape("position_ids", nvinfer1::Dims2{1, seq_len});
+    ctx->setTensorAddress("position_ids", d_position_id_);
+  }
+
+  // Empty KV cache: shape [1, n_heads, 0, head_dim]
+  nvinfer1::Dims4 kv_shape_in{1, n_heads_, 0, head_dim_};
+  // Output KV will be [1, n_heads, S, head_dim] — written to buffer A
+  auto& write = kv_a_;
+  for (int i = 0; i < n_layers_; ++i) {
+    ctx->setInputShape(kv_names_[2 * i].c_str(), kv_shape_in);
+    ctx->setTensorAddress(kv_names_[2 * i].c_str(), kv_a_[2 * i]);  // dummy read (size 0)
+    ctx->setTensorAddress(new_kv_names_[2 * i].c_str(), write[2 * i]);
+
+    ctx->setInputShape(kv_names_[2 * i + 1].c_str(), kv_shape_in);
+    ctx->setTensorAddress(kv_names_[2 * i + 1].c_str(), kv_a_[2 * i + 1]);
+    ctx->setTensorAddress(new_kv_names_[2 * i + 1].c_str(), write[2 * i + 1]);
+  }
+
+  // Bind outputs
+  ctx->setTensorAddress("logits", d_logits_);
+  // Bind last_hidden if present
+  bool has_hidden = false;
+  for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+    std::string tn = engine_->getIOTensorName(i);
+    if (tn == "last_hidden") {
+      ctx->setTensorAddress("last_hidden", d_hidden_);
+      has_hidden = true;
+      break;
+    }
+  }
+
+  // Execute
+  ctx->enqueueV3(stream_);
+
+  // Copy results back to CPU
+  PrefillResult result;
+  result.seq_len = seq_len;
+
+  // logits: [1, S, vocab_size]
+  size_t logits_bytes = 1 * seq_len * vocab_size_ * sizeof(float);
+  result.logits.resize(seq_len * vocab_size_);
+  CHECK_CUDA(cudaMemcpyAsync(result.logits.data(), d_logits_, logits_bytes,
+                             cudaMemcpyDeviceToHost, stream_));
+
+  // last_hidden: [1, S, D]
+  if (has_hidden) {
+    size_t hidden_bytes = 1 * seq_len * hidden_dim_ * sizeof(float);
+    result.last_hidden.resize(seq_len * hidden_dim_);
+    CHECK_CUDA(cudaMemcpyAsync(result.last_hidden.data(), d_hidden_,
+                               hidden_bytes, cudaMemcpyDeviceToHost, stream_));
+  }
+
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+  // KV cache is now in buffer A with seq_len tokens
+  // Set up for decode: next DecodeStep reads from A, writes to B
+  seq_len_ = seq_len;
+  parity_ = 0;
+
+  std::cout << "  TRT Prefill: seq_len=" << seq_len
+            << " logits=" << result.logits.size()
+            << " hidden=" << result.last_hidden.size() << std::endl;
+
+  return result;
 }
 
 void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
