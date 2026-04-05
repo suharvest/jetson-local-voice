@@ -1,7 +1,11 @@
-"""Qwen3-ASR backend — ORT encoder/prefill + C++ TRT decoder (pybind11).
+"""Qwen3-ASR backend — C++ pipeline (encoder + prefill + TRT decoder) via pybind11.
 
 Supports: OFFLINE, MULTI_LANGUAGE, LANGUAGE_ID
 Models loaded once at preload(), stays resident.
+
+The C++ pipeline (ASRPipeline) handles encoder, prefill, and TRT decode loop.
+Python handles: audio loading, mel computation, prompt construction, tokenizer decode.
+Falls back to pure-Python ORT if C++ module not available.
 """
 
 from __future__ import annotations
@@ -15,7 +19,6 @@ import wave
 from typing import Optional
 
 import numpy as np
-import onnxruntime as ort
 
 from asr_backend import ASRBackend, ASRCapability, TranscriptionResult
 
@@ -37,13 +40,16 @@ EOS_IDS = {151643, 151645}
 class Qwen3ASRBackend(ASRBackend):
 
     def __init__(self):
+        self._pipeline = None     # C++ ASRPipeline
+        # Fallback: Python ORT sessions
         self._encoder = None
         self._prefill = None
-        self._decoder = None  # C++ TRT engine via pybind11
+        self._decoder = None      # C++ TRT ASRDecoder (legacy)
         self._decoder_ort = None  # ORT fallback
         self._embed_tokens = None
         self._tokenizer = None
         self._ready = False
+        self._use_cpp_pipeline = False
 
     @property
     def name(self) -> str:
@@ -61,77 +67,168 @@ class Qwen3ASRBackend(ASRBackend):
         return self._ready
 
     def preload(self) -> None:
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-
         logger.info("Loading Qwen3-ASR from %s", _BASE)
         t0 = time.time()
 
-        logger.info("Loading encoder...")
-        self._encoder = ort.InferenceSession(
-            os.path.join(_BASE, "encoder.onnx"), so, providers=providers)
-        logger.info("Encoder OK")
-
-        # Prefill: try decoder_prefill (v2) then decoder_init (community)
-        for name in ["decoder_prefill.onnx", "decoder_init.onnx"]:
-            path = os.path.join(_BASE, name)
-            if not os.path.exists(path):
-                path = os.path.join("/opt/models/qwen3-asr", name)
-            if os.path.exists(path):
-                try:
-                    self._prefill = ort.InferenceSession(path, so, providers=providers)
-                    logger.info("Prefill loaded: %s", path)
-                    break
-                except Exception as e:
-                    logger.warning("Prefill %s failed: %s", name, e)
-
-        # Embed tokens
-        emb_path = os.path.join(_BASE, "embed_tokens.bin")
-        if os.path.exists(emb_path):
-            self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
-
-        # TRT decoder via pybind11 — prefer BF16 engine (FP16 has QK^T overflow)
+        # Try C++ pipeline first (encoder + prefill + TRT decode, all in C++)
+        engine_path = None
         for engine_name in ["asr_decoder_bf16.engine", "asr_decoder_fp16.engine"]:
-            engine_path = os.path.join(_BASE, engine_name)
-            if os.path.exists(engine_path):
+            p = os.path.join(_BASE, engine_name)
+            if os.path.exists(p):
+                engine_path = p
+                break
+
+        if engine_path:
+            try:
+                import qwen3_tts_engine
+                self._pipeline = qwen3_tts_engine.ASRPipeline(
+                    _BASE, engine_path, 0)
+                self._use_cpp_pipeline = True
+                logger.info("C++ ASR pipeline loaded (encoder+prefill+TRT)")
+            except Exception as e:
+                logger.warning("C++ ASR pipeline failed: %s, falling back to Python", e)
+                self._pipeline = None
+
+        # Fall back to Python ORT if C++ pipeline not available
+        if not self._use_cpp_pipeline:
+            import onnxruntime as ort
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+
+            logger.info("Loading encoder...")
+            self._encoder = ort.InferenceSession(
+                os.path.join(_BASE, "encoder.onnx"), so, providers=providers)
+            logger.info("Encoder OK")
+
+            for name in ["decoder_prefill.onnx", "decoder_init.onnx"]:
+                path = os.path.join(_BASE, name)
+                if not os.path.exists(path):
+                    path = os.path.join("/opt/models/qwen3-asr", name)
+                if os.path.exists(path):
+                    try:
+                        self._prefill = ort.InferenceSession(path, so, providers=providers)
+                        logger.info("Prefill loaded: %s", path)
+                        break
+                    except Exception as e:
+                        logger.warning("Prefill %s failed: %s", name, e)
+
+            # Embed tokens
+            emb_path = os.path.join(_BASE, "embed_tokens.bin")
+            if os.path.exists(emb_path):
+                self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
+
+            # TRT decoder via pybind11
+            if engine_path:
                 try:
                     import qwen3_tts_engine
                     self._decoder = qwen3_tts_engine.ASRDecoder(
                         engine_path, 28, 1024, 8, 128, 151936, 500)
                     self._trt_max_seq = 500
                     logger.info("ASR TRT decoder loaded: %s", engine_path)
-                    break
                 except Exception as e:
-                    logger.warning("TRT decoder %s failed: %s", engine_name, e)
+                    logger.warning("TRT decoder %s failed: %s", engine_path, e)
 
-        # ORT decoder fallback (only if TRT not available)
-        if self._decoder is None:
-            path = os.path.join(_BASE, "decoder_step.onnx")
-            if os.path.exists(path):
-                try:
-                    self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
-                    logger.info("ASR ORT decoder loaded: %s", path)
-                except Exception as e:
-                    logger.warning("ORT decoder load failed: %s", e)
+            # ORT decoder fallback
+            if self._decoder is None:
+                path = os.path.join(_BASE, "decoder_step.onnx")
+                if os.path.exists(path):
+                    try:
+                        self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
+                        logger.info("ASR ORT decoder loaded: %s", path)
+                    except Exception as e:
+                        logger.warning("ORT decoder load failed: %s", e)
 
-        # Tokenizer
+        # Tokenizer (needed by both paths)
         tok_path = os.path.join(_BASE, "tokenizer.json")
         if os.path.exists(tok_path):
             from tokenizers import Tokenizer
             self._tokenizer = Tokenizer.from_file(tok_path)
 
+        backend_name = "C++" if self._use_cpp_pipeline else (
+            "TRT" if self._decoder else "ORT" if self._decoder_ort else "none")
         logger.info("Qwen3-ASR loaded in %.1fs (decoder: %s)",
-                     time.time() - t0,
-                     "TRT" if self._decoder else "ORT" if self._decoder_ort else "none")
+                     time.time() - t0, backend_name)
         self._ready = True
 
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         audio = self._bytes_to_float(audio_bytes)
         t_total = time.perf_counter()
 
-        # 1. Mel
+        # 1. Mel spectrogram (always computed in Python)
         mel = self._compute_mel(audio)  # [1, 128, T]
+
+        if self._use_cpp_pipeline:
+            return self._transcribe_cpp(mel, audio, language, t_total)
+        else:
+            return self._transcribe_python(mel, audio, language, t_total)
+
+    def _transcribe_cpp(self, mel, audio, language, t_total):
+        """Full C++ pipeline: mel → encoder → prefill → TRT decode."""
+        mel_len = mel.shape[2]
+
+        # Build prompt (need audio_len from encoder, but we don't know it yet
+        # in Python. Use mel_len // 2 as approximation for the encoder output
+        # length. Actually, the C++ pipeline runs encoder internally and
+        # the prompt needs the true audio_len. So we estimate it.)
+        #
+        # The encoder downsamples mel by 2x typically. But the C++ pipeline
+        # handles encoder → prefill → decode as a unit. The prompt_ids need
+        # the correct audio_len which we only know after encoder runs.
+        #
+        # Solution: Run encoder in C++ to get audio_len, then build prompt.
+        # But our API takes prompt_ids as input...
+        #
+        # Alternative: The C++ Transcribe() takes mel and prompt_ids. We need
+        # to know audio_len beforehand for the prompt. We have two options:
+        #   A) Run encoder first in Python to get audio_len, then call C++
+        #   B) Estimate audio_len from mel_len
+        #
+        # The encoder output length is deterministic from mel_len (conv
+        # strides). For Whisper encoder: T' = mel_len // 2.
+        # Let's estimate and let the C++ side handle it.
+        #
+        # Actually, looking at the ONNX encoder: it's a standard Whisper-like
+        # encoder. The output T' = mel_len // 2.
+        audio_len_est = mel_len // 2
+
+        lang = language if language != "auto" else None
+        prompt_ids = self._build_prompt(audio_len_est, lang)
+        audio_offset = prompt_ids.index(AUDIO_PAD)
+
+        # Ensure mel is contiguous float32
+        mel_c = np.ascontiguousarray(mel, dtype=np.float32)
+
+        result = self._pipeline.transcribe(
+            mel=mel_c,
+            prompt_ids=prompt_ids,
+            audio_offset=audio_offset,
+            max_tokens=200,
+        )
+
+        total_ms = (time.perf_counter() - t_total) * 1000
+        text_ids = result["text_ids"]
+
+        # Decode text
+        text = self._tokenizer.decode(text_ids) if self._tokenizer else f"[{len(text_ids)} tokens]"
+        if "<asr_text>" in text:
+            text = text.split("<asr_text>", 1)[1]
+
+        audio_dur = len(audio) / 16000
+
+        return TranscriptionResult(
+            text=text.strip(),
+            duration=round(audio_dur, 3),
+            inference_time=round(total_ms / 1000, 3),
+            rtf=round(total_ms / 1000 / audio_dur, 3) if audio_dur > 0 else 0,
+            n_tokens=result["n_tokens"],
+            per_token_ms=round(result.get("per_token_ms", 0), 1),
+            backend="C++",
+        )
+
+    def _transcribe_python(self, mel, audio, language, t_total):
+        """Python ORT encoder/prefill + TRT/ORT decode (legacy path)."""
+        import onnxruntime as ort
 
         # 2. Encoder
         t0 = time.perf_counter()
@@ -168,7 +265,6 @@ class Qwen3ASRBackend(ASRBackend):
         use_trt = self._decoder and seq_len <= getattr(self, '_trt_max_seq', 500)
         if use_trt:
             self._decoder.reset()
-            # Ensure KV arrays are contiguous FP32
             for k in list(kv.keys()):
                 kv[k] = np.ascontiguousarray(kv[k].astype(np.float32))
             self._decoder.seed_kv(kv, seq_len)

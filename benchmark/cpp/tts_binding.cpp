@@ -1,4 +1,4 @@
-// tts_binding.cpp — pybind11 binding for Qwen3-TTS C++ TRT engine
+// tts_binding.cpp — pybind11 binding for Qwen3-TTS/ASR C++ TRT engine
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "tts_pipeline.h"
+#include "asr_pipeline.h"
 
 namespace py = pybind11;
 
@@ -184,4 +185,52 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
                               emb.size() * sizeof(float));
            },
            py::arg("mel"));
+
+  // ── ASR Pipeline (encoder + prefill + TRT decode, all in C++) ──
+  py::class_<ASRPipeline>(m, "ASRPipeline")
+      .def(py::init<const std::string&, const std::string&, int>(),
+           py::arg("model_dir"),
+           py::arg("engine_path"),
+           py::arg("device_id") = 0)
+
+      .def("transcribe",
+           [](ASRPipeline& self, py::array_t<float> mel,
+              const std::vector<int64_t>& prompt_ids, int audio_offset,
+              int max_tokens) -> py::dict {
+             auto buf = mel.request();
+             // Accept [128, T] or [1, 128, T]
+             int mel_len;
+             const float* mel_ptr;
+             if (buf.ndim == 2) {
+               mel_len = (int)buf.shape[1];
+               mel_ptr = static_cast<const float*>(buf.ptr);
+             } else if (buf.ndim == 3) {
+               mel_len = (int)buf.shape[2];
+               mel_ptr = static_cast<const float*>(buf.ptr);
+             } else {
+               throw std::runtime_error(
+                   "mel must be [128, T] or [1, 128, T]");
+             }
+
+             auto r = self.Transcribe(mel_ptr, mel_len, prompt_ids,
+                                       audio_offset, max_tokens);
+
+             py::dict result;
+             result["text_ids"] = r.text_ids;
+             result["n_tokens"] = r.n_tokens;
+             result["encoder_ms"] = r.encoder_ms;
+             result["prefill_ms"] = r.prefill_ms;
+             result["decode_ms"] = r.decode_ms;
+             result["per_token_ms"] = r.per_token_ms;
+             result["total_ms"] = r.total_ms;
+             return result;
+           },
+           py::arg("mel"),
+           py::arg("prompt_ids"),
+           py::arg("audio_offset"),
+           py::arg("max_tokens") = 200)
+
+      .def_property_readonly("hidden_dim", &ASRPipeline::hidden_dim)
+      .def_property_readonly("vocab_size", &ASRPipeline::vocab_size)
+      .def_property_readonly("n_layers", &ASRPipeline::n_layers);
 }
