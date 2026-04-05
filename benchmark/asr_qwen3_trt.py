@@ -168,8 +168,13 @@ class Qwen3ASRPipeline:
         print("Loading encoder...")
         self.encoder = ort.InferenceSession(os.path.join(model_dir, "encoder.onnx"), so, providers=providers)
 
-        print("Loading decoder_prefill...")
-        self.prefill = ort.InferenceSession(os.path.join(model_dir, "decoder_prefill.onnx"), so, providers=providers)
+        # Prefill: try self-exported (decoder_prefill) first, fall back to community (decoder_init)
+        prefill_path = os.path.join(model_dir, "decoder_prefill.onnx")
+        if not os.path.exists(prefill_path):
+            prefill_path = os.path.join(model_dir, "decoder_init.onnx")
+        print(f"Loading prefill: {os.path.basename(prefill_path)}")
+        self.prefill = ort.InferenceSession(prefill_path, so, providers=providers)
+        self.prefill_type = "v2" if "prefill" in prefill_path else "v1"
 
         # Embed tokens
         emb_path = os.path.join(model_dir, "embed_tokens.bin")
@@ -178,13 +183,20 @@ class Qwen3ASRPipeline:
 
         # TRT decoder or ORT fallback
         self.trt_decoder = None
+        self.decoder_step = None
         engine_path = trt_engine_path or os.path.join(model_dir, "asr_decoder_fp16.engine")
         if HAS_TRT and os.path.exists(engine_path):
             print(f"Loading TRT decoder: {engine_path}")
             self.trt_decoder = TRTDecoderEngine(engine_path)
         else:
-            print("Loading ORT decoder_step (fallback)...")
-            self.decoder_step = ort.InferenceSession(os.path.join(model_dir, "decoder_step.onnx"), so, providers=providers)
+            step_path = os.path.join(model_dir, "decoder_step.onnx")
+            if os.path.exists(step_path):
+                try:
+                    print("Loading ORT decoder_step (fallback)...")
+                    self.decoder_step = ort.InferenceSession(step_path, so, providers=providers)
+                except Exception as e:
+                    print(f"WARNING: decoder_step ORT load failed: {e}")
+                    print("ASR will use prefill-only mode (slower).")
 
         # Tokenizer
         tok_path = os.path.join(model_dir, "tokenizer.json")
@@ -262,12 +274,15 @@ class Qwen3ASRPipeline:
         prefill_ms = (time.perf_counter() - t0) * 1000
 
         logits = prefill_map.get("logits")
-        # Collect KV cache
+        # Collect KV cache (handle both stacked and per-layer formats)
         kv = {}
         for name, val in prefill_map.items():
-            if name.startswith("past_"):
-                kv[name] = val
-        print(f"  Prefill: {prefill_ms:.0f}ms, KV: {len(kv)} tensors, logits: {logits.shape if logits is not None else '?'}")
+            if name.startswith("past_") or name.startswith("present_"):
+                clean = name.replace("present_", "past_")
+                kv[clean] = val
+        # Detect format: stacked [28,1,8,S,128] vs per-layer [1,8,S,128]
+        self._stacked_kv = "past_keys" in kv or "past_values" in kv
+        print(f"  Prefill: {prefill_ms:.0f}ms, KV: {len(kv)} tensors ({'stacked' if self._stacked_kv else 'per-layer'}), logits: {logits.shape if logits is not None else '?'}")
 
         # Seed TRT KV cache
         if self.trt_decoder:
@@ -289,7 +304,7 @@ class Qwen3ASRPipeline:
 
             if self.trt_decoder:
                 logits = self.trt_decoder.decode_step(input_embeds, cur_pos)
-            else:
+            elif self.decoder_step:
                 # ORT fallback
                 step_inputs = {"input_embeds": input_embeds, "position_ids": np.array([[cur_pos]], dtype=np.int64)}
                 step_inputs.update(kv)
@@ -297,7 +312,16 @@ class Qwen3ASRPipeline:
                 step_names = [o.name for o in self.decoder_step.get_outputs()]
                 step_map = dict(zip(step_names, step_outputs))
                 logits = step_map.get("logits")
-                kv = {k.replace("new_", ""): v for k, v in step_map.items() if k.startswith("new_past_")}
+                new_kv = {}
+                for k, v in step_map.items():
+                    if "logits" not in k:
+                        clean = k.replace("present_", "past_").replace("new_", "")
+                        new_kv[clean] = v
+                kv = new_kv
+            else:
+                # No decoder available — use prefill logits only (greedy from last position)
+                print("WARNING: No decoder_step available, using prefill logits only")
+                break
 
         decode_ms = (time.perf_counter() - t0) * 1000
         total_ms = (time.perf_counter() - t_total) * 1000
