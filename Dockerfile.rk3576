@@ -1,0 +1,47 @@
+# Jetson Voice — RK3576 (CPU onnxruntime)
+# Target: Debian 12 aarch64 with sherpa-onnx Python API
+#
+# Build: docker build -f Dockerfile.rk3576 -t jetson-voice:rk3576 .
+# Run:   docker run -p 8621:8000 -v speech-models:/opt/models jetson-voice:rk3576
+
+FROM debian:12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    libasound2 libsndfile1 sox curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+RUN pip3 install --no-cache-dir --break-system-packages \
+    fastapi \
+    "uvicorn[standard]" \
+    soundfile \
+    python-multipart \
+    'numpy<2' \
+    sherpa-onnx \
+    onnxruntime
+
+# Application code
+COPY app/ /opt/speech/app/
+
+# Custom voice embeddings
+COPY voices/ /opt/speech/voices/
+
+# Model dir (populated at runtime via volume mount or auto-download)
+RUN mkdir -p /opt/models
+
+ENV MODEL_DIR=/opt/models \
+    LANGUAGE_MODE=zh_en \
+    TTS_PROVIDER=cpu \
+    STREAMING_ASR_PROVIDER=cpu \
+    TTS_NUM_THREADS=4 \
+    STREAMING_ASR_NUM_THREADS=4
+
+WORKDIR /opt/speech/app
+EXPOSE 8000
+
+CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
