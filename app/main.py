@@ -1,4 +1,4 @@
-"""FastAPI speech service: SenseVoice ASR + Kokoro TTS."""
+"""FastAPI speech service: ASR + TTS with pluggable backends."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,7 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Jetson Speech Service", version="1.0.0")
+app = FastAPI(title="Jetson Speech Service", version="2.0.0")
 
 
 class TTSRequest(BaseModel):
@@ -23,33 +24,36 @@ class TTSRequest(BaseModel):
     sid: int | None = None
     speed: float | None = None
     pitch: float | None = None
+    language: str | None = None
+
+
+class CloneRequest(BaseModel):
+    text: str
+    speaker_embedding_b64: str  # base64-encoded speaker embedding
+    language: str | None = None
 
 
 @app.on_event("startup")
 async def startup():
-    # Ensure models are downloaded for current LANGUAGE_MODE
     import model_downloader
     mode = os.environ.get("LANGUAGE_MODE", "zh_en")
     model_dir = os.environ.get("MODEL_DIR", "/opt/models")
     model_downloader.ensure_models(mode, model_dir)
 
     import tts_service
-
     logger.info("Pre-loading TTS model...")
     tts_service.preload()
 
-    # Pre-load streaming ASR (primary ASR backend)
     try:
         import streaming_asr_service
         streaming_asr_service.preload()
     except Exception as e:
         logger.info(f"Streaming ASR not available: {e}")
 
-    # SenseVoice (offline ASR) is lazy-loaded on first /asr request
-    # to avoid wasting GPU memory when only streaming is used.
-
     logger.info("Speech service ready.")
 
+
+# ── Health & Capabilities ────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -58,6 +62,8 @@ async def health():
     result = {
         "asr": asr_service.is_ready(),
         "tts": tts_service.is_ready(),
+        "tts_backend": tts_service.backend_name() if tts_service.is_ready() else None,
+        "tts_capabilities": [c.value for c in tts_service.capabilities()] if tts_service.is_ready() else [],
     }
     try:
         import streaming_asr_service
@@ -67,17 +73,20 @@ async def health():
     return result
 
 
-@app.post("/asr")
-async def asr(
-    file: UploadFile = File(...),
-    language: str = Query("auto"),
-):
-    import asr_service
+@app.get("/tts/capabilities")
+async def tts_capabilities():
+    """Return TTS backend info and supported capabilities."""
+    import tts_service
+    if not tts_service.is_ready():
+        return JSONResponse({"error": "TTS not ready"}, status_code=503)
+    return {
+        "backend": tts_service.backend_name(),
+        "capabilities": [c.value for c in tts_service.capabilities()],
+        "sample_rate": tts_service.get_sample_rate(),
+    }
 
-    audio_bytes = await file.read()
-    text = asr_service.transcribe_audio(audio_bytes, language=language)
-    return {"text": text}
 
+# ── TTS ──────────────────────────────────────────────────────────
 
 @app.post("/tts")
 async def tts(req: TTSRequest):
@@ -88,6 +97,7 @@ async def tts(req: TTSRequest):
         speaker_id=req.sid,
         speed=req.speed,
         pitch_shift=req.pitch,
+        language=req.language,
     )
     return Response(
         content=wav_bytes,
@@ -102,57 +112,122 @@ async def tts(req: TTSRequest):
 
 @app.options("/tts/stream")
 async def tts_stream_options():
-    """Allow clients to probe for streaming support."""
     return Response(status_code=200)
 
 
 @app.post("/tts/stream")
 async def tts_stream(req: TTSRequest):
-    """Stream TTS as raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks.
-
-    Uses sherpa-onnx's sentence-level callback for true streaming — each
-    sentence's audio is yielded as soon as it's synthesized, before the
-    full text finishes generating.
-    """
+    """Stream TTS as raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks."""
     import asyncio
     import struct
-    import queue
     import tts_service
+    from tts_backend import TTSCapability
 
-    audio_queue: queue.Queue[bytes | None] = queue.Queue()
+    if not tts_service.has_capability(TTSCapability.STREAMING):
+        return JSONResponse(
+            {"error": "Streaming not supported by current backend",
+             "required_capability": "streaming"},
+            status_code=501,
+        )
+
     sr = tts_service.get_sample_rate()
-
-    def _generate_blocking():
-        tts = tts_service.get_tts()
-        sid = req.sid if req.sid is not None else tts_service.DEFAULT_SPEAKER_ID
-        effective_pitch = req.pitch if req.pitch is not None else tts_service.PITCH_SHIFT
-
-        def callback(samples, progress):
-            import numpy as np
-            shifted = tts_service.pitch_shift_samples(samples, effective_pitch)
-            arr = np.array(shifted, dtype=np.float32)
-            np.clip(arr, -1.0, 1.0, out=arr)
-            pcm = (arr * 32767).astype(np.int16).tobytes()
-            audio_queue.put(pcm)
-            return 1
-
-        effective_speed = req.speed if req.speed is not None else tts_service.DEFAULT_SPEED
-        tts.generate(req.text, sid=sid, speed=effective_speed, callback=callback)
-        audio_queue.put(None)  # sentinel
+    backend = tts_service.get_backend()
 
     async def stream():
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _generate_blocking)
-
         yield struct.pack("<I", sr)
+        loop = asyncio.get_event_loop()
 
-        while True:
-            chunk = await loop.run_in_executor(None, audio_queue.get)
-            if chunk is None:
-                break
+        def _gen():
+            return list(backend.generate_streaming(
+                req.text,
+                speaker_id=req.sid,
+                speed=req.speed,
+                pitch_shift=req.pitch,
+            ))
+
+        chunks = await loop.run_in_executor(None, _gen)
+        for chunk in chunks:
             yield chunk
 
     return StreamingResponse(stream(), media_type="application/octet-stream")
+
+
+# ── Voice Clone ───��──────────────────────────────────────────────
+
+@app.post("/tts/clone")
+async def tts_clone(req: CloneRequest):
+    """Synthesize with voice cloning. Requires voice_clone capability."""
+    import base64
+    import tts_service
+    from tts_backend import TTSCapability
+
+    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
+        return JSONResponse(
+            {"error": "Voice cloning not supported by current backend",
+             "required_capability": "voice_clone",
+             "backend": tts_service.backend_name()},
+            status_code=501,
+        )
+
+    try:
+        speaker_embedding = base64.b64decode(req.speaker_embedding_b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64 speaker_embedding_b64"}, status_code=400)
+
+    wav_bytes, meta = tts_service.clone_voice(
+        text=req.text,
+        speaker_embedding=speaker_embedding,
+        language=req.language,
+    )
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "X-Audio-Duration": str(meta["duration"]),
+            "X-Inference-Time": str(meta["inference_time"]),
+            "X-RTF": str(meta["rtf"]),
+        },
+    )
+
+
+@app.post("/tts/clone/embedding")
+async def tts_extract_embedding(file: UploadFile = File(...)):
+    """Extract speaker embedding from reference audio WAV.
+
+    Returns base64-encoded speaker embedding that can be reused
+    across multiple /tts/clone calls.
+    """
+    import base64
+    import tts_service
+    from tts_backend import TTSCapability
+
+    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
+        return JSONResponse(
+            {"error": "Voice cloning not supported by current backend",
+             "required_capability": "voice_clone",
+             "backend": tts_service.backend_name()},
+            status_code=501,
+        )
+
+    audio_bytes = await file.read()
+    embedding = tts_service.extract_speaker_embedding(audio_bytes)
+    return {
+        "speaker_embedding_b64": base64.b64encode(embedding).decode(),
+        "embedding_size": len(embedding),
+    }
+
+
+# ── ASR ──────────────────────────────────────────────────────────
+
+@app.post("/asr")
+async def asr(
+    file: UploadFile = File(...),
+    language: str = Query("auto"),
+):
+    import asr_service
+    audio_bytes = await file.read()
+    text = asr_service.transcribe_audio(audio_bytes, language=language)
+    return {"text": text}
 
 
 @app.websocket("/asr/stream")
@@ -163,14 +238,11 @@ async def asr_stream(
 ):
     """Streaming ASR via WebSocket.
 
-    Protocol:
-      Client sends: raw int16 PCM bytes (audio chunks)
-      Client sends: empty bytes b"" to signal end of audio
-      Server sends: JSON {"text": "...", "is_final": bool, "is_stable": bool}
+    Client sends: raw int16 PCM bytes
+    Client sends: empty bytes b"" to signal end
+    Server sends: JSON {"text": "...", "is_final": bool, "is_stable": bool}
     """
     import asyncio
-    import json
-
     import numpy as np
 
     await ws.accept()
@@ -190,7 +262,6 @@ async def asr_stream(
             data = await ws.receive_bytes()
 
             if len(data) == 0:
-                # End of audio — finalize (run in thread to avoid blocking event loop)
                 final_text = await asyncio.to_thread(
                     streaming_asr_service.finalize, stream
                 )
@@ -201,10 +272,7 @@ async def asr_stream(
                 })
                 break
 
-            # Convert int16 bytes to float32
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-
-            # Run decode in thread to avoid blocking event loop under concurrent load
             text, is_endpoint = await asyncio.to_thread(
                 streaming_asr_service.feed_and_decode,
                 stream, samples, sample_rate
@@ -216,12 +284,9 @@ async def asr_stream(
                     "is_final": True,
                     "is_stable": True,
                 })
-                # Reset stream for potential next utterance
                 stream = streaming_asr_service.create_stream()
                 prev_text = ""
             elif text and text != prev_text:
-                # Send partial result
-                # Mark as stable if text only grew (no corrections)
                 is_stable = text.startswith(prev_text) if prev_text else False
                 await ws.send_json({
                     "text": text,
