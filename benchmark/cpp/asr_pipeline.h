@@ -46,6 +46,13 @@ class ASRPipeline {
   int vocab_size() const { return vocab_size_; }
   int n_layers() const { return n_layers_; }
 
+  // Run encoder only: mel [1, 128, T] → EncoderOutput with audio_len
+  struct EncoderOutput {
+    std::vector<float> features;  // flattened [1, T', 1024]
+    int audio_len;                // T'
+  };
+  EncoderOutput RunEncoder(const float* mel, int mel_len);
+
  private:
   // ORT sessions (own Env, isolated from TTS and sherpa)
   Ort::Env env_;
@@ -75,13 +82,6 @@ class ASRPipeline {
 
   // Embed lookup (CPU)
   const float* EmbedLookup(int64_t token_id) const;
-
-  // Run encoder: mel [1, 128, T] → audio_features [1, T', 1024]
-  struct EncoderOutput {
-    std::vector<float> features;  // flattened [1, T', 1024]
-    int audio_len;                // T'
-  };
-  EncoderOutput RunEncoder(const float* mel, int mel_len);
 
   // Run prefill: input_ids, position_ids, audio_features, audio_offset
   //   → logits, KV cache

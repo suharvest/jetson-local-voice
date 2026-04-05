@@ -230,6 +230,27 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("audio_offset"),
            py::arg("max_tokens") = 200)
 
+      .def("run_encoder",
+           [](ASRPipeline& self, py::array_t<float> mel) -> int {
+             auto buf = mel.request();
+             int mel_len;
+             const float* mel_ptr;
+             if (buf.ndim == 2) {
+               mel_len = (int)buf.shape[1];
+               mel_ptr = static_cast<const float*>(buf.ptr);
+             } else if (buf.ndim == 3) {
+               mel_len = (int)buf.shape[2];
+               mel_ptr = static_cast<const float*>(buf.ptr);
+             } else {
+               throw std::runtime_error(
+                   "mel must be [128, T] or [1, 128, T]");
+             }
+             auto enc = self.RunEncoder(mel_ptr, mel_len);
+             return enc.audio_len;
+           },
+           py::arg("mel"),
+           "Run encoder only and return audio feature length (T').")
+
       .def_property_readonly("hidden_dim", &ASRPipeline::hidden_dim)
       .def_property_readonly("vocab_size", &ASRPipeline::vocab_size)
       .def_property_readonly("n_layers", &ASRPipeline::n_layers);

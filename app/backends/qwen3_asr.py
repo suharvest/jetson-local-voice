@@ -167,37 +167,20 @@ class Qwen3ASRBackend(ASRBackend):
         """Full C++ pipeline: mel → encoder → prefill → TRT decode."""
         mel_len = mel.shape[2]
 
-        # Build prompt (need audio_len from encoder, but we don't know it yet
-        # in Python. Use mel_len // 2 as approximation for the encoder output
-        # length. Actually, the C++ pipeline runs encoder internally and
-        # the prompt needs the true audio_len. So we estimate it.)
-        #
-        # The encoder downsamples mel by 2x typically. But the C++ pipeline
-        # handles encoder → prefill → decode as a unit. The prompt_ids need
-        # the correct audio_len which we only know after encoder runs.
-        #
-        # Solution: Run encoder in C++ to get audio_len, then build prompt.
-        # But our API takes prompt_ids as input...
-        #
-        # Alternative: The C++ Transcribe() takes mel and prompt_ids. We need
-        # to know audio_len beforehand for the prompt. We have two options:
-        #   A) Run encoder first in Python to get audio_len, then call C++
-        #   B) Estimate audio_len from mel_len
-        #
-        # The encoder output length is deterministic from mel_len (conv
-        # strides). For Whisper encoder: T' = mel_len // 2.
-        # Let's estimate and let the C++ side handle it.
-        #
-        # Actually, looking at the ONNX encoder: it's a standard Whisper-like
-        # encoder. The output T' = mel_len // 2.
-        audio_len_est = mel_len // 2
+        # Get exact encoder output length via C++ run_encoder (avoids
+        # guessing the downsampling ratio).  The encoder is fast (~80-280 ms)
+        # and Transcribe() will re-run it, but correctness > speed here.
+        # If run_encoder is not available, fall back to the known ratio.
+        mel_c = np.ascontiguousarray(mel, dtype=np.float32)
+        if hasattr(self._pipeline, 'run_encoder'):
+            audio_len_est = self._pipeline.run_encoder(mel_c)
+        else:
+            # Qwen3-ASR encoder downsamples mel by ~7.69x (100 mel → 13 features)
+            audio_len_est = mel_len * 13 // 100
 
         lang = language if language != "auto" else None
         prompt_ids = self._build_prompt(audio_len_est, lang)
         audio_offset = prompt_ids.index(AUDIO_PAD)
-
-        # Ensure mel is contiguous float32
-        mel_c = np.ascontiguousarray(mel, dtype=np.float32)
 
         result = self._pipeline.transcribe(
             mel=mel_c,
