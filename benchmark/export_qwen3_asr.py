@@ -506,6 +506,8 @@ def export_decoder_step(model, output_dir, opset=14):
             input_names=["input_embeds", "position_ids"] + in_kv,
             output_names=["logits"] + out_kv,
             dynamic_axes={
+                "input_embeds": {1: "seq_len"},
+                "position_ids": {1: "seq_len"},
                 **{n: {2: "past_len"} for n in in_kv},
                 **{n: {2: "new_len"} for n in out_kv},
             },
