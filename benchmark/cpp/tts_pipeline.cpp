@@ -500,3 +500,196 @@ std::vector<float> TTSPipeline::ExtractSpeakerEmbedding(const float* mel,
                                                          int mel_frames) {
   return ort_->SpeakerEncode(mel, mel_frames);
 }
+
+// ---------------------------------------------------------------------------
+// Streaming synthesis
+// ---------------------------------------------------------------------------
+void TTSPipeline::SynthesizeStreaming(const std::string& text,
+                                      const std::string& lang,
+                                      const std::vector<int64_t>& token_ids,
+                                      const StreamConfig& config,
+                                      AudioChunkCallback callback) {
+  std::cout << "Synth streaming (token-ids): \"" << text << "\" (" << lang
+            << ", " << token_ids.size() << " tokens)" << std::endl;
+  GenerateStreaming(text, lang, nullptr,
+                    token_ids.empty() ? nullptr : &token_ids, config, callback);
+}
+
+void TTSPipeline::SynthesizeStreamingWithSpeaker(
+    const std::string& text, const std::string& lang,
+    const std::vector<int64_t>& token_ids,
+    const std::vector<float>& speaker_embed, const StreamConfig& config,
+    AudioChunkCallback callback) {
+  std::cout << "Synth streaming (voice clone): \"" << text << "\" (" << lang
+            << ")" << std::endl;
+  GenerateStreaming(text, lang, speaker_embed.data(),
+                    token_ids.empty() ? nullptr : &token_ids, config, callback);
+}
+
+void TTSPipeline::GenerateStreaming(const std::string& text,
+                                     const std::string& lang,
+                                     const float* speaker_embed,
+                                     const std::vector<int64_t>* token_ids,
+                                     const StreamConfig& config,
+                                     AudioChunkCallback callback) {
+  using Clock = std::chrono::high_resolution_clock;
+
+  srand(config.seed);
+  int D = cfg_.hidden_dim;
+
+  // Build prefill
+  auto pf = BuildPrefill(text, lang, speaker_embed, token_ids);
+  std::cout << "  Prefill: " << pf.seq_len << " tokens (streaming)"
+            << std::endl;
+
+  // Run prefill
+  auto t0 = Clock::now();
+  auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
+  double prefill_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  std::cout << "  Prefill: " << prefill_ms << " ms" << std::endl;
+
+  // Seed TRT KV cache
+  std::vector<const float*> kv_ptrs;
+  for (auto& kv : pf_result.kv_data) {
+    kv_ptrs.push_back(kv.data());
+  }
+  talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
+
+  // Logits and hidden from prefill (last position)
+  std::vector<float> logits(cfg_.vocab_size);
+  std::vector<float> last_hidden(D);
+  int last_pos_pf = pf.seq_len - 1;
+  VecCopy(logits.data(),
+          pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
+          cfg_.vocab_size);
+  VecCopy(last_hidden.data(),
+          pf_result.last_hidden.data() + last_pos_pf * D, D);
+
+  // Decode loop with chunked vocoder
+  std::vector<std::vector<int>> all_codes;
+  size_t last_audio_pos = 0;  // track yielded audio position
+
+  // Determine chunk boundaries: first chunk is smaller for low TTFA
+  int next_chunk_at = config.first_chunk_frames;
+
+  for (int step = 0; step < config.max_frames; ++step) {
+    // Sample primary code
+    int primary_code = Sample(logits.data(), cfg_.vocab_size, 50, 0.9f,
+                              step < 2, cfg_.codec_eos_token_id);
+    if (primary_code == cfg_.codec_eos_token_id) {
+      std::cout << "  EOS at step " << step << std::endl;
+      break;
+    }
+
+    // Code predictor: 15 residual codes
+    auto primary_e = ort_->CodecEmbed({(int64_t)primary_code});
+    cp_->BeginFrame(last_hidden.data(), primary_e.data());
+
+    std::vector<float> codec_sum(D);
+    VecCopy(codec_sum.data(), primary_e.data(), D);
+
+    std::vector<int> frame_codes = {primary_code};
+
+    for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
+      std::vector<float> cp_logits(cfg_.cp_vocab);
+      cp_->PredictGPU(j, cp_logits.data());
+
+      int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
+      frame_codes.push_back(rc);
+
+      if (cp_->has_embed_table()) {
+        cp_->AppendEmbeddingFromTable(j, rc);
+        const float* re = CPEmbedLookup(j, rc);
+        VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+      } else {
+        auto re = ort_->CPEmbed(rc, j);
+        cp_->AppendEmbedding(re.data());
+        VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
+      }
+    }
+    all_codes.push_back(frame_codes);
+
+    // Next talker input
+    std::vector<float> next_emb(D);
+    if (step < pf.n_trailing) {
+      VecAdd(next_emb.data(), codec_sum.data(),
+             pf.trailing_text.data() + step * D, D);
+    } else {
+      std::vector<float> pad_sum(D);
+      VecAdd(pad_sum.data(), pf.tts_pad_e.data(), pf.codec_pad_e.data(), D);
+      VecAdd(next_emb.data(), codec_sum.data(), pad_sum.data(), D);
+    }
+
+    // Talker decode
+    talker_->DecodeStep(next_emb.data(), logits.data(), last_hidden.data());
+
+    // Check if we should emit a chunk
+    int n = (int)all_codes.size();
+    if (n >= next_chunk_at) {
+      // Run vocoder on all accumulated codes
+      std::vector<int64_t> codes_t(n * cfg_.num_code_groups);
+      for (int f = 0; f < n; ++f) {
+        for (int g = 0; g < cfg_.num_code_groups; ++g) {
+          codes_t[f * cfg_.num_code_groups + g] = all_codes[f][g];
+        }
+      }
+
+      auto full_audio = ort_->Vocoder(codes_t.data(), n, cfg_.num_code_groups);
+
+      // Yield only new samples
+      if (full_audio.size() > last_audio_pos) {
+        StreamChunk chunk;
+        chunk.audio.assign(full_audio.begin() + last_audio_pos,
+                           full_audio.end());
+        chunk.total_frames = n;
+        chunk.is_final = false;
+        last_audio_pos = full_audio.size();
+
+        std::cout << "  Chunk: " << n << " frames, "
+                  << chunk.audio.size() << " new samples" << std::endl;
+        callback(chunk);
+      }
+
+      // After first chunk, use regular chunk size
+      next_chunk_at = n + config.chunk_frames;
+    }
+
+    if ((step + 1) % 10 == 0 && n < next_chunk_at) {
+      std::cout << "  Frame " << step + 1 << std::endl;
+    }
+  }
+
+  // Final chunk: vocoder on all remaining codes
+  int n = (int)all_codes.size();
+  if (n > 0) {
+    std::vector<int64_t> codes_t(n * cfg_.num_code_groups);
+    for (int f = 0; f < n; ++f) {
+      for (int g = 0; g < cfg_.num_code_groups; ++g) {
+        codes_t[f * cfg_.num_code_groups + g] = all_codes[f][g];
+      }
+    }
+
+    auto full_audio = ort_->Vocoder(codes_t.data(), n, cfg_.num_code_groups);
+
+    StreamChunk chunk;
+    if (full_audio.size() > last_audio_pos) {
+      chunk.audio.assign(full_audio.begin() + last_audio_pos,
+                         full_audio.end());
+    }
+    chunk.total_frames = n;
+    chunk.is_final = true;
+
+    std::cout << "  Final chunk: " << n << " frames, "
+              << chunk.audio.size() << " new samples" << std::endl;
+    callback(chunk);
+  } else {
+    // No frames at all — emit empty final chunk
+    StreamChunk chunk;
+    chunk.total_frames = 0;
+    chunk.is_final = true;
+    callback(chunk);
+  }
+
+  std::cout << "  Streaming complete: " << n << " total frames" << std::endl;
+}

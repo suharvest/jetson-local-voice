@@ -186,6 +186,7 @@ async def tts_stream(req: TTSRequest):
                 speaker_id=req.sid,
                 speed=req.speed,
                 pitch_shift=req.pitch,
+                language=req.language,
             ))
 
         chunks = await loop.run_in_executor(None, _gen)
