@@ -501,6 +501,46 @@ std::vector<float> TTSPipeline::ExtractSpeakerEmbedding(const float* mel,
   return ort_->SpeakerEncode(mel, mel_frames);
 }
 
+void TTSPipeline::EnableProfiling(bool enable) {
+  if (talker_) talker_->EnableProfiling(enable);
+  if (cp_) cp_->EnableProfiling(enable);
+}
+
+void TTSPipeline::PrintProfilingStats() {
+  if (talker_ && talker_->stats().n_samples > 0) {
+    auto& s = talker_->stats();
+    std::cout << "\n  === TALKER DECODE PROFILING (" << s.n_samples
+              << " steps) ===" << std::endl;
+    std::cout << "  H2D:     avg=" << s.AvgH2D() << " ms, max=" << s.max_h2d
+              << " ms" << std::endl;
+    std::cout << "  Kernel:  avg=" << s.AvgKernel()
+              << " ms, max=" << s.max_kernel << " ms" << std::endl;
+    std::cout << "  D2H:     avg=" << s.AvgD2H() << " ms, max=" << s.max_d2h
+              << " ms" << std::endl;
+    std::cout << "  Total:   avg=" << s.AvgTotal()
+              << " ms, max=" << s.max_total << " ms" << std::endl;
+    std::cout << "  Overhead (bind+sync): avg=" << s.AvgOverhead() << " ms"
+              << std::endl;
+    talker_->ResetStats();
+  }
+  if (cp_ && cp_->stats().n_samples > 0) {
+    auto& s = cp_->stats();
+    std::cout << "\n  === CODE PREDICTOR PROFILING (" << s.n_samples
+              << " steps) ===" << std::endl;
+    std::cout << "  H2D:     avg=" << s.AvgH2D() << " ms, max=" << s.max_h2d
+              << " ms" << std::endl;
+    std::cout << "  Kernel:  avg=" << s.AvgKernel()
+              << " ms, max=" << s.max_kernel << " ms" << std::endl;
+    std::cout << "  D2H:     avg=" << s.AvgD2H() << " ms, max=" << s.max_d2h
+              << " ms" << std::endl;
+    std::cout << "  Total:   avg=" << s.AvgTotal()
+              << " ms, max=" << s.max_total << " ms" << std::endl;
+    std::cout << "  Overhead (bind+sync): avg=" << s.AvgOverhead() << " ms"
+              << std::endl;
+    cp_->ResetStats();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming synthesis
 // ---------------------------------------------------------------------------

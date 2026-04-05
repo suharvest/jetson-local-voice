@@ -111,6 +111,11 @@ class TTSPipeline {
   std::vector<float> ExtractSpeakerEmbedding(const float* mel,
                                               int mel_frames);
 
+  // Enable CUDA event profiling for per-step timing breakdown
+  void EnableProfiling(bool enable);
+  // Print profiling stats and reset counters
+  void PrintProfilingStats();
+
  private:
   // Core streaming generation loop
   void GenerateStreaming(const std::string& text, const std::string& lang,

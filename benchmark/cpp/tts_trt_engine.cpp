@@ -86,6 +86,13 @@ TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
   kv_elem_bytes_ = TrtDtypeSize(kv_dtype);
 
   AllocateBuffers();
+
+  // Create CUDA events for profiling (always created, zero cost when unused)
+  CHECK_CUDA(cudaEventCreate(&ev_start_));
+  CHECK_CUDA(cudaEventCreate(&ev_h2d_done_));
+  CHECK_CUDA(cudaEventCreate(&ev_kernel_done_));
+  CHECK_CUDA(cudaEventCreate(&ev_d2h_done_));
+
   std::cout << "  TRTTalkerEngine loaded: " << n_layers_ << " layers, KV "
             << kv_elem_bytes_ << " bytes/elem, max_seq=" << max_seq_
             << std::endl;
@@ -93,6 +100,10 @@ TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
 
 TRTTalkerEngine::~TRTTalkerEngine() {
   FreeBuffers();
+  if (ev_start_) cudaEventDestroy(ev_start_);
+  if (ev_h2d_done_) cudaEventDestroy(ev_h2d_done_);
+  if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
+  if (ev_d2h_done_) cudaEventDestroy(ev_d2h_done_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -158,6 +169,11 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
   auto& read = (parity_ == 0) ? kv_a_ : kv_b_;
   auto& write = (parity_ == 0) ? kv_b_ : kv_a_;
 
+  // Record start event for profiling
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
+  }
+
   // Copy inputs_embeds to GPU (4KB)
   size_t emb_bytes = 1 * 1 * hidden_dim_ * sizeof(float);
   CHECK_CUDA(cudaMemcpyAsync(d_emb_, inputs_embeds, emb_bytes,
@@ -174,14 +190,14 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       new_kv_names_[2 * i + 1] = "new_past_value_" + std::to_string(i);
     }
     // Auto-detect embed tensor name: "inputs_embeds" (TTS) or "input_embeds" (ASR)
-    std::string emb_name = "inputs_embeds";
+    emb_name_ = "inputs_embeds";
     for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
       std::string tn = engine_->getIOTensorName(i);
-      if (tn == "input_embeds") { emb_name = "input_embeds"; break; }
+      if (tn == "input_embeds") { emb_name_ = "input_embeds"; break; }
     }
-    std::cout << "  TRT bind: emb_name=" << emb_name << std::endl;
-    ctx->setInputShape(emb_name.c_str(), nvinfer1::Dims3{1, 1, hidden_dim_});
-    ctx->setTensorAddress(emb_name.c_str(), d_emb_);
+    std::cout << "  TRT bind: emb_name=" << emb_name_ << std::endl;
+    ctx->setInputShape(emb_name_.c_str(), nvinfer1::Dims3{1, 1, hidden_dim_});
+    ctx->setTensorAddress(emb_name_.c_str(), d_emb_);
     ctx->setTensorAddress("logits", d_logits_);
     // "last_hidden" may not exist in ASR engine — bind only if present
     for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
@@ -225,8 +241,18 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
     ctx->setTensorAddress(new_kv_names_[2 * i + 1].c_str(), write[2 * i + 1]);
   }
 
-  // Execute
+  // Record H2D done event (all input copies queued before kernel)
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
+  }
+
+  // Execute TRT kernel
   ctx->enqueueV3(stream_);
+
+  // Record kernel done event
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
+  }
 
   // Copy logits + hidden back to host
   size_t logits_bytes = 1 * 1 * vocab_size_ * sizeof(float);
@@ -235,7 +261,21 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
                              cudaMemcpyDeviceToHost, stream_));
   CHECK_CUDA(cudaMemcpyAsync(last_hidden, d_hidden_, hidden_bytes,
                              cudaMemcpyDeviceToHost, stream_));
-  CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+  // Use event sync instead of full stream sync — avoids driver-level
+  // bookkeeping overhead in cudaStreamSynchronize.
+  CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+
+  // Collect profiling data
+  if (profiling_) {
+    StepTiming t;
+    cudaEventElapsedTime(&t.h2d_ms, ev_start_, ev_h2d_done_);
+    cudaEventElapsedTime(&t.kernel_ms, ev_h2d_done_, ev_kernel_done_);
+    cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
+    cudaEventElapsedTime(&t.total_ms, ev_start_, ev_d2h_done_);
+    stats_.Add(t);
+  }
 
   seq_len_ += 1;
   parity_ ^= 1;
@@ -260,6 +300,12 @@ TRTCPEngine::TRTCPEngine(const std::string& engine_path, int hidden_dim,
   CHECK_CUDA(cudaMalloc(&d_gs_, sizeof(int64_t)));
   CHECK_CUDA(cudaMalloc(&d_out_, 1 * 1 * cp_vocab * sizeof(float)));
 
+  // Create CUDA events for profiling
+  CHECK_CUDA(cudaEventCreate(&ev_start_));
+  CHECK_CUDA(cudaEventCreate(&ev_h2d_done_));
+  CHECK_CUDA(cudaEventCreate(&ev_kernel_done_));
+  CHECK_CUDA(cudaEventCreate(&ev_d2h_done_));
+
   std::cout << "  TRTCPEngine loaded: D=" << hidden_dim << ", vocab="
             << cp_vocab << std::endl;
 }
@@ -268,6 +314,10 @@ TRTCPEngine::~TRTCPEngine() {
   if (d_ctx_) cudaFree(d_ctx_);
   if (d_gs_) cudaFree(d_gs_);
   if (d_out_) cudaFree(d_out_);
+  if (ev_start_) cudaEventDestroy(ev_start_);
+  if (ev_h2d_done_) cudaEventDestroy(ev_h2d_done_);
+  if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
+  if (ev_d2h_done_) cudaEventDestroy(ev_d2h_done_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -295,7 +345,9 @@ void TRTCPEngine::Predict(const float* context, int ctx_len, int step,
   size_t out_bytes = 1 * 1 * cp_vocab_ * sizeof(float);
   CHECK_CUDA(cudaMemcpyAsync(logits_out, d_out_, out_bytes,
                              cudaMemcpyDeviceToHost, stream_));
-  CHECK_CUDA(cudaStreamSynchronize(stream_));
+  // Event-based sync
+  CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
 }
 
 // --- GPU-resident context methods ---
@@ -313,7 +365,12 @@ void TRTCPEngine::BeginFrame(const float* hidden, const float* primary_emb) {
 void TRTCPEngine::PredictGPU(int step, float* logits_out) {
   auto* ctx = context_trt_.get();
 
-  // gen_step
+  // Record start event for profiling
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
+  }
+
+  // gen_step — small H2D copy (8 bytes)
   int64_t gs = step;
   CHECK_CUDA(
       cudaMemcpyAsync(d_gs_, &gs, sizeof(int64_t), cudaMemcpyHostToDevice, stream_));
@@ -325,13 +382,34 @@ void TRTCPEngine::PredictGPU(int step, float* logits_out) {
   ctx->setTensorAddress("gen_step", d_gs_);
   ctx->setTensorAddress("logits", d_out_);
 
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
+  }
+
   ctx->enqueueV3(stream_);
+
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
+  }
 
   // Only copy logits back (small: 2048*4 = 8KB)
   size_t out_bytes = 1 * 1 * cp_vocab_ * sizeof(float);
   CHECK_CUDA(cudaMemcpyAsync(logits_out, d_out_, out_bytes,
                              cudaMemcpyDeviceToHost, stream_));
-  CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+  // Event-based sync instead of full stream sync
+  CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+
+  // Collect profiling data
+  if (profiling_) {
+    StepTiming t;
+    cudaEventElapsedTime(&t.h2d_ms, ev_start_, ev_h2d_done_);
+    cudaEventElapsedTime(&t.kernel_ms, ev_h2d_done_, ev_kernel_done_);
+    cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
+    cudaEventElapsedTime(&t.total_ms, ev_start_, ev_d2h_done_);
+    stats_.Add(t);
+  }
 }
 
 void TRTCPEngine::AppendEmbedding(const float* emb) {

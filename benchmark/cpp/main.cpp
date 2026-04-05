@@ -68,6 +68,7 @@ static void PrintUsage(const char* prog) {
             << "  --seed N              Random seed (default: 42)\n"
             << "  --speaker-emb PATH    Speaker embedding .bin (voice clone)\n"
             << "  --token-ids IDS       Comma-separated token IDs (bypass tokenizer)\n"
+            << "  --profile             Enable CUDA event profiling (H2D/kernel/D2H breakdown)\n"
             << std::endl;
 }
 
@@ -83,6 +84,7 @@ int main(int argc, char* argv[]) {
   std::string token_ids_str;
   int max_frames = 200;
   int seed = 42;
+  bool profile = false;
 
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--model-dir") && i + 1 < argc)
@@ -107,6 +109,8 @@ int main(int argc, char* argv[]) {
       speaker_emb_path = argv[++i];
     else if (!strcmp(argv[i], "--token-ids") && i + 1 < argc)
       token_ids_str = argv[++i];
+    else if (!strcmp(argv[i], "--profile"))
+      profile = true;
     else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
       PrintUsage(argv[0]);
       return 0;
@@ -126,6 +130,11 @@ int main(int argc, char* argv[]) {
 
   // Build pipeline
   TTSPipeline pipeline(model_dir, sherpa_dir, talker_engine, cp_engine);
+
+  if (profile) {
+    pipeline.EnableProfiling(true);
+    std::cout << "CUDA event profiling enabled" << std::endl;
+  }
 
   SynthResult result;
   if (!token_ids.empty()) {
@@ -155,6 +164,11 @@ int main(int argc, char* argv[]) {
     result = pipeline.SynthesizeWithSpeaker(text, lang, spk, max_frames, seed);
   } else {
     result = pipeline.Synthesize(text, lang, max_frames, seed);
+  }
+
+  // Print profiling breakdown
+  if (profile) {
+    pipeline.PrintProfilingStats();
   }
 
   // Write WAV
