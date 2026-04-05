@@ -49,7 +49,54 @@ static py::bytes MakeWav(const std::vector<float>& audio, int sample_rate) {
 }
 
 PYBIND11_MODULE(qwen3_tts_engine, m) {
-  m.doc() = "Qwen3-TTS C++ TRT native inference engine";
+  m.doc() = "Qwen3-TTS/ASR C++ TRT native inference engine";
+
+  // ── ASR Decoder (reuses TRTTalkerEngine with different vocab_size) ──
+  py::class_<TRTTalkerEngine>(m, "ASRDecoder")
+      .def(py::init<const std::string&, int, int, int, int, int, int>(),
+           py::arg("engine_path"),
+           py::arg("n_layers") = 28,
+           py::arg("hidden_dim") = 1024,
+           py::arg("n_heads") = 8,
+           py::arg("head_dim") = 128,
+           py::arg("vocab_size") = 151936,
+           py::arg("max_seq") = 500)
+
+      .def("seed_kv",
+           [](TRTTalkerEngine& self, py::dict kv_dict, int seq_len) {
+             // Collect KV pointers from dict of numpy arrays
+             std::vector<const float*> ptrs;
+             for (int i = 0; i < 28; ++i) {
+               for (auto prefix : {"past_key_", "past_value_"}) {
+                 std::string name = std::string(prefix) + std::to_string(i);
+                 if (kv_dict.contains(name)) {
+                   auto arr = kv_dict[name.c_str()].cast<py::array_t<float>>();
+                   ptrs.push_back(static_cast<const float*>(arr.request().ptr));
+                 }
+               }
+             }
+             self.SeedKV(ptrs.data(), (int)ptrs.size(), seq_len);
+           },
+           py::arg("kv_dict"), py::arg("seq_len"))
+
+      .def("decode_step",
+           [](TRTTalkerEngine& self, py::array_t<float> embeds,
+              int vocab_size) -> py::array_t<float> {
+             auto buf = embeds.request();
+             std::vector<float> logits(vocab_size);
+             std::vector<float> hidden(1024);
+             self.DecodeStep(static_cast<const float*>(buf.ptr),
+                             logits.data(), hidden.data());
+             auto result = py::array_t<float>({1, 1, vocab_size});
+             std::memcpy(result.mutable_data(), logits.data(),
+                         vocab_size * sizeof(float));
+             return result;
+           },
+           py::arg("input_embeds"),
+           py::arg("vocab_size") = 151936)
+
+      .def("reset", &TRTTalkerEngine::Reset);
+
 
   py::class_<SynthResult>(m, "SynthResult")
       .def_readonly("n_frames", &SynthResult::n_frames)

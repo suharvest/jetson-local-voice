@@ -117,6 +117,7 @@ void TRTTalkerEngine::AllocateBuffers() {
   CHECK_CUDA(cudaMalloc(&d_emb_, 1 * 1 * hidden_dim_ * emb_elem));
   CHECK_CUDA(cudaMalloc(&d_logits_, 1 * 1 * vocab_size_ * logits_elem));
   CHECK_CUDA(cudaMalloc(&d_hidden_, 1 * 1 * hidden_dim_ * hidden_elem));
+  CHECK_CUDA(cudaMalloc(&d_position_id_, sizeof(int64_t)));
 }
 
 void TRTTalkerEngine::FreeBuffers() {
@@ -127,6 +128,7 @@ void TRTTalkerEngine::FreeBuffers() {
   if (d_emb_) cudaFree(d_emb_);
   if (d_logits_) cudaFree(d_logits_);
   if (d_hidden_) cudaFree(d_hidden_);
+  if (d_position_id_) cudaFree(d_position_id_);
 }
 
 void TRTTalkerEngine::SeedKV(const float* const* kv_ptrs, int n_kv,
@@ -161,7 +163,7 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
   CHECK_CUDA(cudaMemcpyAsync(d_emb_, inputs_embeds, emb_bytes,
                              cudaMemcpyHostToDevice, stream_));
 
-  // Initialize cached names on first call
+  // Initialize cached names on first call — auto-detect from engine
   if (first_step_) {
     kv_names_.resize(2 * n_layers_);
     new_kv_names_.resize(2 * n_layers_);
@@ -171,12 +173,41 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       new_kv_names_[2 * i] = "new_past_key_" + std::to_string(i);
       new_kv_names_[2 * i + 1] = "new_past_value_" + std::to_string(i);
     }
-    // Bind static tensors (only need to do once)
-    ctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, hidden_dim_});
-    ctx->setTensorAddress("inputs_embeds", d_emb_);
+    // Auto-detect embed tensor name: "inputs_embeds" (TTS) or "input_embeds" (ASR)
+    std::string emb_name = "inputs_embeds";
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "input_embeds") { emb_name = "input_embeds"; break; }
+    }
+    ctx->setInputShape(emb_name.c_str(), nvinfer1::Dims3{1, 1, hidden_dim_});
+    ctx->setTensorAddress(emb_name.c_str(), d_emb_);
     ctx->setTensorAddress("logits", d_logits_);
-    ctx->setTensorAddress("last_hidden", d_hidden_);
+    // "last_hidden" may not exist in ASR engine — bind only if present
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "last_hidden") {
+        ctx->setTensorAddress("last_hidden", d_hidden_);
+        break;
+      }
+    }
+    // "position_ids" for ASR
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "position_ids") {
+        has_position_ids_ = true;
+        ctx->setInputShape("position_ids", nvinfer1::Dims2{1, 1});
+        ctx->setTensorAddress("position_ids", d_position_id_);
+        break;
+      }
+    }
     first_step_ = false;
+  }
+
+  // Update position_ids if present
+  if (has_position_ids_) {
+    int64_t pos = seq_len_;
+    CHECK_CUDA(cudaMemcpyAsync(d_position_id_, &pos, sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
   }
 
   // Bind KV cache — only shapes and addresses change per step

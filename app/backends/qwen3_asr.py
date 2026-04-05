@@ -1,4 +1,4 @@
-"""Qwen3-ASR backend — ORT encoder/prefill + TRT decoder.
+"""Qwen3-ASR backend — ORT encoder/prefill + C++ TRT decoder (pybind11).
 
 Supports: OFFLINE, MULTI_LANGUAGE, LANGUAGE_ID
 Models loaded once at preload(), stays resident.
@@ -7,27 +7,41 @@ Models loaded once at preload(), stays resident.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
-import struct
 import time
 import wave
 from typing import Optional
 
 import numpy as np
+import onnxruntime as ort
 
 from asr_backend import ASRBackend, ASRCapability, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
-# Community export (validated with ORT 1.20) is the default
 _BASE = os.environ.get("QWEN3_ASR_MODEL_BASE", "/opt/models/qwen3-asr")
+
+# Prompt constants (from andrewleech/qwen3-asr-onnx/src/prompt.py)
+IM_START = 151644
+IM_END = 151645
+AUDIO_START = 151669
+AUDIO_END = 151670
+AUDIO_PAD = 151676
+ASR_TEXT = 151704
+EOS_IDS = {151643, 151645}
 
 
 class Qwen3ASRBackend(ASRBackend):
 
     def __init__(self):
-        self._pipeline = None
+        self._encoder = None
+        self._prefill = None
+        self._decoder = None  # C++ TRT engine via pybind11
+        self._decoder_ort = None  # ORT fallback
+        self._embed_tokens = None
+        self._tokenizer = None
         self._ready = False
 
     @property
@@ -46,34 +60,183 @@ class Qwen3ASRBackend(ASRBackend):
         return self._ready
 
     def preload(self) -> None:
-        import sys
-        # Add benchmark dir to path for the pipeline module
-        benchmark_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "benchmark")
-        if os.path.exists(benchmark_dir):
-            sys.path.insert(0, benchmark_dir)
-
-        # Import inline to avoid top-level deps
-        from asr_qwen3_trt import Qwen3ASRPipeline
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         logger.info("Loading Qwen3-ASR from %s", _BASE)
         t0 = time.time()
-        self._pipeline = Qwen3ASRPipeline(_BASE)
-        logger.info("Qwen3-ASR loaded in %.1fs", time.time() - t0)
+
+        self._encoder = ort.InferenceSession(
+            os.path.join(_BASE, "encoder.onnx"), so, providers=providers)
+
+        # Prefill: try decoder_prefill (v2) then decoder_init (community)
+        for name in ["decoder_prefill.onnx", "decoder_init.onnx"]:
+            path = os.path.join(_BASE, name)
+            if os.path.exists(path):
+                self._prefill = ort.InferenceSession(path, so, providers=providers)
+                break
+
+        # Embed tokens
+        emb_path = os.path.join(_BASE, "embed_tokens.bin")
+        if os.path.exists(emb_path):
+            self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
+
+        # TRT decoder via pybind11 (same C++ engine as TTS talker)
+        engine_path = os.path.join(_BASE, "asr_decoder_fp16.engine")
+        if not os.path.exists(engine_path):
+            # Also check v2 directory
+            engine_path = os.path.join(_BASE.replace("qwen3-asr", "qwen3-asr-v2"), "asr_decoder_fp16.engine")
+
+        # TODO: TRT decoder needs KV dtype/position_ids alignment with ORT prefill
+        # Disabled for now — ORT decode works correctly
+        # if os.path.exists(engine_path):
+        #     try:
+        #         import qwen3_tts_engine
+        #         self._decoder = qwen3_tts_engine.ASRDecoder(
+        #             engine_path, 28, 1024, 8, 128, 151936, 500)
+        #         logger.info("ASR TRT decoder loaded: %s", engine_path)
+        #     except Exception as e:
+        #         logger.warning("TRT decoder failed: %s, using ORT fallback", e)
+        if False:
+            pass  # TRT disabled until KV alignment fixed
+
+        # ORT decoder fallback
+        if self._decoder is None:
+            for name in ["decoder_step.onnx"]:
+                path = os.path.join(_BASE, name)
+                if os.path.exists(path):
+                    try:
+                        self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
+                        logger.info("ASR ORT decoder loaded")
+                    except Exception as e:
+                        logger.warning("ORT decoder failed: %s", e)
+
+        # Tokenizer
+        tok_path = os.path.join(_BASE, "tokenizer.json")
+        if os.path.exists(tok_path):
+            from tokenizers import Tokenizer
+            self._tokenizer = Tokenizer.from_file(tok_path)
+
+        logger.info("Qwen3-ASR loaded in %.1fs (decoder: %s)",
+                     time.time() - t0,
+                     "TRT" if self._decoder else "ORT" if self._decoder_ort else "none")
         self._ready = True
 
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         audio = self._bytes_to_float(audio_bytes)
+        t_total = time.perf_counter()
+
+        # 1. Mel
+        mel = self._compute_mel(audio)  # [1, 128, T]
+
+        # 2. Encoder
+        t0 = time.perf_counter()
+        enc_out = self._encoder.run(None, {"mel": mel})[0]  # [1, T', 1024]
+        enc_ms = (time.perf_counter() - t0) * 1000
+        audio_len = enc_out.shape[1]
+
+        # 3. Prompt
         lang = language if language != "auto" else None
-        text, meta = self._pipeline.transcribe(audio, language=lang)
+        prompt_ids = self._build_prompt(audio_len, lang)
+        input_ids = np.array([prompt_ids], dtype=np.int64)
+        seq_len = len(prompt_ids)
+        audio_offset = prompt_ids.index(AUDIO_PAD)
+
+        # 4. Prefill
+        t0 = time.perf_counter()
+        prefill_inputs = {
+            "input_ids": input_ids,
+            "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
+            "audio_features": enc_out,
+            "audio_offset": np.array([audio_offset], dtype=np.int64),
+        }
+        valid = {n: v for n, v in prefill_inputs.items()
+                 if n in [i.name for i in self._prefill.get_inputs()]}
+        outputs = self._prefill.run(None, valid)
+        out_map = dict(zip([o.name for o in self._prefill.get_outputs()], outputs))
+        prefill_ms = (time.perf_counter() - t0) * 1000
+
+        logits = out_map.get("logits")
+        kv = {k.replace("present_", "past_"): v for k, v in out_map.items()
+              if k.startswith("past_") or k.startswith("present_")}
+
+        # Seed TRT KV
+        if self._decoder:
+            self._decoder.seed_kv(kv, seq_len)
+
+        # 5. Decode
+        t0 = time.perf_counter()
+        output_ids = []
+        for step in range(200):
+            next_token = int(np.argmax(logits[0, -1, :]))
+            if next_token in EOS_IDS:
+                break
+            output_ids.append(next_token)
+
+            embeds = self._embed_tokens[next_token][np.newaxis, np.newaxis, :]
+            cur_pos = seq_len + step
+
+            if self._decoder:
+                logits = self._decoder.decode_step(embeds, 151936)
+            elif self._decoder_ort:
+                step_in = {"input_embeds": embeds,
+                           "position_ids": np.array([[cur_pos]], dtype=np.int64)}
+                step_in.update(kv)
+                step_out = self._decoder_ort.run(None, step_in)
+                step_map = dict(zip([o.name for o in self._decoder_ort.get_outputs()], step_out))
+                logits = step_map.get("logits")
+                kv = {k.replace("present_", "past_").replace("new_", ""): v
+                      for k, v in step_map.items() if "logits" not in k}
+            else:
+                break
+
+        decode_ms = (time.perf_counter() - t0) * 1000
+        total_ms = (time.perf_counter() - t_total) * 1000
+
+        # Decode text
+        text = self._tokenizer.decode(output_ids) if self._tokenizer else f"[{len(output_ids)} tokens]"
+        if "<asr_text>" in text:
+            text = text.split("<asr_text>", 1)[1]
+
+        audio_dur = len(audio) / 16000
+        per_tok = decode_ms / max(len(output_ids), 1)
+        backend = "TRT" if self._decoder else "ORT"
+
         return TranscriptionResult(
-            text=text,
-            language=meta.get("language"),
-            **meta,
+            text=text.strip(),
+            duration=round(audio_dur, 3),
+            inference_time=round(total_ms / 1000, 3),
+            rtf=round(total_ms / 1000 / audio_dur, 3) if audio_dur > 0 else 0,
+            n_tokens=len(output_ids),
+            per_token_ms=round(per_tok, 1),
+            backend=backend,
         )
 
+    def _build_prompt(self, audio_len, language=None):
+        ids = [
+            IM_START, 9125, 198, IM_END, 198,
+            IM_START, 882, 198,
+            AUDIO_START, *([AUDIO_PAD] * audio_len), AUDIO_END, IM_END, 198,
+            IM_START, 77091, 198,
+        ]
+        if language:
+            if self._tokenizer:
+                lang_ids = self._tokenizer.encode(f"language {language}").ids
+            else:
+                lang_ids = []
+            ids.extend(lang_ids + [ASR_TEXT])
+        return ids
+
+    def _compute_mel(self, audio):
+        from transformers import WhisperFeatureExtractor
+        fe = WhisperFeatureExtractor(feature_size=128, sampling_rate=16000,
+                                     n_fft=400, hop_length=160, chunk_length=30)
+        features = fe(audio, sampling_rate=16000, return_tensors="np")
+        return features["input_features"]  # [1, 128, T]
+
     @staticmethod
-    def _bytes_to_float(audio_bytes: bytes) -> np.ndarray:
-        """Convert WAV bytes to float32 numpy array at 16kHz."""
+    def _bytes_to_float(audio_bytes):
         try:
             import soundfile as sf
             audio, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
@@ -85,10 +248,8 @@ class Qwen3ASRBackend(ASRBackend):
                 sr = w.getframerate()
                 raw = w.readframes(w.getnframes())
                 audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
         if sr != 16000:
             ratio = 16000 / sr
             new_len = int(len(audio) * ratio)
-            indices = np.linspace(0, len(audio) - 1, new_len)
-            audio = np.interp(indices, np.arange(len(audio)), audio)
+            audio = np.interp(np.linspace(0, len(audio)-1, new_len), np.arange(len(audio)), audio)
         return audio.astype(np.float32)
