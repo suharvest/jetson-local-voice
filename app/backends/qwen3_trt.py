@@ -1,43 +1,38 @@
-"""Qwen3-TTS backend via C++ TRT native engine.
+"""Qwen3-TTS backend via C++ TRT native engine (pybind11).
 
 Supports: BASIC_TTS, VOICE_CLONE, MULTI_LANGUAGE
-Requires: compiled qwen3_tts binary + TRT engines + ONNX models
+Models loaded once at preload(), C++ engine stays resident in memory.
 """
 
 from __future__ import annotations
 
-import io
 import logging
 import os
-import struct
-import subprocess
-import tempfile
 import time
 from typing import Optional
-
-import numpy as np
 
 from tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
 
 # Paths (configurable via env)
-QWEN3_BINARY = os.environ.get("QWEN3_TTS_BINARY", "/tmp/qwen3_tts")
 QWEN3_SHERPA_DIR = os.environ.get("QWEN3_SHERPA_DIR", "/tmp/qwen3-v2")
 QWEN3_MODEL_DIR = os.environ.get("QWEN3_MODEL_DIR", "/tmp/qwen3-v2")
 QWEN3_TALKER_ENGINE = os.environ.get("QWEN3_TALKER_ENGINE", "/tmp/talker_decode_fp16.engine")
 QWEN3_CP_ENGINE = os.environ.get("QWEN3_CP_ENGINE", "/tmp/cp_bf16.engine")
 QWEN3_SPEAKER_ENCODER = os.environ.get("QWEN3_SPEAKER_ENCODER", "/tmp/qwen3-v2/speaker_encoder.onnx")
-QWEN3_EXTRACT_SCRIPT = os.environ.get("QWEN3_EXTRACT_SCRIPT", "/tmp/extract_speaker_emb.py")
 QWEN3_TOKENIZER_DIR = os.environ.get("QWEN3_TOKENIZER_DIR", "/tmp/qwen3-tts-bench/model/tokenizer")
+# Path to extract_speaker_emb.py for mel computation
+QWEN3_EXTRACT_SCRIPT = os.environ.get("QWEN3_EXTRACT_SCRIPT", "/tmp/extract_speaker_emb.py")
 
 
 class Qwen3TRTBackend(TTSBackend):
-    """Qwen3-TTS via C++ TRT native inference."""
+    """Qwen3-TTS via C++ TRT native inference (pybind11 module, models resident)."""
 
     def __init__(self):
-        self._ready = False
+        self._engine = None  # qwen3_tts_engine.Pipeline
         self._tokenizer = None
+        self._ready = False
 
     @property
     def name(self) -> str:
@@ -58,50 +53,44 @@ class Qwen3TRTBackend(TTSBackend):
         return self._ready
 
     def preload(self) -> None:
-        # Verify binary and engines exist
-        missing = []
+        """Load C++ TRT engine + tokenizer. Models stay resident."""
+        # Verify files
         for path, desc in [
-            (QWEN3_BINARY, "C++ binary"),
             (QWEN3_TALKER_ENGINE, "talker engine"),
             (QWEN3_CP_ENGINE, "CP engine"),
-            (QWEN3_SHERPA_DIR + "/config.json", "config.json"),
+            (os.path.join(QWEN3_SHERPA_DIR, "config.json"), "config.json"),
         ]:
             if not os.path.exists(path):
-                missing.append(f"{desc}: {path}")
-        if missing:
-            raise FileNotFoundError(
-                f"Qwen3 TRT backend missing files:\n" + "\n".join(missing)
-            )
+                raise FileNotFoundError(f"Missing {desc}: {path}")
 
         # Load tokenizer
         self._load_tokenizer()
 
-        # Warmup: run one short synthesis
-        logger.info("Qwen3 TRT warmup...")
-        try:
-            self.synthesize("OK", language="english")
-            logger.info("Qwen3 TRT backend ready.")
-        except Exception as e:
-            logger.warning("Warmup failed (non-fatal): %s", e)
+        # Load C++ engine (this is the heavy part: ~25s for model loading + embed table)
+        logger.info("Loading Qwen3 TRT engine (this takes ~25s)...")
+        t0 = time.time()
 
+        import qwen3_tts_engine
+        self._engine = qwen3_tts_engine.Pipeline(
+            QWEN3_MODEL_DIR, QWEN3_SHERPA_DIR,
+            QWEN3_TALKER_ENGINE, QWEN3_CP_ENGINE,
+        )
+        logger.info("Qwen3 TRT engine loaded in %.1fs", time.time() - t0)
         self._ready = True
 
     def _load_tokenizer(self):
         vocab_path = os.path.join(QWEN3_TOKENIZER_DIR, "vocab.json")
         merges_path = os.path.join(QWEN3_TOKENIZER_DIR, "merges.txt")
-        if os.path.exists(vocab_path):
-            try:
-                from tokenizers import Tokenizer
-                from tokenizers.models import BPE
-                from tokenizers.pre_tokenizers import ByteLevel
+        if not os.path.exists(vocab_path):
+            raise FileNotFoundError(f"Tokenizer not found: {vocab_path}")
 
-                self._tokenizer = Tokenizer(BPE(vocab_path, merges_path))
-                self._tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
-                logger.info("Tokenizer loaded from %s", QWEN3_TOKENIZER_DIR)
-            except Exception as e:
-                logger.warning("Failed to load tokenizer: %s", e)
-        else:
-            logger.warning("Tokenizer not found at %s", QWEN3_TOKENIZER_DIR)
+        from tokenizers import Tokenizer
+        from tokenizers.models import BPE
+        from tokenizers.pre_tokenizers import ByteLevel
+
+        self._tokenizer = Tokenizer(BPE(vocab_path, merges_path))
+        self._tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+        logger.info("Tokenizer loaded from %s", QWEN3_TOKENIZER_DIR)
 
     def _tokenize(self, text: str) -> list[int]:
         if self._tokenizer is None:
@@ -121,34 +110,27 @@ class Qwen3TRTBackend(TTSBackend):
             language = "english"
 
         token_ids = self._tokenize(text)
-        token_ids_str = ",".join(str(i) for i in token_ids)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            wav_path = f.name
+        start = time.time()
+        result = self._engine.synthesize(
+            text=text,
+            lang=language,
+            token_ids=token_ids,
+        )
+        elapsed = time.time() - start
 
-        try:
-            start = time.time()
-            self._run_binary(
-                token_ids_str=token_ids_str,
-                language=language,
-                output=wav_path,
-                text=text,
-            )
-            elapsed = time.time() - start
+        wav_bytes = result["wav_bytes"]
+        duration = result.get("duration", 0)
 
-            wav_bytes = open(wav_path, "rb").read()
-            duration = self._wav_duration(wav_bytes)
-
-            meta = {
-                "duration": round(duration, 3),
-                "inference_time": round(elapsed, 3),
-                "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
-                "sample_rate": self.sample_rate,
-            }
-            return wav_bytes, meta
-        finally:
-            if os.path.exists(wav_path):
-                os.unlink(wav_path)
+        meta = {
+            "duration": round(duration, 3),
+            "inference_time": round(elapsed, 3),
+            "rtf": round(result.get("rtf", 0), 3),
+            "sample_rate": self.sample_rate,
+            "n_frames": result.get("n_frames", 0),
+            "per_step_ms": round(result.get("per_step_ms", 0), 1),
+        }
+        return wav_bytes, meta
 
     def clone_voice(
         self,
@@ -161,41 +143,32 @@ class Qwen3TRTBackend(TTSBackend):
             language = "english"
 
         token_ids = self._tokenize(text)
-        token_ids_str = ",".join(str(i) for i in token_ids)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
-            wav_path = wf.name
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as ef:
-            ef.write(speaker_embedding)
-            emb_path = ef.name
+        start = time.time()
+        result = self._engine.synthesize_clone(
+            text=text,
+            lang=language,
+            token_ids=token_ids,
+            speaker_emb_bytes=speaker_embedding,
+        )
+        elapsed = time.time() - start
 
-        try:
-            start = time.time()
-            self._run_binary(
-                token_ids_str=token_ids_str,
-                language=language,
-                output=wav_path,
-                text=text,
-                speaker_emb=emb_path,
-            )
-            elapsed = time.time() - start
+        wav_bytes = result["wav_bytes"]
+        duration = result.get("duration", 0)
 
-            wav_bytes = open(wav_path, "rb").read()
-            duration = self._wav_duration(wav_bytes)
-
-            meta = {
-                "duration": round(duration, 3),
-                "inference_time": round(elapsed, 3),
-                "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
-                "sample_rate": self.sample_rate,
-            }
-            return wav_bytes, meta
-        finally:
-            for p in [wav_path, emb_path]:
-                if os.path.exists(p):
-                    os.unlink(p)
+        meta = {
+            "duration": round(duration, 3),
+            "inference_time": round(elapsed, 3),
+            "rtf": round(result.get("rtf", 0), 3),
+            "sample_rate": self.sample_rate,
+        }
+        return wav_bytes, meta
 
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
+        """Extract speaker embedding using Python mel computation + ORT."""
+        import tempfile
+        import subprocess
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
             wf.write(audio_wav_bytes)
             wav_path = wf.name
@@ -204,49 +177,16 @@ class Qwen3TRTBackend(TTSBackend):
 
         try:
             result = subprocess.run(
-                [
-                    "python3", QWEN3_EXTRACT_SCRIPT,
-                    "--audio", wav_path,
-                    "--model", QWEN3_SPEAKER_ENCODER,
-                    "--output", emb_path,
-                ],
+                ["python3", QWEN3_EXTRACT_SCRIPT,
+                 "--audio", wav_path,
+                 "--model", QWEN3_SPEAKER_ENCODER,
+                 "--output", emb_path],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"Speaker embedding extraction failed: {result.stderr}")
-
+                raise RuntimeError(f"Embedding extraction failed: {result.stderr}")
             return open(emb_path, "rb").read()
         finally:
             for p in [wav_path, emb_path]:
                 if os.path.exists(p):
                     os.unlink(p)
-
-    def _run_binary(self, token_ids_str: str, language: str, output: str,
-                    text: str = "", speaker_emb: Optional[str] = None):
-        cmd = [
-            QWEN3_BINARY,
-            "--sherpa-dir", QWEN3_SHERPA_DIR,
-            "--model-dir", QWEN3_MODEL_DIR,
-            "--talker-engine", QWEN3_TALKER_ENGINE,
-            "--cp-engine", QWEN3_CP_ENGINE,
-            "--token-ids", token_ids_str,
-            "--lang", language,
-            "--output", output,
-            "--text", text,
-        ]
-        if speaker_emb:
-            cmd += ["--speaker-emb", speaker_emb]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            raise RuntimeError(f"qwen3_tts failed: {result.stderr[-500:]}")
-
-    @staticmethod
-    def _wav_duration(wav_bytes: bytes) -> float:
-        try:
-            with io.BytesIO(wav_bytes) as bio:
-                import wave
-                with wave.open(bio) as w:
-                    return w.getnframes() / w.getframerate()
-        except Exception:
-            return 0.0
