@@ -20,7 +20,8 @@ from asr_backend import ASRBackend, ASRCapability, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
-_BASE = os.environ.get("QWEN3_ASR_MODEL_BASE", "/opt/models/qwen3-asr-v2")
+# Community export (validated with ORT 1.20) is the default
+_BASE = os.environ.get("QWEN3_ASR_MODEL_BASE", "/opt/models/qwen3-asr")
 
 
 class Qwen3ASRBackend(ASRBackend):
