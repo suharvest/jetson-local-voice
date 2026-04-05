@@ -70,6 +70,11 @@ class TRTTalkerEngine {
 
   int seq_len_ = 0;
   int parity_ = 0;  // 0 = read A write B, 1 = read B write A
+
+  // Pre-cached tensor names to avoid snprintf per step
+  std::vector<std::string> kv_names_;       // "past_key_0", "past_value_0", ...
+  std::vector<std::string> new_kv_names_;   // "new_past_key_0", ...
+  bool first_step_ = true;
 };
 
 // ---------------------------------------------------------------------------
