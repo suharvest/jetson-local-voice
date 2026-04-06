@@ -1,0 +1,372 @@
+================================================================================
+ONNX Model Analysis: Streaming Zipformer Encoder
+================================================================================
+
+--- Graph Inputs ---
+  x: ['N', 39, 80] (float32)
+  cached_len_0: [2, 'N'] (int64)
+  cached_len_1: [2, 'N'] (int64)
+  cached_len_2: [2, 'N'] (int64)
+  cached_len_3: [2, 'N'] (int64)
+  cached_len_4: [2, 'N'] (int64)
+  cached_avg_0: [2, 'N', 256] (float32)
+  cached_avg_1: [2, 'N', 256] (float32)
+  cached_avg_2: [2, 'N', 256] (float32)
+  cached_avg_3: [2, 'N', 256] (float32)
+  cached_avg_4: [2, 'N', 256] (float32)
+  cached_key_0: [2, 64, 'N', 192] (float32)
+  cached_key_1: [2, 32, 'N', 192] (float32)
+  cached_key_2: [2, 16, 'N', 192] (float32)
+  cached_key_3: [2, 8, 'N', 192] (float32)
+  cached_key_4: [2, 32, 'N', 192] (float32)
+  cached_val_0: [2, 64, 'N', 96] (float32)
+  cached_val_1: [2, 32, 'N', 96] (float32)
+  cached_val_2: [2, 16, 'N', 96] (float32)
+  cached_val_3: [2, 8, 'N', 96] (float32)
+  cached_val_4: [2, 32, 'N', 96] (float32)
+  cached_val2_0: [2, 64, 'N', 96] (float32)
+  cached_val2_1: [2, 32, 'N', 96] (float32)
+  cached_val2_2: [2, 16, 'N', 96] (float32)
+  cached_val2_3: [2, 8, 'N', 96] (float32)
+  cached_val2_4: [2, 32, 'N', 96] (float32)
+  cached_conv1_0: [2, 'N', 256, 30] (float32)
+  cached_conv1_1: [2, 'N', 256, 30] (float32)
+  cached_conv1_2: [2, 'N', 256, 30] (float32)
+  cached_conv1_3: [2, 'N', 256, 30] (float32)
+  cached_conv1_4: [2, 'N', 256, 30] (float32)
+  cached_conv2_0: [2, 'N', 256, 30] (float32)
+  cached_conv2_1: [2, 'N', 256, 30] (float32)
+  cached_conv2_2: [2, 'N', 256, 30] (float32)
+  cached_conv2_3: [2, 'N', 256, 30] (float32)
+  cached_conv2_4: [2, 'N', 256, 30] (float32)
+
+--- Graph Outputs ---
+  encoder_out: ['N', 'Addencoder_out_dim_1', 512] (float32)
+  new_cached_len_0: [2, 'N'] (int64)
+  new_cached_len_1: [2, 'N'] (int64)
+  new_cached_len_2: [2, 'N'] (int64)
+  new_cached_len_3: [2, 'N'] (int64)
+  new_cached_len_4: [2, 'N'] (int64)
+  new_cached_avg_0: [2, 'N', 256] (float32)
+  new_cached_avg_1: [2, 'N', 'Concatnew_cached_avg_1_dim_2'] (float32)
+  new_cached_avg_2: [2, 'N', 'Concatnew_cached_avg_2_dim_2'] (float32)
+  new_cached_avg_3: [2, 'N', 'Concatnew_cached_avg_3_dim_2'] (float32)
+  new_cached_avg_4: [2, 'N', 'Concatnew_cached_avg_4_dim_2'] (float32)
+  new_cached_key_0: [2, 'Concatnew_cached_key_0_dim_1', 'N', 'Concatnew_cached_key_0_dim_3'] (float32)
+  new_cached_key_1: [2, 'Concatnew_cached_key_1_dim_1', 'N', 'Concatnew_cached_key_1_dim_3'] (float32)
+  new_cached_key_2: [2, 'Concatnew_cached_key_2_dim_1', 'N', 'Concatnew_cached_key_2_dim_3'] (float32)
+  new_cached_key_3: [2, 'Concatnew_cached_key_3_dim_1', 'N', 'Concatnew_cached_key_3_dim_3'] (float32)
+  new_cached_key_4: [2, 'Concatnew_cached_key_4_dim_1', 'N', 'Concatnew_cached_key_4_dim_3'] (float32)
+  new_cached_val_0: [2, 'Concatnew_cached_val_0_dim_1', 'N', 'Concatnew_cached_val_0_dim_3'] (float32)
+  new_cached_val_1: [2, 'Concatnew_cached_val_1_dim_1', 'N', 'Concatnew_cached_val_1_dim_3'] (float32)
+  new_cached_val_2: [2, 'Concatnew_cached_val_2_dim_1', 'N', 'Concatnew_cached_val_2_dim_3'] (float32)
+  new_cached_val_3: [2, 'Concatnew_cached_val_3_dim_1', 'N', 'Concatnew_cached_val_3_dim_3'] (float32)
+  new_cached_val_4: [2, 'Concatnew_cached_val_4_dim_1', 'N', 'Concatnew_cached_val_4_dim_3'] (float32)
+  new_cached_val2_0: [2, 'Concatnew_cached_val2_0_dim_1', 'N', 'Concatnew_cached_val2_0_dim_3'] (float32)
+  new_cached_val2_1: [2, 'Concatnew_cached_val2_1_dim_1', 'N', 'Concatnew_cached_val2_1_dim_3'] (float32)
+  new_cached_val2_2: [2, 'Concatnew_cached_val2_2_dim_1', 'N', 'Concatnew_cached_val2_2_dim_3'] (float32)
+  new_cached_val2_3: [2, 'Concatnew_cached_val2_3_dim_1', 'N', 'Concatnew_cached_val2_3_dim_3'] (float32)
+  new_cached_val2_4: [2, 'Concatnew_cached_val2_4_dim_1', 'N', 'Concatnew_cached_val2_4_dim_3'] (float32)
+  new_cached_conv1_0: [2, 'N', 256, 'Concatnew_cached_conv1_0_dim_3'] (float32)
+  new_cached_conv1_1: [2, 'N', 256, 'Concatnew_cached_conv1_1_dim_3'] (float32)
+  new_cached_conv1_2: [2, 'N', 256, 'Concatnew_cached_conv1_2_dim_3'] (float32)
+  new_cached_conv1_3: [2, 'N', 256, 'Concatnew_cached_conv1_3_dim_3'] (float32)
+  new_cached_conv1_4: [2, 'N', 256, 'Concatnew_cached_conv1_4_dim_3'] (float32)
+  new_cached_conv2_0: [2, 'N', 256, 'Concatnew_cached_conv2_0_dim_3'] (float32)
+  new_cached_conv2_1: [2, 'N', 256, 'Concatnew_cached_conv2_1_dim_3'] (float32)
+  new_cached_conv2_2: [2, 'N', 256, 'Concatnew_cached_conv2_2_dim_3'] (float32)
+  new_cached_conv2_3: [2, 'N', 256, 'Concatnew_cached_conv2_3_dim_3'] (float32)
+  new_cached_conv2_4: [2, 'N', 256, 'Concatnew_cached_conv2_4_dim_3'] (float32)
+
+--- MatMul Weight -> Bias Mapping (92 pairs) ---
+  onnx::MatMul_4839              [2432, 256]          <-> encoder.encoder_embed.out.bias [256]
+  onnx::MatMul_4841              [256, 768]           <-> encoder.encoders.0.layers.0.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_4842              [768, 256]           <-> encoder.encoders.0.layers.0.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_4866              [256, 768]           <-> encoder.encoders.0.layers.0.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_4867              [768, 256]           <-> encoder.encoders.0.layers.0.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_4874              [256, 768]           <-> encoder.encoders.0.layers.0.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_4875              [768, 256]           <-> encoder.encoders.0.layers.0.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_4845              [256, 496]           <-> encoder.encoders.0.layers.0.self_attn.in_proj.bias [496]
+  onnx::MatMul_4865              [96, 256]            <-> encoder.encoders.0.layers.0.self_attn.out_proj.bias [256]
+  onnx::MatMul_4873              [96, 256]            <-> encoder.encoders.0.layers.0.self_attn.out_proj2.bias [256]
+  onnx::MatMul_4876              [256, 768]           <-> encoder.encoders.0.layers.1.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_4877              [768, 256]           <-> encoder.encoders.0.layers.1.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_4901              [256, 768]           <-> encoder.encoders.0.layers.1.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_4902              [768, 256]           <-> encoder.encoders.0.layers.1.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_4909              [256, 768]           <-> encoder.encoders.0.layers.1.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_4910              [768, 256]           <-> encoder.encoders.0.layers.1.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_4880              [256, 496]           <-> encoder.encoders.0.layers.1.self_attn.in_proj.bias [496]
+  onnx::MatMul_4900              [96, 256]            <-> encoder.encoders.0.layers.1.self_attn.out_proj.bias [256]
+  onnx::MatMul_4908              [96, 256]            <-> encoder.encoders.0.layers.1.self_attn.out_proj2.bias [256]
+  onnx::MatMul_4913              [256, 768]           <-> encoder.encoders.1.encoder.layers.0.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_4914              [768, 256]           <-> encoder.encoders.1.encoder.layers.0.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_4938              [256, 768]           <-> encoder.encoders.1.encoder.layers.0.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_4939              [768, 256]           <-> encoder.encoders.1.encoder.layers.0.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_4946              [256, 768]           <-> encoder.encoders.1.encoder.layers.0.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_4947              [768, 256]           <-> encoder.encoders.1.encoder.layers.0.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_4917              [256, 496]           <-> encoder.encoders.1.encoder.layers.0.self_attn.in_proj.bias [496]
+  onnx::MatMul_4937              [96, 256]            <-> encoder.encoders.1.encoder.layers.0.self_attn.out_proj.bias [256]
+  onnx::MatMul_4945              [96, 256]            <-> encoder.encoders.1.encoder.layers.0.self_attn.out_proj2.bias [256]
+  onnx::MatMul_4948              [256, 768]           <-> encoder.encoders.1.encoder.layers.1.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_4949              [768, 256]           <-> encoder.encoders.1.encoder.layers.1.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_4973              [256, 768]           <-> encoder.encoders.1.encoder.layers.1.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_4974              [768, 256]           <-> encoder.encoders.1.encoder.layers.1.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_4981              [256, 768]           <-> encoder.encoders.1.encoder.layers.1.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_4982              [768, 256]           <-> encoder.encoders.1.encoder.layers.1.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_4952              [256, 496]           <-> encoder.encoders.1.encoder.layers.1.self_attn.in_proj.bias [496]
+  onnx::MatMul_4972              [96, 256]            <-> encoder.encoders.1.encoder.layers.1.self_attn.out_proj.bias [256]
+  onnx::MatMul_4980              [96, 256]            <-> encoder.encoders.1.encoder.layers.1.self_attn.out_proj2.bias [256]
+  onnx::MatMul_4990              [256, 768]           <-> encoder.encoders.2.encoder.layers.0.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_4991              [768, 256]           <-> encoder.encoders.2.encoder.layers.0.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_5015              [256, 768]           <-> encoder.encoders.2.encoder.layers.0.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_5016              [768, 256]           <-> encoder.encoders.2.encoder.layers.0.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_5023              [256, 768]           <-> encoder.encoders.2.encoder.layers.0.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_5024              [768, 256]           <-> encoder.encoders.2.encoder.layers.0.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_4994              [256, 496]           <-> encoder.encoders.2.encoder.layers.0.self_attn.in_proj.bias [496]
+  onnx::MatMul_5014              [96, 256]            <-> encoder.encoders.2.encoder.layers.0.self_attn.out_proj.bias [256]
+  onnx::MatMul_5022              [96, 256]            <-> encoder.encoders.2.encoder.layers.0.self_attn.out_proj2.bias [256]
+  onnx::MatMul_5025              [256, 768]           <-> encoder.encoders.2.encoder.layers.1.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_5026              [768, 256]           <-> encoder.encoders.2.encoder.layers.1.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_5050              [256, 768]           <-> encoder.encoders.2.encoder.layers.1.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_5051              [768, 256]           <-> encoder.encoders.2.encoder.layers.1.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_5058              [256, 768]           <-> encoder.encoders.2.encoder.layers.1.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_5059              [768, 256]           <-> encoder.encoders.2.encoder.layers.1.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_5029              [256, 496]           <-> encoder.encoders.2.encoder.layers.1.self_attn.in_proj.bias [496]
+  onnx::MatMul_5049              [96, 256]            <-> encoder.encoders.2.encoder.layers.1.self_attn.out_proj.bias [256]
+  onnx::MatMul_5057              [96, 256]            <-> encoder.encoders.2.encoder.layers.1.self_attn.out_proj2.bias [256]
+  onnx::MatMul_5067              [256, 768]           <-> encoder.encoders.3.encoder.layers.0.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_5068              [768, 256]           <-> encoder.encoders.3.encoder.layers.0.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_5092              [256, 768]           <-> encoder.encoders.3.encoder.layers.0.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_5093              [768, 256]           <-> encoder.encoders.3.encoder.layers.0.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_5100              [256, 768]           <-> encoder.encoders.3.encoder.layers.0.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_5101              [768, 256]           <-> encoder.encoders.3.encoder.layers.0.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_5071              [256, 496]           <-> encoder.encoders.3.encoder.layers.0.self_attn.in_proj.bias [496]
+  onnx::MatMul_5091              [96, 256]            <-> encoder.encoders.3.encoder.layers.0.self_attn.out_proj.bias [256]
+  onnx::MatMul_5099              [96, 256]            <-> encoder.encoders.3.encoder.layers.0.self_attn.out_proj2.bias [256]
+  onnx::MatMul_5102              [256, 768]           <-> encoder.encoders.3.encoder.layers.1.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_5103              [768, 256]           <-> encoder.encoders.3.encoder.layers.1.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_5127              [256, 768]           <-> encoder.encoders.3.encoder.layers.1.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_5128              [768, 256]           <-> encoder.encoders.3.encoder.layers.1.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_5135              [256, 768]           <-> encoder.encoders.3.encoder.layers.1.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_5136              [768, 256]           <-> encoder.encoders.3.encoder.layers.1.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_5106              [256, 496]           <-> encoder.encoders.3.encoder.layers.1.self_attn.in_proj.bias [496]
+  onnx::MatMul_5126              [96, 256]            <-> encoder.encoders.3.encoder.layers.1.self_attn.out_proj.bias [256]
+  onnx::MatMul_5134              [96, 256]            <-> encoder.encoders.3.encoder.layers.1.self_attn.out_proj2.bias [256]
+  onnx::MatMul_5145              [256, 768]           <-> encoder.encoders.4.encoder.layers.0.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_5146              [768, 256]           <-> encoder.encoders.4.encoder.layers.0.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_5170              [256, 768]           <-> encoder.encoders.4.encoder.layers.0.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_5171              [768, 256]           <-> encoder.encoders.4.encoder.layers.0.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_5178              [256, 768]           <-> encoder.encoders.4.encoder.layers.0.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_5179              [768, 256]           <-> encoder.encoders.4.encoder.layers.0.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_5149              [256, 496]           <-> encoder.encoders.4.encoder.layers.0.self_attn.in_proj.bias [496]
+  onnx::MatMul_5169              [96, 256]            <-> encoder.encoders.4.encoder.layers.0.self_attn.out_proj.bias [256]
+  onnx::MatMul_5177              [96, 256]            <-> encoder.encoders.4.encoder.layers.0.self_attn.out_proj2.bias [256]
+  onnx::MatMul_5180              [256, 768]           <-> encoder.encoders.4.encoder.layers.1.feed_forward1.in_proj.bias [768]
+  onnx::MatMul_5181              [768, 256]           <-> encoder.encoders.4.encoder.layers.1.feed_forward1.out_proj.bias [256]
+  onnx::MatMul_5205              [256, 768]           <-> encoder.encoders.4.encoder.layers.1.feed_forward2.in_proj.bias [768]
+  onnx::MatMul_5206              [768, 256]           <-> encoder.encoders.4.encoder.layers.1.feed_forward2.out_proj.bias [256]
+  onnx::MatMul_5213              [256, 768]           <-> encoder.encoders.4.encoder.layers.1.feed_forward3.in_proj.bias [768]
+  onnx::MatMul_5214              [768, 256]           <-> encoder.encoders.4.encoder.layers.1.feed_forward3.out_proj.bias [256]
+  onnx::MatMul_5184              [256, 496]           <-> encoder.encoders.4.encoder.layers.1.self_attn.in_proj.bias [496]
+  onnx::MatMul_5204              [96, 256]            <-> encoder.encoders.4.encoder.layers.1.self_attn.out_proj.bias [256]
+  onnx::MatMul_5212              [96, 256]            <-> encoder.encoders.4.encoder.layers.1.self_attn.out_proj2.bias [256]
+  onnx::MatMul_5221              [256, 512]           <-> encoder_proj.bias [512]
+
+================================================================================
+Architecture Summary Per Encoder Layer
+================================================================================
+
+  Stack 0, Layer 0:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 0, Layer 1:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 1, Layer 0:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 1, Layer 1:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 2, Layer 0:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 2, Layer 1:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 3, Layer 0:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 3, Layer 1:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 4, Layer 0:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack 4, Layer 1:
+    feed_forward1.in_proj                   : weight [256, 768] bias [768]
+    feed_forward1.out_proj                  : weight [768, 256] bias [256]
+    feed_forward2.in_proj                   : weight [256, 768] bias [768]
+    feed_forward2.out_proj                  : weight [768, 256] bias [256]
+    feed_forward3.in_proj                   : weight [256, 768] bias [768]
+    feed_forward3.out_proj                  : weight [768, 256] bias [256]
+    self_attn.in_proj                       : weight [256, 496] bias [496]
+    self_attn.out_proj                      : weight [96, 256] bias [256]
+    self_attn.out_proj2                     : weight [96, 256] bias [256]
+
+  Stack proj, Layer 0:
+    encoder_proj                            : weight [256, 512] bias [512]
+
+================================================================================
+Detected Architecture Dimensions
+================================================================================
+  self_attn.in_proj: [256, 496]
+    hidden_dim = 256
+    in_proj output = 496 (Q+K+V+pos combined)
+  self_attn.out_proj: [96, 256]
+  self_attn.out_proj2: [96, 256]
+  feed_forward1.in_proj: weight [256, 768] bias [768]
+  feed_forward1.out_proj: weight [768, 256] bias [256]
+  feed_forward2.in_proj: weight [256, 768] bias [768]
+  feed_forward2.out_proj: weight [768, 256] bias [256]
+  feed_forward3.in_proj: weight [256, 768] bias [768]
+  feed_forward3.out_proj: weight [768, 256] bias [256]
+
+  === Summary ===
+  Number of encoder stacks: 5
+    Stack 0: 2 layers (indices [0, 1])
+    Stack 1: 2 layers (indices [0, 1])
+    Stack 2: 2 layers (indices [0, 1])
+    Stack 3: 2 layers (indices [0, 1])
+    Stack 4: 2 layers (indices [0, 1])
+  hidden_dim: 256
+  ffn_dim: 768
+  attention in_proj output: 496
+
+  --- Cached key/val shapes (num_heads per stack) ---
+    Stack 0: cached_key shape [2, 64, 'N', 192] -> num_heads=64, head_dim_k=192
+    Stack 1: cached_key shape [2, 32, 'N', 192] -> num_heads=32, head_dim_k=192
+    Stack 2: cached_key shape [2, 16, 'N', 192] -> num_heads=16, head_dim_k=192
+    Stack 3: cached_key shape [2, 8, 'N', 192] -> num_heads=8, head_dim_k=192
+    Stack 4: cached_key shape [2, 32, 'N', 192] -> num_heads=32, head_dim_k=192
+    Stack 0: cached_val shape [2, 64, 'N', 96] -> head_dim_v=96
+    Stack 1: cached_val shape [2, 32, 'N', 96] -> head_dim_v=96
+    Stack 2: cached_val shape [2, 16, 'N', 96] -> head_dim_v=96
+    Stack 3: cached_val shape [2, 8, 'N', 96] -> head_dim_v=96
+    Stack 4: cached_val shape [2, 32, 'N', 96] -> head_dim_v=96
+
+  --- Attention dimension analysis ---
+    Stack 0: in_proj_out=496, key_dim=192, val_dim=96, remaining(Q+pos)=208, left_context=64
+    Stack 1: in_proj_out=496, key_dim=192, val_dim=96, remaining(Q+pos)=208, left_context=32
+    Stack 2: in_proj_out=496, key_dim=192, val_dim=96, remaining(Q+pos)=208, left_context=16
+    Stack 3: in_proj_out=496, key_dim=192, val_dim=96, remaining(Q+pos)=208, left_context=8
+    Stack 4: in_proj_out=496, key_dim=192, val_dim=96, remaining(Q+pos)=208, left_context=32
+
+  --- Convolution Module Weights ---
+    encoder.encoders.0.layers.0.conv_module1.pointwise_conv1.weight: [512, 256, 1]
+
+  --- Embedding Conv Weights ---
+    encoder.encoder_embed.conv.0.weight: [8, 1, 3, 3]
+    encoder.encoder_embed.conv.0.bias: [8]
+    encoder.encoder_embed.conv.3.weight: [32, 8, 3, 3]
+    encoder.encoder_embed.conv.3.bias: [32]
+    encoder.encoder_embed.conv.6.weight: [128, 32, 3, 3]
+    encoder.encoder_embed.conv.6.bias: [128]
+    encoder.encoder_embed.out.bias: [256]
+
+  Total initializers: 369
+  Total parameters: 19,451,236 (74.2 MB as FP32)
+
+--- Op Type Counts ---
+  Constant: 1404
+  Unsqueeze: 471
+  Add: 301
+  Gather: 251
+  Concat: 229
+  Mul: 212
+  Shape: 185
+  MatMul: 162
+  Reshape: 124
+  Transpose: 123
+  Slice: 99
+  Sub: 93
+  Sigmoid: 73
+  Conv: 63
+  Cast: 60
+  Range: 30
+  Neg: 20
+  Split: 20
+  Softmax: 15
+  ConstantOfShape: 14

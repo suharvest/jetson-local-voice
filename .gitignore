@@ -24,3 +24,7 @@ Thumbs.db
 
 # Wheels (binary, managed separately)
 wheels/
+
+# MTE binary weights and reference data (too large for git)
+rk3576/mte/weights/
+rk3576/mte/reference/
