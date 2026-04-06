@@ -7,10 +7,18 @@
 
 namespace fs = std::filesystem;
 
+Ort::SessionOptions ORTModels::MakeCPUSessionOptions() {
+  Ort::SessionOptions opts;
+  opts.SetIntraOpNumThreads(4);
+  opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+  // CPU-only: no CUDA EP to avoid GPU memory usage
+  return opts;
+}
+
 Ort::SessionOptions ORTModels::MakeSessionOptions(int device_id) {
   Ort::SessionOptions opts;
   opts.SetIntraOpNumThreads(2);
-  opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+  opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
 
   // Append CUDA EP
   OrtCUDAProviderOptions cuda_opts;
@@ -44,7 +52,17 @@ ORTModels::ORTModels(const std::string& model_dir,
   cp_embed_ = load(sherpa_dir + "/code_predictor_embed.onnx");
   // talker_prefill: optional — load if present (used as fallback when TRT
   // engine doesn't support dynamic inputs_embeds seq_len)
-  talker_prefill_ = load(sherpa_dir + "/talker_prefill.onnx");
+  // Load talker_prefill with CPU-only to avoid GPU OOM
+  {
+    std::string pfill_path = sherpa_dir + "/talker_prefill.onnx";
+    if (fs::exists(pfill_path)) {
+      auto cpu_opts = MakeCPUSessionOptions();
+      talker_prefill_ = std::make_unique<Ort::Session>(env_, pfill_path.c_str(), cpu_opts);
+      std::cout << "  Loaded (CPU): " << pfill_path << std::endl;
+    } else {
+      std::cerr << "  Skipped (not found): " << pfill_path << std::endl;
+    }
+  }
   if (!talker_prefill_) {
     std::cout << "  talker_prefill.onnx not found — will use TRT unified prefill"
               << std::endl;

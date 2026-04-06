@@ -58,6 +58,12 @@ class TRTTalkerEngine {
                   int n_heads, int head_dim, int vocab_size, int max_seq = 200);
   ~TRTTalkerEngine();
 
+  // Load optional separate prefill engine (talker_prefill_fp16.engine).
+  // When loaded, Prefill() uses batch execution instead of iterative decode.
+  // The prefill engine takes inputs_embeds [1, T, D] and outputs
+  // logits [1, T, vocab], last_hidden [1, T, D], past_key_0..27 [1, 8, T, 128].
+  void LoadPrefillEngine(const std::string& prefill_engine_path);
+
   // One-time: copy prefill KV output to GPU buffer A
   // kv_data: flat array of all 2*n_layers KV tensors, each [1, n_heads, seq_len, head_dim]
   void SeedKV(const float* const* kv_ptrs, int n_kv, int seq_len);
@@ -93,11 +99,29 @@ class TRTTalkerEngine {
   void AllocateBuffers();
   void FreeBuffers();
 
+  // Run prefill using the dedicated prefill engine (batch, no KV inputs).
+  // Copies KV outputs directly into kv_a_ via D2D cudaMemcpy.
+  PrefillResult RunPrefillEngine(const float* inputs_embeds, int seq_len);
+
   TRTLogger logger_;
   std::unique_ptr<nvinfer1::IRuntime> runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine> engine_;
   std::unique_ptr<nvinfer1::IExecutionContext> context_;
   cudaStream_t stream_ = nullptr;
+
+  // Separate prefill engine (optional — loaded by LoadPrefillEngine)
+  TRTLogger prefill_logger_;
+  std::unique_ptr<nvinfer1::IRuntime> prefill_runtime_;
+  std::unique_ptr<nvinfer1::ICudaEngine> prefill_engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> prefill_ctx_;
+
+  // Temporary GPU buffers for prefill engine outputs (KV cache).
+  // Shape: [1, n_heads, max_seq, head_dim] per tensor, 2*n_layers total.
+  // After prefill, these are D2D-copied into kv_a_.
+  std::vector<void*> d_prefill_kv_;   // size = 2 * n_layers
+  void* d_prefill_emb_ = nullptr;     // [1, max_seq, hidden_dim]
+  void* d_prefill_logits_ = nullptr;  // [1, max_seq, vocab_size]
+  void* d_prefill_hidden_ = nullptr;  // [1, max_seq, hidden_dim]
 
   int n_layers_;
   int hidden_dim_;

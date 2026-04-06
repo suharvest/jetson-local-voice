@@ -58,6 +58,7 @@ class ORTModels {
  private:
   Ort::Env env_;
   Ort::SessionOptions MakeSessionOptions(int device_id);
+  Ort::SessionOptions MakeCPUSessionOptions();
 
   std::unique_ptr<Ort::Session> text_project_;
   std::unique_ptr<Ort::Session> codec_embed_;
