@@ -44,6 +44,28 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
   cp_ = std::make_unique<TRTCPEngine>(cp_engine_path, cfg_.hidden_dim,
                                       cfg_.cp_vocab);
 
+  // Auto-detect prefill engine: look for talker_prefill_fp16.engine in the
+  // same directory as the decode engine. Load it if found.
+  {
+    std::string engine_dir = talker_engine_path;
+    auto slash = engine_dir.rfind('/');
+    if (slash != std::string::npos) {
+      engine_dir = engine_dir.substr(0, slash);
+    } else {
+      engine_dir = ".";
+    }
+    std::string prefill_path = engine_dir + "/talker_prefill_fp16.engine";
+    std::ifstream test(prefill_path);
+    if (test.good()) {
+      test.close();
+      std::cout << "  Found prefill engine: " << prefill_path << std::endl;
+      talker_->LoadPrefillEngine(prefill_path);
+    } else {
+      std::cout << "  No prefill engine found at: " << prefill_path
+                << " — using iterative prefill fallback" << std::endl;
+    }
+  }
+
   // Try to load cp_embed table on GPU for fast lookup
   LoadCPEmbedTable(sherpa_dir);
 
@@ -325,6 +347,8 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
             pf_result.last_hidden.data() + last_pos * D, D);
   }
 
+
+
   // Decode loop
   std::vector<std::vector<int>> all_codes;
   std::vector<double> dt_times, ct_times;
@@ -372,6 +396,7 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     ct_times.push_back(
         std::chrono::duration<double, std::milli>(Clock::now() - t_cp).count());
     all_codes.push_back(frame_codes);
+    
 
     // Next talker input: codec_sum + text_embed
     std::vector<float> next_emb(D);

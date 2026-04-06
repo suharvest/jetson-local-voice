@@ -17,7 +17,7 @@ namespace fs = std::filesystem;
 Ort::SessionOptions ASRPipeline::MakeSessionOptions(int device_id) {
   Ort::SessionOptions opts;
   opts.SetIntraOpNumThreads(2);
-  opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+  opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
 
   OrtCUDAProviderOptions cuda_opts;
   cuda_opts.device_id = device_id;
@@ -48,14 +48,19 @@ ASRPipeline::ASRPipeline(const std::string& model_dir,
     std::cerr << "[ASR]   Encoder not found: " << enc_path << std::endl;
   }
 
-  // Prefill ORT session (optional — only loaded if present, for fallback)
-  for (auto& name : {"decoder_prefill.onnx", "decoder_init.onnx"}) {
-    std::string pf_path = model_dir + "/" + name;
-    if (fs::exists(pf_path)) {
-      prefill_ = std::make_unique<Ort::Session>(env_, pf_path.c_str(), opts);
-      std::cout << "[ASR]   Prefill ORT loaded (fallback): " << pf_path
-                << std::endl;
-      break;
+  // Prefill ORT session (CPU-only to reduce GPU memory pressure)
+  {
+    Ort::SessionOptions cpu_opts;
+    cpu_opts.SetIntraOpNumThreads(4);
+    cpu_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+    for (auto& name : {"decoder_prefill.onnx", "decoder_init.onnx"}) {
+      std::string pf_path = model_dir + "/" + name;
+      if (fs::exists(pf_path)) {
+        prefill_ = std::make_unique<Ort::Session>(env_, pf_path.c_str(), cpu_opts);
+        std::cout << "[ASR]   Prefill ORT loaded (CPU): " << pf_path
+                  << std::endl;
+        break;
+      }
     }
   }
   if (!prefill_) {
