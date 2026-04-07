@@ -54,13 +54,12 @@ RUN ldconfig
 
 RUN mkdir -p /opt/tts/models /opt/tts/lib /opt/asr/models
 
-# C engine: compile cp_engine (W4A16 mode for ~3x speedup)
-# Non-fatal: tts_service.py currently uses 15x RKNN calls, not the C engine.
-# Will be enabled in a future update.
+# C engine: compile cp_engine (W8A16 mode, requires .int8.bin + .scales.bin weights)
+# W8A16 uses per-column INT8 quantization via RKNN NPU matmul (~2x speedup vs FP16).
 COPY engine/ /opt/tts/engine/
 RUN cd /opt/tts/engine && \
     gcc -O2 -fPIC -Wall -Wno-unused-result -march=armv8-a+fp16 \
-    -DCP_USE_W4A16 \
+    -DCP_USE_W8A16 \
     -I/opt/tts/engine/include \
     -shared -o /opt/tts/lib/libcp_engine.so \
     cp_engine.c \

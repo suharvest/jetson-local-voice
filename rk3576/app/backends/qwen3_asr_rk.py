@@ -87,9 +87,7 @@ class Qwen3ASRRKBackend(ASRBackend):
             raise RuntimeError("ASR backend not ready")
 
         audio = self._decode_audio(audio_bytes)
-        # language=None (auto-detect) generates EOS immediately with this decoder;
-        # fall back to Chinese for now as default when auto is requested.
-        lang_hint = "Chinese" if language == "auto" else language
+        lang_hint = None if language == "auto" else language
 
         lock = get_npu_lock()
         with lock:
@@ -113,7 +111,7 @@ class Qwen3ASRRKBackend(ASRBackend):
         if not self.is_ready():
             raise RuntimeError("ASR backend not ready")
 
-        lang_hint = "Chinese" if language == "auto" else language
+        lang_hint = None if language == "auto" else language
         stream_session = self._engine.create_stream(
             language=lang_hint,
             chunk_size=4.0,
