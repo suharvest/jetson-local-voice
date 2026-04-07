@@ -15,11 +15,27 @@ from tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
 
+
+def _detect_language(text: str) -> str:
+    """Simple language detection — returns config-compatible language strings."""
+    for ch in text:
+        cp = ord(ch)
+        # CJK Unified Ideographs
+        if 0x4E00 <= cp <= 0x9FFF:
+            return "chinese"
+        # Japanese Hiragana / Katakana
+        if 0x3040 <= cp <= 0x30FF:
+            return "japanese"
+        # Korean Hangul
+        if 0xAC00 <= cp <= 0xD7AF:
+            return "korean"
+    return "english"
+
 # Paths — all under /opt/models/qwen3-tts (persistent volume)
 _BASE = os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts")
 QWEN3_SHERPA_DIR = os.environ.get("QWEN3_SHERPA_DIR", os.path.join(_BASE, "onnx"))
 QWEN3_MODEL_DIR = os.environ.get("QWEN3_MODEL_DIR", os.path.join(_BASE, "onnx"))
-QWEN3_TALKER_ENGINE = os.environ.get("QWEN3_TALKER_ENGINE", os.path.join(_BASE, "engines", "talker_decode_fp16.engine"))
+QWEN3_TALKER_ENGINE = os.environ.get("QWEN3_TALKER_ENGINE", os.path.join(_BASE, "engines", "talker_decode_bf16.engine"))
 QWEN3_CP_ENGINE = os.environ.get("QWEN3_CP_ENGINE", os.path.join(_BASE, "engines", "cp_bf16.engine"))
 QWEN3_SPEAKER_ENCODER = os.environ.get("QWEN3_SPEAKER_ENCODER", os.path.join(_BASE, "onnx", "speaker_encoder.onnx"))
 QWEN3_TOKENIZER_DIR = os.environ.get("QWEN3_TOKENIZER_DIR", os.path.join(_BASE, "tokenizer"))
@@ -108,7 +124,7 @@ class Qwen3TRTBackend(TTSBackend):
         **kwargs,
     ) -> tuple[bytes, dict]:
         if language is None:
-            language = "english"
+            language = _detect_language(text)
 
         token_ids = self._tokenize(text)
 
@@ -141,7 +157,7 @@ class Qwen3TRTBackend(TTSBackend):
         **kwargs,
     ) -> tuple[bytes, dict]:
         if language is None:
-            language = "english"
+            language = _detect_language(text)
 
         token_ids = self._tokenize(text)
 
@@ -172,7 +188,7 @@ class Qwen3TRTBackend(TTSBackend):
         subsequent chunks use 25 frames (~2s audio each).
         """
 
-        language = kwargs.get("language", "english")
+        language = kwargs.get("language") or _detect_language(text)
         first_chunk_frames = kwargs.get("first_chunk_frames", 10)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)

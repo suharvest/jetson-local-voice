@@ -146,7 +146,7 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("lang") = "english",
            py::arg("token_ids") = std::vector<int64_t>{},
            py::arg("max_frames") = 200,
-           py::arg("seed") = 42)
+           py::arg("seed") = 0)
 
       .def("synthesize_clone",
            [](TTSPipeline& self, const std::string& text,
@@ -173,7 +173,7 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("token_ids"),
            py::arg("speaker_emb_bytes"),
            py::arg("max_frames") = 200,
-           py::arg("seed") = 42)
+           py::arg("seed") = 0)
 
       .def("extract_speaker_embedding",
            [](TTSPipeline& self, py::array_t<float> mel) -> py::bytes {
@@ -229,7 +229,7 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("first_chunk_frames") = 10,
            py::arg("chunk_frames") = 25,
            py::arg("max_frames") = 200,
-           py::arg("seed") = 42)
+           py::arg("seed") = 0)
 
       .def("enable_profiling", &TTSPipeline::EnableProfiling,
            py::arg("enable") = true,
@@ -270,7 +270,7 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("first_chunk_frames") = 10,
            py::arg("chunk_frames") = 25,
            py::arg("max_frames") = 200,
-           py::arg("seed") = 42);
+           py::arg("seed") = 0);
 
   // ── ASR Pipeline (encoder + prefill + TRT decode, all in C++) ──
   py::class_<ASRPipeline>(m, "ASRPipeline")

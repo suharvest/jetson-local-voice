@@ -1,17 +1,25 @@
 cmake_minimum_required(VERSION 3.18)
-project(qwen3_tts_trt LANGUAGES CXX)
+project(qwen3_tts_trt LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- CUDA (runtime only, no nvcc needed) ---
+# --- CUDA ---
 set(CUDA_ROOT "/usr/local/cuda" CACHE PATH "CUDA root")
 set(CUDA_INCLUDE_DIR "${CUDA_ROOT}/include")
 find_library(CUDA_RUNTIME_LIB cudart HINTS "${CUDA_ROOT}/lib64" "${CUDA_ROOT}/lib")
 if(NOT CUDA_RUNTIME_LIB)
     message(FATAL_ERROR "cudart not found. Set CUDA_ROOT.")
 endif()
+find_library(CURAND_LIB curand HINTS "${CUDA_ROOT}/lib64" "${CUDA_ROOT}/lib")
+if(NOT CURAND_LIB)
+    message(FATAL_ERROR "curand not found. Set CUDA_ROOT.")
+endif()
 include_directories(${CUDA_INCLUDE_DIR})
+
+# CUDA architecture: SM 8.7 for Jetson Orin
+set(CMAKE_CUDA_ARCHITECTURES 87)
+set(CMAKE_CUDA_STANDARD 17)
 
 # --- TensorRT ---
 # On Jetson, headers are in /usr/include/aarch64-linux-gnu/
@@ -65,12 +73,14 @@ add_executable(qwen3_tts
     tts_ort_models.cpp
     tts_pipeline.cpp
     asr_pipeline.cpp
+    cp_sample_kernel.cu
 )
 
 target_link_libraries(qwen3_tts
     ${TRT_LIB}
     ${ORT_LIB}
     ${CUDA_RUNTIME_LIB}
+    ${CURAND_LIB}
     pthread
 )
 
@@ -98,11 +108,13 @@ if(pybind11_FOUND)
         tts_ort_models.cpp
         tts_pipeline.cpp
         asr_pipeline.cpp
+        cp_sample_kernel.cu
     )
     target_link_libraries(qwen3_tts_engine PRIVATE
         ${TRT_LIB}
         ${ORT_LIB}
         ${CUDA_RUNTIME_LIB}
+        ${CURAND_LIB}
     )
 else()
     message(STATUS "pybind11 not found — skipping Python module")
