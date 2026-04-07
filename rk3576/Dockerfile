@@ -1,28 +1,27 @@
-# RK3576 Qwen3-TTS Docker Container
+# RK3576 Speech Service Docker Container (TTS + ASR)
 #
 # Build on cat-remote (aarch64):
-#   docker build --network=host -t rk3576-tts -f Dockerfile .
+#   docker build --network=host -t rk3576-speech -f Dockerfile .
 #
 # Run (--network=host required because RK3576 kernel lacks iptable_raw):
 #   docker run --privileged --network=host \
 #     -v /dev:/dev \
 #     -v /home/cat/qwen3-tts-rknn:/opt/tts/models:ro \
 #     -v /home/cat/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:/opt/tts/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:ro \
-#     rk3576-tts
-#
-# Docker daemon.json must have:
-#   {"iptables": false, "registry-mirrors": ["https://docker.1ms.run"]}
-# This is needed because the RK3576 kernel 6.1.99 lacks iptable_raw module.
+#     -v /home/cat/qwen3-asr-models:/opt/asr/models:ro \
+#     -e ASR_BACKEND=qwen3_asr_rk \
+#     rk3576-speech
 
 FROM debian:12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# System deps
+# System deps (gcc for C engine compilation)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     libsndfile1 \
+    gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Python venv
@@ -32,7 +31,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Python deps (install in stages for better caching)
 RUN pip install --no-cache-dir \
     'numpy<2' \
-    soundfile
+    soundfile \
+    librosa
 
 RUN pip install --no-cache-dir \
     fastapi \
@@ -47,32 +47,36 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     rknn-toolkit-lite2
 
-# RKLLM runtime library
+# RKLLM + RKNN runtime libraries (copied from host /usr/lib/)
 COPY librkllmrt.so /usr/lib/librkllmrt.so
+COPY librknnrt.so /usr/lib/librknnrt.so
 RUN ldconfig
+
+RUN mkdir -p /opt/tts/models /opt/tts/lib /opt/asr/models
+
+# C engine: compile cp_engine (W4A16 mode for ~3x speedup)
+# Non-fatal: tts_service.py currently uses 15x RKNN calls, not the C engine.
+# Will be enabled in a future update.
+COPY engine/ /opt/tts/engine/
+RUN cd /opt/tts/engine && \
+    gcc -O2 -fPIC -Wall -Wno-unused-result -march=armv8-a+fp16 \
+    -DCP_USE_W4A16 \
+    -I/opt/tts/engine/include \
+    -shared -o /opt/tts/lib/libcp_engine.so \
+    cp_engine.c \
+    -lrknnrt -lm && \
+    ldconfig || echo "WARNING: cp_engine.so build failed (non-fatal, C engine not used yet)"
 
 # Application code
 COPY app/ /opt/tts/app/
 
-# Model directory structure:
-# /opt/tts/models/
-#   talker_fullvocab_fixed_w4a16_rk3576.rkllm
-#   text_project.rknn
-#   codec_embed.rknn
-#   code_predictor.rknn
-#   code_predictor_embed.rknn
-#   decoder_ctx25_int8.rknn
-#   codec_head_weight.npy
-#   codebook_embeds/
-#     codebook_{0..15}.npy
-#     output_proj_first_weight.npy
-#     output_proj_rest_weight.npy
-#   tokenizer/
-#     tokenizer.json, vocab.json, merges.txt, etc.
-RUN mkdir -p /opt/tts/models
-
 ENV MODEL_DIR=/opt/tts/models
+ENV TTS_BACKEND=qwen3_rknn
+ENV ASR_MODEL_DIR=/opt/asr/models
+# ASR_BACKEND is intentionally unset here — enable at runtime via env var
+# e.g. -e ASR_BACKEND=qwen3_asr_rk
+ENV LD_LIBRARY_PATH=/opt/tts/lib:/usr/lib
 WORKDIR /opt/tts/app
-EXPOSE 8000
+EXPOSE 8621
 
-CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8621"]
