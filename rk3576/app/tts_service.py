@@ -123,17 +123,21 @@ class TTSService:
         self._code_predictor = load_rknn("code_predictor")
         self._code_predictor_embed = load_rknn("code_predictor_embed")
 
-        # Vocoder: prefer tokenizer12hz_decode_stream (takes codes directly)
-        # Fallback to decoder_ctx25_int8 (takes pre-computed embeddings)
-        stream_path = os.path.join(self._model_dir, "tokenizer12hz_decode_stream.rknn")
-        if os.path.exists(stream_path):
-            self._vocoder = load_rknn("tokenizer12hz_decode_stream")
-            self._vocoder_type = "stream"  # input: [1, 75, 16] int64
-            logger.info("Using stream vocoder (direct codes input)")
-        else:
+        # Vocoder: prefer decoder_ctx25_int8 (optimized INT8, Sin→polynomial, 620ms/chunk)
+        # Fallback to tokenizer12hz_decode_stream (FP16, unoptimized, ~5.8s/chunk)
+        int8_path = os.path.join(self._model_dir, "decoder_ctx25_int8.rknn")
+        if os.path.exists(int8_path):
             self._vocoder = load_rknn("decoder_ctx25_int8")
             self._vocoder_type = "noembed"  # input: [1, 512, 50] float32
-            logger.info("Using noembed vocoder (pre-computed embeddings)")
+            logger.info("Using INT8 vocoder (decoder_ctx25_int8, ~620ms/chunk)")
+        else:
+            stream_path = os.path.join(self._model_dir, "tokenizer12hz_decode_stream.rknn")
+            if os.path.exists(stream_path):
+                self._vocoder = load_rknn("tokenizer12hz_decode_stream")
+                self._vocoder_type = "stream"  # input: [1, 75, 16] int64
+                logger.info("Using stream vocoder (FP16, slower)")
+            else:
+                raise FileNotFoundError("No vocoder model found")
 
     def _load_rkllm_talker(self):
         from rkllm_wrapper import RKLLMTalker
@@ -498,22 +502,16 @@ class TTSService:
 
         Returns: [512, T] float32 - vocoder input format
 
-        Each frame's embedding is computed as:
-            embed = sum(codebook_i[code_i] @ output_proj_i.T for i in range(16))
-        where output_proj_first is used for codebook 0 and output_proj_rest for 1-15.
+        Vectorized: batch lookup + single matmul per codebook instead of per-frame loop.
         """
         T = codes.shape[0]
         embeddings = np.zeros((T, 512), dtype=np.float32)
 
-        for t in range(T):
-            for cb_idx in range(NUM_CODE_GROUPS):
-                code = int(codes[t, cb_idx])
-                cb_embed = self._codebook_embeds[cb_idx][code]  # [256]
-                if cb_idx == 0:
-                    proj = cb_embed @ self._output_proj_first.T  # [256] @ [256, 512] -> [512]
-                else:
-                    proj = cb_embed @ self._output_proj_rest.T  # [256] @ [256, 512] -> [512]
-                embeddings[t] += proj
+        for cb_idx in range(NUM_CODE_GROUPS):
+            cb_codes = codes[:, cb_idx].astype(np.intp)  # [T]
+            cb_embeds = self._codebook_embeds[cb_idx][cb_codes]  # [T, 256]
+            proj = self._output_proj_first if cb_idx == 0 else self._output_proj_rest
+            embeddings += cb_embeds @ proj.T  # [T, 256] @ [256, 512] -> [T, 512]
 
         return embeddings.T  # [512, T]
 
