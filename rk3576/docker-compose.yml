@@ -1,17 +1,22 @@
 services:
-  tts:
+  speech:
     build:
       context: .
       dockerfile: Dockerfile
       network: host
-    image: rk3576-tts:latest
-    container_name: rk3576-tts
+    image: rk3576-speech:latest
+    container_name: rk3576-speech
     privileged: true
     network_mode: host
     volumes:
       - /dev:/dev
       - /home/cat/qwen3-tts-rknn:/opt/tts/models:ro
       - /home/cat/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:/opt/tts/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:ro
+      - /home/cat/cp_weights:/opt/tts/models/cp_weights:ro
+      - /home/cat/qwen3-asr-models:/opt/asr/models:ro
     restart: unless-stopped
     environment:
       - MODEL_DIR=/opt/tts/models
+      - TTS_BACKEND=qwen3_rknn
+      - ASR_BACKEND=qwen3_asr_rk
+      - ASR_MODEL_DIR=/opt/asr/models

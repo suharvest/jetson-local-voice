@@ -70,6 +70,7 @@ class TTSService:
         self._vocoder = None
         self._codec_head_weight = None
         self._codebook_embeds = None
+        self._cp_engine = None  # C engine for code_predictor (optional)
 
     def load(self):
         """Load all models. Call once at startup."""
@@ -79,6 +80,7 @@ class TTSService:
         self._load_rknn_models()
         self._load_rkllm_talker()
         self._load_numpy_weights()
+        self._load_cp_engine()
 
         elapsed = time.perf_counter() - t0
         logger.info("All models loaded in %.1fs", elapsed)
@@ -164,6 +166,32 @@ class TTSService:
         # output_proj weights for code_predictor logit computation
         self._output_proj_first = np.load(os.path.join(cb_dir, "output_proj_first_weight.npy")).astype(np.float32)
         self._output_proj_rest = np.load(os.path.join(cb_dir, "output_proj_rest_weight.npy")).astype(np.float32)
+
+    def _load_cp_engine(self):
+        """Try to load C engine for code_predictor (faster than 15x RKNN calls)."""
+        try:
+            import sys
+            engine_dir = os.path.join(os.path.dirname(__file__), "..", "engine")
+            lib_path = os.path.join(os.path.dirname(__file__), "..", "lib", "libcp_engine.so")
+            if not os.path.exists(lib_path):
+                lib_path = os.path.join(engine_dir, "libcp_engine.so")
+            if not os.path.exists(lib_path):
+                logger.info("C engine not found, using RKNN code_predictor fallback")
+                return
+
+            sys.path.insert(0, engine_dir)
+            from cp_engine_wrapper import CodePredictorEngine
+
+            weight_dir = os.path.join(self._model_dir, "cp_weights")
+            if not os.path.isdir(weight_dir):
+                logger.info("cp_weights dir not found at %s, skipping C engine", weight_dir)
+                return
+
+            self._cp_engine = CodePredictorEngine(weight_dir, num_npu_cores=2, lib_path=lib_path)
+            logger.info("C engine loaded (W8A16 matmul API)")
+        except Exception as e:
+            logger.warning("C engine load failed, using RKNN fallback: %s", e)
+            self._cp_engine = None
 
     # ── RKNN Helpers ─────────────────────────────────────────────
 
@@ -301,29 +329,32 @@ class TTSService:
             primary_embed = self._run_codec_embed([primary_code])  # [1, 1024]
 
             # 5c: Residual codes via code_predictor
-            # The RKNN code_predictor has static shape [1, 2, 1024].
-            # For each residual step, pass [last_hidden, latest_embed].
             frame_codes = [primary_code]
-            codec_sum = primary_embed[0].copy()  # [1024]
-            latest_embed = primary_embed[0]  # [1024]
 
-            for j in range(NUM_CODE_GROUPS - 1):
-                # Build 2-token input: [last_hidden, latest_embed]
-                cp_input = np.stack([last_hidden[0], latest_embed])[np.newaxis, :, :]  # [1, 2, 1024]
-                cp_logits = self._run_code_predictor(cp_input)
-                # Output is [1, 1, 2048]
-                cp_logits_last = cp_logits[0, 0]
+            if self._cp_engine is not None:
+                # Fast path: C engine does all 15 steps in one call
+                codes, codec_sum = self._cp_engine.run(last_hidden[0], primary_embed[0])
+                frame_codes.extend(int(c) for c in codes)
+                # codec_sum from C engine already includes primary_embed
+            else:
+                # Fallback: 15 RKNN calls
+                codec_sum = primary_embed[0].copy()  # [1024]
+                latest_embed = primary_embed[0]  # [1024]
 
-                res_code = self._sample_top_k(
-                    cp_logits_last[:CODE_PREDICTOR_VOCAB_SIZE],
-                    top_k=1, temperature=0.0  # greedy for residual codes
-                )
-                frame_codes.append(res_code)
+                for j in range(NUM_CODE_GROUPS - 1):
+                    cp_input = np.stack([last_hidden[0], latest_embed])[np.newaxis, :, :]
+                    cp_logits = self._run_code_predictor(cp_input)
+                    cp_logits_last = cp_logits[0, 0]
 
-                # Get residual embedding for next iteration
-                res_embed = self._run_code_predictor_embed(res_code, j)  # [1024]
-                latest_embed = res_embed
-                codec_sum += res_embed
+                    res_code = self._sample_top_k(
+                        cp_logits_last[:CODE_PREDICTOR_VOCAB_SIZE],
+                        top_k=1, temperature=0.0
+                    )
+                    frame_codes.append(res_code)
+
+                    res_embed = self._run_code_predictor_embed(res_code, j)
+                    latest_embed = res_embed
+                    codec_sum += res_embed
 
             all_codes.append(frame_codes)
 
