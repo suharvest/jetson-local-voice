@@ -84,10 +84,7 @@ class TRTTalkerEngine {
                   float* logits,               // [1, 1, vocab_size]
                   float* last_hidden);         // [1, 1, hidden_dim]
 
-  void Reset() {
-    seq_len_ = 0;
-    parity_ = 0;
-  }
+  void Reset();
 
   // Profiling control
   void EnableProfiling(bool enable) { profiling_ = enable; }
@@ -108,6 +105,15 @@ class TRTTalkerEngine {
   std::unique_ptr<nvinfer1::ICudaEngine> engine_;
   std::unique_ptr<nvinfer1::IExecutionContext> context_;
   cudaStream_t stream_ = nullptr;
+
+  // Dual-profile contexts: created when engine has 2 optimization profiles.
+  // ctx_prefill_: Profile 0 — seq_len dynamic, past_len=0 (batch prefill)
+  // ctx_decode_:  Profile 1 — seq_len=1, past_len dynamic (autoregressive)
+  // When present, Prefill() batch path uses ctx_prefill_, DecodeStep() uses ctx_decode_.
+  // Single-profile engines continue to use context_ for both.
+  std::unique_ptr<nvinfer1::IExecutionContext> ctx_prefill_;  // Profile 0
+  std::unique_ptr<nvinfer1::IExecutionContext> ctx_decode_;   // Profile 1
+  bool has_dual_profiles_ = false;
 
   // Separate prefill engine (optional — loaded by LoadPrefillEngine)
   TRTLogger prefill_logger_;
@@ -134,7 +140,13 @@ class TRTTalkerEngine {
   // Index: past_key_i = 2*i, past_value_i = 2*i+1
   std::vector<void*> kv_a_;
   std::vector<void*> kv_b_;
-  size_t kv_elem_bytes_ = 0;  // per-element byte size (FP16=2, FP32=4)
+  size_t kv_elem_bytes_ = 0;      // per-element byte size (FP16=2, BF16=2, FP32=4)
+  bool kv_is_bf16_ = false;       // true if KV cache uses BF16 (vs FP16)
+  size_t logits_elem_bytes_ = 4;  // logits output element size (BF16=2, FP32=4)
+  size_t hidden_elem_bytes_ = 4;  // last_hidden output element size
+  bool has_last_hidden_ = false;  // whether engine has last_hidden output
+  bool logits_is_bf16_ = false;   // true if logits output is BF16 (vs FP16)
+  bool hidden_is_bf16_ = false;   // true if last_hidden output is BF16
 
   // Small fixed I/O buffers
   void* d_emb_ = nullptr;
@@ -147,7 +159,8 @@ class TRTTalkerEngine {
   // Pre-cached tensor names to avoid snprintf per step
   std::vector<std::string> kv_names_;       // "past_key_0", "past_value_0", ...
   std::vector<std::string> new_kv_names_;   // "new_past_key_0", ...
-  bool first_step_ = true;
+  bool first_step_ = true;          // first call to Prefill() batch path or DecodeStep()
+  bool decode_first_step_ = true;   // first call to DecodeStep() (for dual-profile init)
   bool has_position_ids_ = false;
   void* d_position_id_ = nullptr;
 
@@ -229,4 +242,206 @@ class TRTCPEngine {
   cudaEvent_t ev_h2d_done_ = nullptr;
   cudaEvent_t ev_kernel_done_ = nullptr;
   cudaEvent_t ev_d2h_done_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// TRT Code Predictor Engine with KV Cache — BF16 unified ONNX
+// Inputs: inputs_embeds [1,seq_len,1024], cache_position [seq_len],
+//         past_key_i/past_value_i [1,8,past_len,128] (i=0..4)
+// Outputs: logits_all [15,2048], new_past_key_i/new_past_value_i [1,8,new_len,128]
+// ---------------------------------------------------------------------------
+class TRTCPKVEngine {
+ public:
+  // engine_path: path to cp_unified_bf16.engine
+  // n_cp_layers: number of CP transformer layers (5 for cp_unified)
+  // hidden_dim: embedding dimension (1024)
+  // n_heads: number of KV heads (8)
+  // head_dim: attention head dimension (128)
+  // cp_vocab: code vocabulary size per layer (2048)
+  // cp_out_groups: number of output groups (15 = num_code_groups - 1)
+  // max_past: max KV cache length (default 20 = max CP steps)
+  TRTCPKVEngine(const std::string& engine_path, int n_cp_layers = 5,
+                int hidden_dim = 1024, int n_heads = 8, int head_dim = 128,
+                int cp_vocab = 2048, int cp_out_groups = 15, int max_past = 20);
+  ~TRTCPKVEngine();
+
+  // Run CP for one codec frame (autoregressive):
+  //   Step 0: prefill [hidden, primary_emb] (seq_len=2) → logits[0] → sample code[0]
+  //   Step 1-14: decode [embed(code[j-1])] (seq_len=1) → logits[j] → sample code[j]
+  // codes_out: [cp_out_groups] int — sampled codes for each group
+  // embed_table: CPU pointer to cp_embed table [n_layers][vocab][D]
+  void RunFrameAutoregressive(const float* hidden, const float* primary_emb,
+                              int* codes_out,
+                              const float* embed_table, int embed_vocab);
+
+  // GPU-resident autoregressive CP: all 15 steps run async on GPU.
+  // Only 1 H2D at start + 1 D2H sync at the end to read 15 sampled codes.
+  // Requires embed table loaded on GPU via LoadEmbedTable().
+  void RunFrameGPU(const float* hidden, const float* primary_emb,
+                   int* codes_out);
+
+  // Legacy parallel RunFrame (kept for reference, not recommended)
+  void RunFrame(const float* hidden, const float* primary_emb,
+                float* logits_out);
+
+  // GPU embedding table — same API as TRTCPEngine (not used in RunFrame,
+  // but kept for potential future streaming use)
+  void LoadEmbedTable(const float* table, int n_layers, int vocab, int dim);
+  bool has_embed_table() const { return d_embed_table_ != nullptr; }
+
+  // Profiling
+  void EnableProfiling(bool enable) { profiling_ = enable; }
+  bool profiling() const { return profiling_; }
+  const ProfilingStats& stats() const { return stats_; }
+  void ResetStats() { stats_.Reset(); }
+
+ private:
+  TRTLogger logger_;
+  std::unique_ptr<nvinfer1::IRuntime> runtime_;
+  std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> context_;
+  cudaStream_t stream_ = nullptr;
+
+  int n_cp_layers_;   // 5
+  int hidden_dim_;    // 1024
+  int n_heads_;       // 8
+  int head_dim_;      // 128
+  int cp_vocab_;      // 2048
+  int cp_out_groups_; // 15
+
+  // Embedding input: [1, 2, D] (seq_len=2 for frame prefill)
+  void* d_embeds_ = nullptr;
+  void* d_cache_pos_ = nullptr;  // [2] int64 = {0, 1}
+
+  // Small dummy buffer for zero-size past KV inputs (TRT needs non-null ptr)
+  void* d_kv_dummy_ = nullptr;  // 16 bytes — just needs to be a valid GPU address
+
+  // KV double-buffer for autoregressive decode:
+  // d_kv_a_ and d_kv_b_ are ping-pong buffers
+  // Each: 2 * n_cp_layers tensors of [1, n_heads, max_past, head_dim]
+  std::vector<void*> d_kv_a_;   // read buffer (past KV input)
+  std::vector<void*> d_kv_b_;   // write buffer (new KV output)
+  int max_past_ = 20;
+
+  // Legacy: KV output buffers (used by parallel RunFrame)
+  std::vector<void*> d_kv_out_;  // 2 * n_cp_layers output KV tensors
+
+  size_t kv_elem_bytes_ = 2;  // BF16
+
+  // Output: logits_all [cp_out_groups, cp_vocab]
+  void* d_logits_all_ = nullptr;
+  size_t logits_elem_bytes_ = 4;
+  bool logits_is_bf16_ = false;
+
+  // Embedding table on GPU (optional, not used by RunFrame)
+  void* d_embed_table_ = nullptr;
+  int embed_n_layers_ = 0;
+  int embed_vocab_ = 0;
+  int embed_dim_ = 0;
+
+  // GPU-resident autoregressive members (RunFrameGPU)
+  int* d_codes_out_ = nullptr;             // [cp_out_groups] int on GPU
+  int64_t* d_cache_pos_table_ = nullptr;   // [max_past] int64 pre-filled {0,1,2,...}
+  int64_t* d_cache_pos_single_ = nullptr;  // [1] int64 written by kernel
+  unsigned long long rng_counter_ = 0;     // monotonic counter for cuRAND sequence
+
+  // Profiling
+  bool profiling_ = false;
+  ProfilingStats stats_;
+  cudaEvent_t ev_start_ = nullptr;
+  cudaEvent_t ev_kernel_done_ = nullptr;
+  cudaEvent_t ev_d2h_done_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// TRT Vocoder Engine — FP16 engine for audio_codes -> audio_values
+// ---------------------------------------------------------------------------
+class TRTVocoderEngine {
+ public:
+  // engine_path: path to vocoder_fp16.engine
+  // max_frames: maximum T dimension (audio_codes [1, T, 16])
+  // max_samples: maximum output samples (default 192000)
+  TRTVocoderEngine(const std::string& engine_path, int max_frames = 100,
+                   int max_samples = 192000);
+  ~TRTVocoderEngine();
+
+  // Run vocoder: codes [1, T, 16] int64 → audio [valid_samples] float32
+  // Returns only the valid samples (trimmed using lengths output).
+  std::vector<float> Run(const int64_t* codes, int n_frames, int n_groups);
+
+ private:
+  TRTLogger logger_;
+  std::unique_ptr<nvinfer1::IRuntime> runtime_;
+  std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> context_;
+  cudaStream_t stream_ = nullptr;
+
+  int max_frames_;
+  int max_samples_;
+
+  void* d_codes_ = nullptr;        // [1, max_frames, 16] int64
+  void* d_audio_values_ = nullptr; // [max_samples] float32
+  void* d_lengths_ = nullptr;      // [1] int64
+
+  // Detect output names (may vary)
+  std::string audio_values_name_;
+  std::string lengths_name_;
+
+  cudaEvent_t ev_done_ = nullptr;
+};
+
+class TRTASRPrefillEngine {
+ public:
+  // engine_path: path to asr_prefill_bf16.engine
+  // max_seq: max(seq_len, audio_len) for buffer allocation
+  TRTASRPrefillEngine(const std::string& engine_path, int n_layers,
+                      int hidden_dim, int n_heads, int head_dim,
+                      int vocab_size, int max_seq = 500);
+  ~TRTASRPrefillEngine();
+
+  // Run prefill.
+  // Returns logits [seq_len, vocab_size] FP32 on CPU.
+  // KV outputs are stored internally in d_kv_ GPU buffers.
+  struct PrefillOutput {
+    std::vector<float> logits;  // [seq_len * vocab_size] FP32
+    int seq_len;
+  };
+  PrefillOutput Run(const std::vector<int64_t>& input_ids,
+                    const std::vector<int64_t>& position_ids,
+                    const float* audio_features, int audio_len,
+                    int64_t audio_offset);
+
+  // Seed a TRTTalkerEngine's KV cache with the last Run() results.
+  // Handles BF16->FP32 conversion and calls decoder->SeedKV().
+  void SeedDecoder(TRTTalkerEngine* decoder, int seq_len);
+
+  bool loaded() const { return engine_ != nullptr; }
+
+ private:
+  TRTLogger logger_;
+  std::unique_ptr<nvinfer1::IRuntime> runtime_;
+  std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> ctx_;
+  cudaStream_t stream_ = nullptr;
+
+  int n_layers_;
+  int hidden_dim_;
+  int n_heads_;
+  int head_dim_;
+  int vocab_size_;
+  int max_seq_;
+
+  // GPU input buffers
+  void* d_input_ids_ = nullptr;       // [max_seq] int64
+  void* d_position_ids_ = nullptr;    // [max_seq] int64
+  void* d_audio_features_ = nullptr;  // [max_seq * hidden_dim] fp32
+  void* d_audio_offset_ = nullptr;    // [1] int64
+
+  // GPU output buffers
+  void* d_logits_ = nullptr;      // [max_seq * vocab_size] (BF16 or FP32)
+  std::vector<void*> d_kv_;       // 2 * n_layers KV tensors on GPU
+
+  size_t kv_elem_bytes_ = 2;      // BF16 = 2 bytes
+
+  cudaEvent_t ev_done_ = nullptr;
 };

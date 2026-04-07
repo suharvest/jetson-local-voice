@@ -54,15 +54,54 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     } else {
       engine_dir = ".";
     }
-    std::string prefill_path = engine_dir + "/talker_prefill_fp16.engine";
-    std::ifstream test(prefill_path);
-    if (test.good()) {
-      test.close();
-      std::cout << "  Found prefill engine: " << prefill_path << std::endl;
-      talker_->LoadPrefillEngine(prefill_path);
+    // Prefer BF16 (no SIGSEGV), fall back to FP16, then iterative
+    std::vector<std::string> prefill_candidates = {
+        engine_dir + "/talker_prefill_bf16.engine",
+        engine_dir + "/talker_prefill_fp16.engine",
+    };
+    bool prefill_loaded = false;
+    for (const auto& prefill_path : prefill_candidates) {
+      std::ifstream test(prefill_path);
+      if (test.good()) {
+        test.close();
+        std::cout << "  Found prefill engine: " << prefill_path << std::endl;
+        talker_->LoadPrefillEngine(prefill_path);
+        prefill_loaded = true;
+        break;
+      }
+    }
+    if (!prefill_loaded) {
+      std::cout << "  No prefill engine found — using iterative prefill fallback" << std::endl;
+    }
+
+    // Try to load CP KV cache engine (cp_unified_bf16.engine)
+    std::string cp_kv_path = engine_dir + "/cp_unified_bf16.engine";
+    std::ifstream cp_kv_test(cp_kv_path);
+    if (cp_kv_test.good()) {
+      cp_kv_test.close();
+      std::cout << "  Found CP KV engine: " << cp_kv_path << std::endl;
+      cp_kv_ = std::make_unique<TRTCPKVEngine>(
+          cp_kv_path,
+          5,                      // n_cp_layers
+          cfg_.hidden_dim,        // 1024
+          cfg_.n_heads,           // 8
+          cfg_.head_dim,          // 128
+          cfg_.cp_vocab,          // 2048
+          cfg_.num_code_groups - 1  // 15 output groups
+      );
     } else {
-      std::cout << "  No prefill engine found at: " << prefill_path
-                << " — using iterative prefill fallback" << std::endl;
+      std::cout << "  No CP KV engine — using old context-copy CP" << std::endl;
+    }
+
+    // Try to load vocoder TRT engine
+    std::string voc_engine_path = engine_dir + "/vocoder_fp16.engine";
+    std::ifstream voc_test(voc_engine_path);
+    if (voc_test.good()) {
+      voc_test.close();
+      std::cout << "  Found vocoder TRT engine: " << voc_engine_path << std::endl;
+      trt_vocoder_ = std::make_unique<TRTVocoderEngine>(voc_engine_path, 200, 24000 * 20);
+    } else {
+      std::cout << "  No vocoder TRT engine found — using ORT fallback" << std::endl;
     }
   }
 
@@ -134,29 +173,69 @@ std::vector<int64_t> TTSPipeline::Tokenize(const std::string& text) {
 // ---------------------------------------------------------------------------
 int TTSPipeline::Sample(const float* logits, int vocab_size, int k, float temp,
                         bool suppress_eos, int eos_id) {
+  // Sample() is used for CP (code predictor) — no suppress, no penalty, no bias
+  return SampleWithPenalty(logits, vocab_size, nullptr, 0, k, temp,
+                           suppress_eos, eos_id, 0.0f, /*suppress_range=*/false);
+}
+
+int TTSPipeline::SampleWithPenalty(const float* logits, int vocab_size,
+                                    const int* prev_tokens, int n_prev,
+                                    int k, float temp,
+                                    bool suppress_eos, int eos_id,
+                                    float eos_bias,
+                                    bool suppress_range) {
   std::vector<double> l(vocab_size);
   for (int i = 0; i < vocab_size; ++i) l[i] = logits[i];
 
-  if (suppress_eos && eos_id >= 0 && eos_id < vocab_size) {
-    l[eos_id] = -1e9;
+  // 1. Repetition penalty (before temperature) — official: 1.05
+  //    Penalizes all previously generated tokens in the sequence.
+  //    Positive logits: divide by penalty. Negative: multiply by penalty.
+  if (prev_tokens && n_prev > 0) {
+    const double rep_penalty = 1.05;
+    for (int t = 0; t < n_prev; ++t) {
+      int tok = prev_tokens[t];
+      if (tok >= 0 && tok < vocab_size) {
+        if (l[tok] < 0.0) l[tok] *= rep_penalty;
+        else               l[tok] /= rep_penalty;
+      }
+    }
   }
 
-  // Temperature
+  // 2. Suppress EOS for first 2 steps
+  if (suppress_eos && eos_id >= 0 && eos_id < vocab_size) {
+    l[eos_id] = -1e30;
+  }
+
+  // 3. Suppress non-codec tokens: [vocab_size-1024, vocab_size) except EOS
+  //    Only for talker (primary codec), NOT for code predictor (residual codecs)
+  if (suppress_range) {
+    int suppress_start = vocab_size - 1024;
+    for (int i = suppress_start; i < vocab_size; ++i) {
+      if (i != eos_id) l[i] = -1e30;
+    }
+  }
+
+  // 4. EOS bias: boost EOS logit to compensate systematic gap
+  if (eos_bias != 0.0f && !suppress_eos && eos_id >= 0 && eos_id < vocab_size) {
+    l[eos_id] += eos_bias;
+  }
+
+  // 5. Temperature
   if (temp > 1e-6) {
     for (auto& v : l) v /= temp;
   }
 
-  // Top-k
+  // 6. Top-k
   if (k > 0 && k < vocab_size) {
     std::vector<double> sorted(l);
     std::nth_element(sorted.begin(), sorted.end() - k, sorted.end());
     double threshold = sorted[sorted.size() - k];
     for (auto& v : l) {
-      if (v < threshold) v = -1e9;
+      if (v < threshold) v = -1e30;
     }
   }
 
-  // Softmax
+  // 7. Softmax
   double max_val = *std::max_element(l.begin(), l.end());
   double sum = 0;
   for (auto& v : l) {
@@ -165,10 +244,31 @@ int TTSPipeline::Sample(const float* logits, int vocab_size, int k, float temp,
   }
   for (auto& v : l) v /= sum;
 
-  // Sample
-  static std::mt19937 rng;
+  // 8. Sample — rng_ is a member, seeded per-request in GenerateInternal
   std::discrete_distribution<int> dist(l.begin(), l.end());
-  return dist(rng);
+  return dist(rng_);
+}
+
+bool TTSPipeline::DetectRepetition(const std::vector<int>& history,
+                                    int min_repeat) {
+  int n = (int)history.size();
+  if (n < min_repeat) return false;
+  // Check single-token repeat: last min_repeat tokens are identical
+  int last = history[n - 1];
+  int count = 0;
+  for (int i = n - 1; i >= 0 && history[i] == last; --i) ++count;
+  if (count >= min_repeat) return true;
+  // Check 2-token pattern repeat: AB AB AB ...
+  if (n >= min_repeat * 2) {
+    int a = history[n - 2], b = history[n - 1];
+    int pairs = 0;
+    for (int i = n - 2; i >= 1; i -= 2) {
+      if (history[i - 1] == a && history[i] == b) ++pairs;
+      else break;
+    }
+    if (pairs >= min_repeat) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +374,7 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
   pf.embeds = std::move(prefill);
   pf.seq_len = pos;
 
-  // Trailing text: body[1:] + codec_pad, then tts_eos + codec_pad
+  // Trailing text: body[1:], then tts_eos (NO codec_pad — matches official)
   int n_text = body_emb.empty() ? 0 : (int)(body_emb.size() / D);
   int n_trailing = (n_text > 1 ? n_text - 1 : 0) + 1;  // body[1:] + eos
   pf.trailing_text.resize(n_trailing * D);
@@ -282,10 +382,10 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
 
   int t = 0;
   for (int i = 1; i < n_text; ++i, ++t) {
-    VecAdd(pf.trailing_text.data() + t * D, body_emb.data() + i * D, codec_pad_e, D);
+    VecCopy(pf.trailing_text.data() + t * D, body_emb.data() + i * D, D);
   }
-  // Last: tts_eos + codec_pad
-  VecAdd(pf.trailing_text.data() + t * D, tts_eos_e, codec_pad_e, D);
+  // Last: tts_eos only (no codec_pad)
+  VecCopy(pf.trailing_text.data() + t * D, tts_eos_e, D);
 
   return pf;
 }
@@ -301,10 +401,12 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
   using Clock = std::chrono::high_resolution_clock;
   SynthResult result;
 
-  // Seed RNG
-  // (Sample uses a static mt19937 — seed it here)
-  // For reproducibility:
-  srand(seed);
+  // Seed RNG: 0 = random (time-based), >0 = fixed seed
+  if (seed == 0) {
+    rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  } else {
+    rng_.seed(seed);
+  }
 
   int D = cfg_.hidden_dim;
 
@@ -339,58 +441,117 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
     result.prefill_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    int last_pos = pf.seq_len - 1;
+    // last_pos: engine may output last token only (logits.size()==vocab_size) or all tokens
+    int last_pos = (int)pf_result.logits.size() / cfg_.vocab_size - 1;
     VecCopy(logits.data(),
             pf_result.logits.data() + last_pos * cfg_.vocab_size,
             cfg_.vocab_size);
+    // last_hidden is always full sequence
     VecCopy(last_hidden.data(),
-            pf_result.last_hidden.data() + last_pos * D, D);
+            pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
   }
 
 
 
   // Decode loop
   std::vector<std::vector<int>> all_codes;
+  std::vector<int> primary_history;  // for repetition penalty
   std::vector<double> dt_times, ct_times;
 
-  for (int step = 0; step < max_frames; ++step) {
-    // Sample primary code
-    int primary_code = Sample(logits.data(), cfg_.vocab_size, 50, 0.9f,
-                              step < 2, cfg_.codec_eos_token_id);
+  // EOS bias: progressive boost, delayed until expected audio length
+  // Each text token ≈ 3-4 frames at 12.5Hz. Start biasing after 3x trailing.
+  const float kEosBiasBase = 5.0f;
+  const float kEosBiasRate = 0.5f;   // per step after bias onset
+  const float kEosBiasMax = 25.0f;
+  int bias_onset = pf.n_trailing * 3;  // delay: let model generate audio first
+  // Hard cap: max 10 frames per text token
+  int text_based_max = std::max(50, pf.n_trailing * 10);
+  int effective_max = std::min(max_frames, text_based_max);
+  std::cerr << "  EOS params: n_trailing=" << pf.n_trailing
+            << " bias_onset=" << bias_onset
+            << " effective_max=" << effective_max << std::endl;
+
+  for (int step = 0; step < effective_max; ++step) {
+    // Compute progressive EOS bias (delayed start)
+    float eos_bias = 0.0f;
+    int steps_past_onset = step - bias_onset;
+    if (steps_past_onset >= 0) {
+      eos_bias = std::min(kEosBiasMax,
+                          kEosBiasBase + steps_past_onset * kEosBiasRate);
+    }
+
+    // Sample primary code with repetition penalty + EOS bias
+    int primary_code = SampleWithPenalty(
+        logits.data(), cfg_.vocab_size,
+        primary_history.data(), (int)primary_history.size(),
+        50, 0.9f, step < 2, cfg_.codec_eos_token_id, eos_bias);
     if (primary_code == cfg_.codec_eos_token_id) {
-      std::cout << "  EOS at step " << step << std::endl;
+      std::cout << "  EOS at step " << step << " (bias=" << eos_bias << ")" << std::endl;
       break;
+    }
+
+    // Repetition detection: force EOS if looping
+    primary_history.push_back(primary_code);
+    if (DetectRepetition(primary_history, 5)) {
+      std::cout << "  Force EOS at step " << step << " (repetition detected)" << std::endl;
+      break;
+    }
+
+    // Debug: print EOS logit and sampled token every 20 steps
+    if (step % 20 == 0 || step < 3) {
+      float eos_logit = logits[cfg_.codec_eos_token_id];
+      float max_logit = *std::max_element(logits.data(), logits.data() + cfg_.vocab_size);
+      int argmax = (int)(std::max_element(logits.data(), logits.data() + cfg_.vocab_size) - logits.data());
+      std::cerr << "  [step " << step << "] sampled=" << primary_code
+                << " eos_logit=" << eos_logit << " max_logit=" << max_logit
+                << " argmax=" << argmax << " eos_bias=" << eos_bias << std::endl;
     }
 
     // Code predictor: 15 residual codes (GPU-resident context)
     auto t_cp = Clock::now();
     auto primary_e = ort_->CodecEmbed({(int64_t)primary_code});
 
-    // Initialize GPU context with [hidden, primary_emb]
-    cp_->BeginFrame(last_hidden.data(), primary_e.data());
-
     std::vector<float> codec_sum(D);
     VecCopy(codec_sum.data(), primary_e.data(), D);
 
     std::vector<int> frame_codes = {primary_code};
 
-    for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
-      std::vector<float> cp_logits(cfg_.cp_vocab);
-      cp_->PredictGPU(j, cp_logits.data());
+    if (cp_kv_) {
+      // --- Autoregressive CP (CPU sampling, 15 TRT decode steps) ---
+      // NOTE: RunFrameGPU exists but has ~124ms overhead from TRT shape-change sync.
+      // CPU autoregressive is ~50ms. GPU path needs CUDA graph optimization.
+      int n_groups = cfg_.num_code_groups - 1;
+      std::vector<int> cp_codes(n_groups);
+      cp_kv_->RunFrameAutoregressive(
+          last_hidden.data(), primary_e.data(), cp_codes.data(),
+          cp_embed_table_.data(), cp_embed_vocab_);
 
-      int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
-      frame_codes.push_back(rc);
-
-      if (cp_->has_embed_table()) {
-        // GPU→GPU: append embedding from pre-loaded table (no ORT call!)
-        cp_->AppendEmbeddingFromTable(j, rc);
-        // CPU table lookup for codec_sum (zero-cost pointer arithmetic)
+      for (int j = 0; j < n_groups; ++j) {
+        int rc = cp_codes[j];
+        frame_codes.push_back(rc);
         const float* re = CPEmbedLookup(j, rc);
         VecAdd(codec_sum.data(), codec_sum.data(), re, D);
-      } else {
-        auto re = ort_->CPEmbed(rc, j);
-        cp_->AppendEmbedding(re.data());
-        VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
+      }
+    } else {
+      // --- Old context-copy CP engine path ---
+      cp_->BeginFrame(last_hidden.data(), primary_e.data());
+
+      for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
+        std::vector<float> cp_logits(cfg_.cp_vocab);
+        cp_->PredictGPU(j, cp_logits.data());
+
+        int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
+        frame_codes.push_back(rc);
+
+        if (cp_->has_embed_table()) {
+          cp_->AppendEmbeddingFromTable(j, rc);
+          const float* re = CPEmbedLookup(j, rc);
+          VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+        } else {
+          auto re = ort_->CPEmbed(rc, j);
+          cp_->AppendEmbedding(re.data());
+          VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
+        }
       }
     }
     ct_times.push_back(
@@ -398,16 +559,14 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     all_codes.push_back(frame_codes);
     
 
-    // Next talker input: codec_sum + text_embed
+    // Next talker input: codec_sum + trailing_text (or tts_pad after text)
+    // Official: inputs_embeds = codec_sum + trailing_text[step] or + tts_pad_embed
     std::vector<float> next_emb(D);
     if (step < pf.n_trailing) {
       VecAdd(next_emb.data(), codec_sum.data(),
              pf.trailing_text.data() + step * D, D);
     } else {
-      // tts_pad + codec_pad
-      std::vector<float> pad_sum(D);
-      VecAdd(pad_sum.data(), pf.tts_pad_e.data(), pf.codec_pad_e.data(), D);
-      VecAdd(next_emb.data(), codec_sum.data(), pad_sum.data(), D);
+      VecAdd(next_emb.data(), codec_sum.data(), pf.tts_pad_e.data(), D);
     }
 
     // Talker decode
@@ -427,6 +586,14 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     return result;
   }
 
+  // Dump primary codes for debugging
+  std::cerr << "  PRIMARY_CODES=[";
+  for (int f = 0; f < n; ++f) {
+    if (f) std::cerr << ",";
+    std::cerr << all_codes[f][0];
+  }
+  std::cerr << "]" << std::endl;
+
   result.n_frames = n;
   double dur = n / 12.5;
   result.decode_ms_avg =
@@ -444,7 +611,11 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
   }
 
   auto t_voc = Clock::now();
-  result.audio = ort_->Vocoder(codes_t.data(), n, cfg_.num_code_groups);
+  if (trt_vocoder_) {
+    result.audio = trt_vocoder_->Run(codes_t.data(), n, cfg_.num_code_groups);
+  } else {
+    result.audio = ort_->Vocoder(codes_t.data(), n, cfg_.num_code_groups);
+  }
   result.vocoder_ms =
       std::chrono::duration<double, std::milli>(Clock::now() - t_voc).count();
 
@@ -497,8 +668,13 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
   cp_embed_n_layers_ = n_layers;
   cp_embed_vocab_ = vocab;
 
-  // Upload to GPU for fast context append
+  // Upload to GPU for fast context append (old CP engine)
   cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+
+  // Also upload to new KV CP engine if available
+  if (cp_kv_) {
+    cp_kv_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+  }
 }
 
 const float* TTSPipeline::CPEmbedLookup(int layer, int token_id) const {
@@ -540,6 +716,7 @@ std::vector<float> TTSPipeline::ExtractSpeakerEmbedding(const float* mel,
 void TTSPipeline::EnableProfiling(bool enable) {
   if (talker_) talker_->EnableProfiling(enable);
   if (cp_) cp_->EnableProfiling(enable);
+  if (cp_kv_) cp_kv_->EnableProfiling(enable);
 }
 
 void TTSPipeline::PrintProfilingStats() {
@@ -574,6 +751,18 @@ void TTSPipeline::PrintProfilingStats() {
     std::cout << "  Overhead (bind+sync): avg=" << s.AvgOverhead() << " ms"
               << std::endl;
     cp_->ResetStats();
+  }
+  if (cp_kv_ && cp_kv_->stats().n_samples > 0) {
+    auto& s = cp_kv_->stats();
+    std::cout << "\n  === CP-KV PROFILING (" << s.n_samples << " frames) ==="
+              << std::endl;
+    std::cout << "  Kernel: avg=" << s.AvgKernel()
+              << " ms, max=" << s.max_kernel << " ms" << std::endl;
+    std::cout << "  D2H:    avg=" << s.AvgD2H() << " ms, max=" << s.max_d2h
+              << " ms" << std::endl;
+    std::cout << "  Total:  avg=" << s.AvgTotal()
+              << " ms, max=" << s.max_total << " ms" << std::endl;
+    cp_kv_->ResetStats();
   }
 }
 
@@ -610,7 +799,11 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
                                      AudioChunkCallback callback) {
   using Clock = std::chrono::high_resolution_clock;
 
-  srand(config.seed);
+  if (config.seed == 0) {
+    rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  } else {
+    rng_.seed(config.seed);
+  }
   int D = cfg_.hidden_dim;
 
   // Build prefill
@@ -642,67 +835,118 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     double prefill_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     std::cout << "  Prefill: " << prefill_ms << " ms (TRT unified)" << std::endl;
-    int last_pos_pf = pf.seq_len - 1;
+    // last_pos_pf: engine may output last token only (logits.size()==vocab_size) or all tokens
+    int last_pos_pf = (int)pf_result.logits.size() / cfg_.vocab_size - 1;
     VecCopy(logits.data(),
             pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
             cfg_.vocab_size);
+    // last_hidden is always full sequence
     VecCopy(last_hidden.data(),
-            pf_result.last_hidden.data() + last_pos_pf * D, D);
+            pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
   }
 
   // Decode loop with chunked vocoder
   std::vector<std::vector<int>> all_codes;
-  size_t last_audio_pos = 0;  // track yielded audio position
+  std::vector<int> primary_history;  // for repetition penalty
+
+  // Sliding-window vocoder constants
+  const int kVocContextFrames = 25;   // left context frames (official default)
+  const int kSamplesPerFrame = 1920;  // 24000 Hz / 12.5 Hz codec rate
+
+  int last_emitted_frames = 0;  // frame count at the last chunk emit
 
   // Determine chunk boundaries: first chunk is smaller for low TTFA
   int next_chunk_at = config.first_chunk_frames;
 
-  for (int step = 0; step < config.max_frames; ++step) {
-    // Sample primary code
-    int primary_code = Sample(logits.data(), cfg_.vocab_size, 50, 0.9f,
-                              step < 2, cfg_.codec_eos_token_id);
+  // EOS bias: progressive boost, delayed until expected audio length
+  const float kEosBiasBase = 5.0f;
+  const float kEosBiasRate = 0.5f;
+  const float kEosBiasMax = 25.0f;
+  int bias_onset = pf.n_trailing * 3;
+  int text_based_max = std::max(50, pf.n_trailing * 10);
+  int effective_max = std::min(config.max_frames, text_based_max);
+  std::cerr << "  EOS params: n_trailing=" << pf.n_trailing
+            << " bias_onset=" << bias_onset
+            << " effective_max=" << effective_max << std::endl;
+
+  for (int step = 0; step < effective_max; ++step) {
+    // Compute progressive EOS bias (delayed start)
+    float eos_bias = 0.0f;
+    int steps_past_onset = step - bias_onset;
+    if (steps_past_onset >= 0) {
+      eos_bias = std::min(kEosBiasMax,
+                          kEosBiasBase + steps_past_onset * kEosBiasRate);
+    }
+
+    // Sample primary code with repetition penalty + EOS bias
+    int primary_code = SampleWithPenalty(
+        logits.data(), cfg_.vocab_size,
+        primary_history.data(), (int)primary_history.size(),
+        50, 0.9f, step < 2, cfg_.codec_eos_token_id, eos_bias);
     if (primary_code == cfg_.codec_eos_token_id) {
-      std::cout << "  EOS at step " << step << std::endl;
+      std::cout << "  EOS at step " << step << " (bias=" << eos_bias << ")" << std::endl;
+      break;
+    }
+
+    // Repetition detection: force EOS if looping
+    primary_history.push_back(primary_code);
+    if (DetectRepetition(primary_history, 5)) {
+      std::cout << "  Force EOS at step " << step << " (repetition detected)" << std::endl;
       break;
     }
 
     // Code predictor: 15 residual codes
     auto primary_e = ort_->CodecEmbed({(int64_t)primary_code});
-    cp_->BeginFrame(last_hidden.data(), primary_e.data());
 
     std::vector<float> codec_sum(D);
     VecCopy(codec_sum.data(), primary_e.data(), D);
 
     std::vector<int> frame_codes = {primary_code};
 
-    for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
-      std::vector<float> cp_logits(cfg_.cp_vocab);
-      cp_->PredictGPU(j, cp_logits.data());
+    if (cp_kv_) {
+      // --- Autoregressive CP (CPU sampling, 15 TRT decode steps) ---
+      int n_groups = cfg_.num_code_groups - 1;
+      std::vector<int> cp_codes(n_groups);
+      cp_kv_->RunFrameAutoregressive(
+          last_hidden.data(), primary_e.data(), cp_codes.data(),
+          cp_embed_table_.data(), cp_embed_vocab_);
 
-      int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
-      frame_codes.push_back(rc);
-
-      if (cp_->has_embed_table()) {
-        cp_->AppendEmbeddingFromTable(j, rc);
+      for (int j = 0; j < n_groups; ++j) {
+        int rc = cp_codes[j];
+        frame_codes.push_back(rc);
         const float* re = CPEmbedLookup(j, rc);
         VecAdd(codec_sum.data(), codec_sum.data(), re, D);
-      } else {
-        auto re = ort_->CPEmbed(rc, j);
-        cp_->AppendEmbedding(re.data());
-        VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
+      }
+    } else {
+      cp_->BeginFrame(last_hidden.data(), primary_e.data());
+
+      for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
+        std::vector<float> cp_logits(cfg_.cp_vocab);
+        cp_->PredictGPU(j, cp_logits.data());
+
+        int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
+        frame_codes.push_back(rc);
+
+        if (cp_->has_embed_table()) {
+          cp_->AppendEmbeddingFromTable(j, rc);
+          const float* re = CPEmbedLookup(j, rc);
+          VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+        } else {
+          auto re = ort_->CPEmbed(rc, j);
+          cp_->AppendEmbedding(re.data());
+          VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
+        }
       }
     }
     all_codes.push_back(frame_codes);
 
-    // Next talker input
+    // Next talker input: codec_sum + trailing_text (or tts_pad after text)
     std::vector<float> next_emb(D);
     if (step < pf.n_trailing) {
       VecAdd(next_emb.data(), codec_sum.data(),
              pf.trailing_text.data() + step * D, D);
     } else {
-      std::vector<float> pad_sum(D);
-      VecAdd(pad_sum.data(), pf.tts_pad_e.data(), pf.codec_pad_e.data(), D);
-      VecAdd(next_emb.data(), codec_sum.data(), pad_sum.data(), D);
+      VecAdd(next_emb.data(), codec_sum.data(), pf.tts_pad_e.data(), D);
     }
 
     // Talker decode
@@ -711,29 +955,45 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     // Check if we should emit a chunk
     int n = (int)all_codes.size();
     if (n >= next_chunk_at) {
-      // Run vocoder on all accumulated codes
-      std::vector<int64_t> codes_t(n * cfg_.num_code_groups);
-      for (int f = 0; f < n; ++f) {
+      // Sliding-window vocoder: pass [window_start..n] where window_start
+      // is at most kVocContextFrames before the new frames in this chunk.
+      int prev_boundary = last_emitted_frames;  // start of new frames
+      int window_start = std::max(0, prev_boundary - kVocContextFrames);
+      int window_len = n - window_start;
+
+      std::vector<int64_t> codes_t(window_len * cfg_.num_code_groups);
+      for (int f = 0; f < window_len; ++f) {
         for (int g = 0; g < cfg_.num_code_groups; ++g) {
-          codes_t[f * cfg_.num_code_groups + g] = all_codes[f][g];
+          codes_t[f * cfg_.num_code_groups + g] =
+              all_codes[window_start + f][g];
         }
       }
 
-      auto full_audio = ort_->Vocoder(codes_t.data(), n, cfg_.num_code_groups);
-
-      // Yield only new samples
-      if (full_audio.size() > last_audio_pos) {
-        StreamChunk chunk;
-        chunk.audio.assign(full_audio.begin() + last_audio_pos,
-                           full_audio.end());
-        chunk.total_frames = n;
-        chunk.is_final = false;
-        last_audio_pos = full_audio.size();
-
-        std::cout << "  Chunk: " << n << " frames, "
-                  << chunk.audio.size() << " new samples" << std::endl;
-        callback(chunk);
+      std::vector<float> window_audio;
+      if (trt_vocoder_) {
+        window_audio =
+            trt_vocoder_->Run(codes_t.data(), window_len, cfg_.num_code_groups);
+      } else {
+        window_audio =
+            ort_->Vocoder(codes_t.data(), window_len, cfg_.num_code_groups);
       }
+
+      // Skip the context portion, yield only new frames' audio
+      size_t skip_samples =
+          (size_t)(prev_boundary - window_start) * kSamplesPerFrame;
+      StreamChunk chunk;
+      if (window_audio.size() > skip_samples) {
+        chunk.audio.assign(window_audio.begin() + skip_samples,
+                           window_audio.end());
+      }
+      chunk.total_frames = n;
+      chunk.is_final = false;
+      last_emitted_frames = n;
+
+      std::cout << "  Chunk: window=[" << window_start << ".." << n
+                << "] skip=" << skip_samples
+                << " yield=" << chunk.audio.size() << " samples" << std::endl;
+      callback(chunk);
 
       // After first chunk, use regular chunk size
       next_chunk_at = n + config.chunk_frames;
@@ -744,28 +1004,43 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     }
   }
 
-  // Final chunk: vocoder on all remaining codes
+  // Final chunk: sliding-window vocoder for remaining codes
   int n = (int)all_codes.size();
   if (n > 0) {
-    std::vector<int64_t> codes_t(n * cfg_.num_code_groups);
-    for (int f = 0; f < n; ++f) {
+    int prev_boundary = last_emitted_frames;
+    int window_start = std::max(0, prev_boundary - kVocContextFrames);
+    int window_len = n - window_start;
+
+    std::vector<int64_t> codes_t(window_len * cfg_.num_code_groups);
+    for (int f = 0; f < window_len; ++f) {
       for (int g = 0; g < cfg_.num_code_groups; ++g) {
-        codes_t[f * cfg_.num_code_groups + g] = all_codes[f][g];
+        codes_t[f * cfg_.num_code_groups + g] =
+            all_codes[window_start + f][g];
       }
     }
 
-    auto full_audio = ort_->Vocoder(codes_t.data(), n, cfg_.num_code_groups);
+    std::vector<float> window_audio;
+    if (trt_vocoder_) {
+      window_audio =
+          trt_vocoder_->Run(codes_t.data(), window_len, cfg_.num_code_groups);
+    } else {
+      window_audio =
+          ort_->Vocoder(codes_t.data(), window_len, cfg_.num_code_groups);
+    }
 
+    size_t skip_samples =
+        (size_t)(prev_boundary - window_start) * kSamplesPerFrame;
     StreamChunk chunk;
-    if (full_audio.size() > last_audio_pos) {
-      chunk.audio.assign(full_audio.begin() + last_audio_pos,
-                         full_audio.end());
+    if (window_audio.size() > skip_samples) {
+      chunk.audio.assign(window_audio.begin() + skip_samples,
+                         window_audio.end());
     }
     chunk.total_frames = n;
     chunk.is_final = true;
 
-    std::cout << "  Final chunk: " << n << " frames, "
-              << chunk.audio.size() << " new samples" << std::endl;
+    std::cout << "  Final chunk: window=[" << window_start << ".." << n
+              << "] skip=" << skip_samples
+              << " yield=" << chunk.audio.size() << " samples" << std::endl;
     callback(chunk);
   } else {
     // No frames at all — emit empty final chunk

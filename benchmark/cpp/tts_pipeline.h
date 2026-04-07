@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -64,7 +65,7 @@ struct StreamConfig {
   int first_chunk_frames = 10;   // smaller first chunk for low TTFA (~800ms)
   int chunk_frames = 25;         // subsequent chunks (~2s audio each)
   int max_frames = 200;
-  int seed = 42;
+  int seed = 0;  // 0 = random (time-based), >0 = fixed
 };
 
 class TTSPipeline {
@@ -78,20 +79,20 @@ class TTSPipeline {
 
   // Standard TTS
   SynthResult Synthesize(const std::string& text, const std::string& lang,
-                         int max_frames = 200, int seed = 42);
+                         int max_frames = 200, int seed = 0);
 
   // X-vector voice clone: provide pre-computed speaker embedding
   SynthResult SynthesizeWithSpeaker(const std::string& text,
                                     const std::string& lang,
                                     const std::vector<float>& speaker_embed,
-                                    int max_frames = 200, int seed = 42);
+                                    int max_frames = 200, int seed = 0);
 
   // Synthesize with pre-tokenized IDs (bypass tokenizer)
   SynthResult SynthesizeWithTokenIds(const std::string& text,
                                      const std::string& lang,
                                      const std::vector<int64_t>& token_ids,
                                      const std::vector<float>* speaker_embed,
-                                     int max_frames = 200, int seed = 42);
+                                     int max_frames = 200, int seed = 0);
 
   // Streaming TTS with callback per audio chunk
   void SynthesizeStreaming(const std::string& text, const std::string& lang,
@@ -142,9 +143,22 @@ class TTSPipeline {
                            const float* speaker_embed,
                            const std::vector<int64_t>* token_ids = nullptr);
 
-  // Top-k sampling
+  // Top-k sampling (convenience wrapper without repetition penalty)
   int Sample(const float* logits, int vocab_size, int k = 50, float temp = 0.9f,
              bool suppress_eos = false, int eos_id = -1);
+  // Full sampling with repetition penalty (matches official Qwen3-TTS generate)
+  // eos_bias: added to EOS logit before sampling (>0 encourages EOS)
+  // suppress_range: apply [vocab-1024, vocab) suppress (talker only, NOT for CP)
+  int SampleWithPenalty(const float* logits, int vocab_size,
+                        const int* prev_tokens, int n_prev,
+                        int k = 50, float temp = 0.9f,
+                        bool suppress_eos = false, int eos_id = -1,
+                        float eos_bias = 0.0f,
+                        bool suppress_range = true);
+
+  // Check if primary_history shows looping (same token N+ times in a row)
+  static bool DetectRepetition(const std::vector<int>& history,
+                               int min_repeat = 5);
 
   // Tokenize text (simple BPE via vocab.json + merges.txt)
   std::vector<int64_t> Tokenize(const std::string& text);
@@ -160,10 +174,15 @@ class TTSPipeline {
   std::unique_ptr<ORTModels> ort_;
   std::unique_ptr<TRTTalkerEngine> talker_;
   std::unique_ptr<TRTCPEngine> cp_;
+  std::unique_ptr<TRTCPKVEngine> cp_kv_;           // optional KV-cache CP engine
+  std::unique_ptr<TRTVocoderEngine> trt_vocoder_;  // optional TRT vocoder
 
   // CPU copy of cp_embed table: [n_layers][vocab][D]
   std::vector<float> cp_embed_table_;
   int cp_embed_n_layers_ = 0;
   int cp_embed_vocab_ = 0;
   const float* CPEmbedLookup(int layer, int token_id) const;
+
+  // RNG for sampling — seeded per request for reproducibility
+  std::mt19937 rng_{42};
 };
