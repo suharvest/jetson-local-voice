@@ -284,6 +284,9 @@ class Qwen3ASREngine:
         assistant_prompt = "assistant\n"
         if language:
             assistant_prompt += f"language {language}"
+        else:
+            # Auto-detect: let decoder generate "language XXX" itself
+            assistant_prompt += "language "
 
         # Compact suffix saves ~120ms per chunk by reducing token count
         # Full:    "数字用0123456789，语音转录："  (~9 tokens)
