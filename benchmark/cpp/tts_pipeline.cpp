@@ -517,9 +517,10 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     std::vector<int> frame_codes = {primary_code};
 
     if (cp_kv_) {
-      // --- Autoregressive CP (CPU sampling, 15 TRT decode steps) ---
-      // NOTE: RunFrameGPU exists but has ~124ms overhead from TRT shape-change sync.
-      // CPU autoregressive is ~50ms. GPU path needs CUDA graph optimization.
+      // --- Autoregressive CP (dual-context, CPU sampling) ---
+      // Dual contexts: ctx_prefill_ for seq_len=2, ctx_decode_ for seq_len=1
+      // avoids profile switching overhead. CPU sampling is faster than
+      // GPU sampling with per-step sync due to TRT overhead on Jetson.
       int n_groups = cfg_.num_code_groups - 1;
       std::vector<int> cp_codes(n_groups);
       cp_kv_->RunFrameAutoregressive(
@@ -904,7 +905,7 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     std::vector<int> frame_codes = {primary_code};
 
     if (cp_kv_) {
-      // --- Autoregressive CP (CPU sampling, 15 TRT decode steps) ---
+      // --- GPU-resident autoregressive CP (dual-context, no CPU sync) ---
       int n_groups = cfg_.num_code_groups - 1;
       std::vector<int> cp_codes(n_groups);
       cp_kv_->RunFrameAutoregressive(
