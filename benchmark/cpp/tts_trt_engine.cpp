@@ -4,13 +4,15 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
-#include <chrono>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <vector>
 
 #define CHECK_CUDA(call)                                                  \
@@ -1144,16 +1146,63 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
     std::cerr << "[CPKV] Failed to deserialize engine: " << engine_path << std::endl;
     std::abort();
   }
-  context_.reset(engine_->createExecutionContext());
   CHECK_CUDA(cudaStreamCreate(&stream_));
+
+  // Check for dual-profile engine (Profile 0 = prefill, Profile 1 = decode)
+  int n_profiles = engine_->getNbOptimizationProfiles();
+  if (n_profiles >= 2) {
+    has_dual_profiles_ = true;
+    ctx_prefill_.reset(engine_->createExecutionContext());
+    ctx_prefill_->setOptimizationProfileAsync(0, stream_);
+    ctx_decode_.reset(engine_->createExecutionContext());
+    ctx_decode_->setOptimizationProfileAsync(1, stream_);
+    has_dual_ctx_ = true;
+    context_.reset();  // not used
+    std::cout << "  [CPKV] DUAL-PROFILE engine (" << n_profiles << " profiles)"
+              << std::endl;
+  } else {
+    // Single-profile engine: create two contexts on the same profile.
+    // Each context independently tracks shapes, so prefill (seq_len=2) and
+    // decode (seq_len=1) don't interfere with each other's shape validation.
+    has_dual_profiles_ = false;
+    ctx_prefill_.reset(engine_->createExecutionContext());
+    ctx_decode_.reset(engine_->createExecutionContext());
+    has_dual_ctx_ = true;
+    context_.reset(engine_->createExecutionContext());  // legacy fallback
+    std::cout << "  [CPKV] Single-profile engine, dual-context mode" << std::endl;
+  }
+
+  // Detect single-head engine (has "gen_step" input, "logits" output)
+  // vs unified engine (has "logits_all" output)
+  {
+    int n_io = engine_->getNbIOTensors();
+    for (int i = 0; i < n_io; ++i) {
+      const char* name = engine_->getIOTensorName(i);
+      if (std::string(name) == "gen_step") {
+        is_single_head_ = true;
+        break;
+      }
+    }
+  }
 
   // Detect KV output and logits dtypes from engine
   auto kv_dtype = engine_->getTensorDataType("new_past_key_0");
   kv_elem_bytes_ = TrtDtypeSize(kv_dtype);
 
-  auto logits_dtype = engine_->getTensorDataType("logits_all");
+  const char* logits_name = is_single_head_ ? "logits" : "logits_all";
+  auto logits_dtype = engine_->getTensorDataType(logits_name);
   logits_elem_bytes_ = TrtDtypeSize(logits_dtype);
   logits_is_bf16_ = (logits_dtype == nvinfer1::DataType::kBF16);
+
+  // Pre-cache tensor names to avoid string allocation per step
+  cp_kv_names_.resize(2 * n_cp_layers);
+  cp_new_kv_names_.resize(2 * n_cp_layers);
+  for (int i = 0; i < n_cp_layers; ++i) {
+    cp_kv_names_[2*i]     = "past_key_" + std::to_string(i);
+    cp_kv_names_[2*i+1]   = "past_value_" + std::to_string(i);
+    cp_new_kv_names_[2*i]   = "new_past_key_" + std::to_string(i);
+    cp_new_kv_names_[2*i+1] = "new_past_value_" + std::to_string(i);
+  }
 
   // Allocate embedding input: [1, 2, D] (seq_len=2 always)
   CHECK_CUDA(cudaMalloc(&d_embeds_, 2 * hidden_dim * sizeof(float)));
@@ -1182,9 +1231,20 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
     CHECK_CUDA(cudaMalloc(&d_kv_b_[i], kv_buf_size));
   }
 
-  // Output logits_all: [cp_out_groups, cp_vocab]
-  CHECK_CUDA(cudaMalloc(&d_logits_all_,
-                        (size_t)cp_out_groups * cp_vocab * logits_elem_bytes_));
+  // Output logits buffer
+  if (is_single_head_) {
+    // Single-head: logits [1, cp_vocab]
+    CHECK_CUDA(cudaMalloc(&d_logits_all_, (size_t)cp_vocab * logits_elem_bytes_));
+    CHECK_CUDA(cudaMalloc(&d_logits_decode_, (size_t)cp_vocab * logits_elem_bytes_));
+    // gen_step: scalar int64
+    CHECK_CUDA(cudaMalloc(&d_gen_step_, sizeof(int64_t)));
+  } else {
+    // Unified: logits_all [cp_out_groups, cp_vocab]
+    CHECK_CUDA(cudaMalloc(&d_logits_all_,
+                          (size_t)cp_out_groups * cp_vocab * logits_elem_bytes_));
+    CHECK_CUDA(cudaMalloc(&d_logits_decode_,
+                          (size_t)cp_out_groups * cp_vocab * logits_elem_bytes_));
+  }
 
   // GPU-resident autoregressive buffers
   CHECK_CUDA(cudaMalloc(&d_codes_out_, cp_out_groups * sizeof(int)));
@@ -1207,17 +1267,21 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
             << " D=" << hidden_dim << " vocab=" << cp_vocab
             << " groups=" << cp_out_groups
             << " logits=" << (logits_is_bf16_ ? "bf16" : "fp32")
+            << " single_head=" << is_single_head_
+            << " dual_ctx=" << has_dual_ctx_
             << std::endl;
 }
 
 TRTCPKVEngine::~TRTCPKVEngine() {
   if (d_embeds_) cudaFree(d_embeds_);
   if (d_cache_pos_) cudaFree(d_cache_pos_);
+  if (d_gen_step_) cudaFree(d_gen_step_);
   if (d_kv_dummy_) cudaFree(d_kv_dummy_);
   for (auto* p : d_kv_out_) if (p) cudaFree(p);
   for (auto* p : d_kv_a_) if (p) cudaFree(p);
   for (auto* p : d_kv_b_) if (p) cudaFree(p);
   if (d_logits_all_) cudaFree(d_logits_all_);
+  if (d_logits_decode_) cudaFree(d_logits_decode_);
   if (d_embed_table_) cudaFree(d_embed_table_);
   if (d_codes_out_) cudaFree(d_codes_out_);
   if (d_cache_pos_table_) cudaFree(d_cache_pos_table_);
@@ -1232,87 +1296,47 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     const float* hidden, const float* primary_emb,
     int* codes_out,
     const float* embed_table, int embed_vocab) {
-  // Autoregressive CP: 1 prefill (2 tokens) + 14 decode steps (1 token each)
-  // embed_table: [n_layers][vocab][D] on CPU (used to look up sampled code embeddings)
-  auto* ctx = context_.get();
+  // Autoregressive CP: 15 sequential steps.
+  // If GPU embed table is available → GPU sampling (no CPU sync between steps).
+  // Otherwise → CPU sampling (sync each step for D2H logits).
+  auto* pctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
+  auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
   int D = hidden_dim_;
   int n_groups = cp_out_groups_;  // 15
+  size_t d_bytes = D * sizeof(float);
+  const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
-  // Helper to read one group's logits from GPU
-  auto read_group_logits = [&](int group_idx, float* out) {
-    size_t offset = (size_t)group_idx * cp_vocab_;
+  // GPU sampling is slower due to TRT shape-change overhead when not syncing
+  // between steps. CPU sampling with per-step sync is actually faster (~53ms
+  // vs ~123ms) because the sync lets TRT finalize each step's execution plan.
+  bool use_gpu_sample = false;  // disabled — CPU path is faster
+
+  // RNG seed for GPU sampling
+  unsigned long long rng_seed = std::chrono::high_resolution_clock::now()
+      .time_since_epoch().count();
+
+  // CPU sampling fallback (only used when no GPU embed table)
+  static thread_local std::mt19937 cp_rng(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  auto sample_topk_cpu = [&](const void* logits_buf, int group_idx) -> int {
+    size_t offset = is_single_head_ ? 0 : (size_t)group_idx * cp_vocab_;
+    std::vector<float> logits(cp_vocab_);
     if (logits_is_bf16_) {
       std::vector<uint16_t> raw(cp_vocab_);
-      CHECK_CUDA(cudaMemcpyAsync(raw.data(),
-                                  (char*)d_logits_all_ + offset * 2,
+      CHECK_CUDA(cudaMemcpyAsync(raw.data(), (char*)logits_buf + offset * 2,
                                   cp_vocab_ * 2, cudaMemcpyDeviceToHost, stream_));
       CHECK_CUDA(cudaStreamSynchronize(stream_));
-      for (int j = 0; j < cp_vocab_; ++j) {
-        uint32_t bits = (uint32_t)raw[j] << 16;
-        std::memcpy(&out[j], &bits, 4);
+      for (int v = 0; v < cp_vocab_; ++v) {
+        uint32_t bits = (uint32_t)raw[v] << 16;
+        std::memcpy(&logits[v], &bits, 4);
       }
     } else {
-      CHECK_CUDA(cudaMemcpyAsync(out,
-                                  (char*)d_logits_all_ + offset * sizeof(float),
+      CHECK_CUDA(cudaMemcpyAsync(logits.data(),
+                                  (char*)logits_buf + offset * sizeof(float),
                                   cp_vocab_ * sizeof(float),
                                   cudaMemcpyDeviceToHost, stream_));
       CHECK_CUDA(cudaStreamSynchronize(stream_));
     }
-  };
-
-  // Helper to run one TRT inference step
-  auto run_step = [&](int seq_len, int past_len,
-                      std::vector<void*>& kv_in, std::vector<void*>& kv_out) {
-    ctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, seq_len, D});
-    ctx->setTensorAddress("inputs_embeds", d_embeds_);
-    ctx->setInputShape("cache_position", nvinfer1::Dims{1, {seq_len}});
-    ctx->setTensorAddress("cache_position", d_cache_pos_);
-
-    for (int i = 0; i < n_cp_layers_; ++i) {
-      std::string kn = "past_key_" + std::to_string(i);
-      std::string vn = "past_value_" + std::to_string(i);
-      ctx->setInputShape(kn.c_str(),
-                         nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
-      ctx->setInputShape(vn.c_str(),
-                         nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
-      ctx->setTensorAddress(kn.c_str(), past_len > 0 ? kv_in[2*i] : d_kv_dummy_);
-      ctx->setTensorAddress(vn.c_str(), past_len > 0 ? kv_in[2*i+1] : d_kv_dummy_);
-
-      std::string new_kn = "new_past_key_" + std::to_string(i);
-      std::string new_vn = "new_past_value_" + std::to_string(i);
-      ctx->setTensorAddress(new_kn.c_str(), kv_out[2*i]);
-      ctx->setTensorAddress(new_vn.c_str(), kv_out[2*i+1]);
-    }
-
-    ctx->setTensorAddress("logits_all", d_logits_all_);
-    bool ok = ctx->enqueueV3(stream_);
-    if (!ok) {
-      std::cerr << "[CPKV-AR] enqueueV3 FAILED! seq=" << seq_len
-                << " past=" << past_len << std::endl;
-      std::abort();
-    }
-  };
-
-  // ---- Step 0: Prefill [hidden, primary_emb] (seq_len=2, past_len=0) ----
-  size_t d_bytes = D * sizeof(float);
-  CHECK_CUDA(cudaMemcpyAsync(d_embeds_, hidden, d_bytes,
-                             cudaMemcpyHostToDevice, stream_));
-  CHECK_CUDA(cudaMemcpyAsync((char*)d_embeds_ + d_bytes, primary_emb, d_bytes,
-                             cudaMemcpyHostToDevice, stream_));
-  int64_t pos2[2] = {0, 1};
-  CHECK_CUDA(cudaMemcpyAsync(d_cache_pos_, pos2, 2 * sizeof(int64_t),
-                             cudaMemcpyHostToDevice, stream_));
-
-  run_step(2, 0, d_kv_a_, d_kv_b_);  // output KV → d_kv_b_
-
-  // Read and sample group 0
-  std::vector<float> grp_logits(cp_vocab_);
-  read_group_logits(0, grp_logits.data());
-
-  // Inline top-k sampling for CP (temp=0.9, k=50, no suppress, no penalty)
-  static thread_local std::mt19937 cp_rng(
-      std::chrono::high_resolution_clock::now().time_since_epoch().count());
-  auto sample_topk = [&](const float* logits) -> int {
     std::vector<std::pair<float, int>> vals(cp_vocab_);
     for (int v = 0; v < cp_vocab_; ++v) vals[v] = {logits[v], v};
     std::partial_sort(vals.begin(), vals.begin() + 50, vals.end(),
@@ -1329,42 +1353,168 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     return vals[dist(cp_rng)].second;
   };
 
-  codes_out[0] = sample_topk(grp_logits.data());
+  // ---- Step 0: Prefill [hidden, primary_emb] (seq_len=2, past_len=0) ----
+  CHECK_CUDA(cudaMemcpyAsync(d_embeds_, hidden, d_bytes,
+                             cudaMemcpyHostToDevice, stream_));
+  CHECK_CUDA(cudaMemcpyAsync((char*)d_embeds_ + d_bytes, primary_emb, d_bytes,
+                             cudaMemcpyHostToDevice, stream_));
 
-  // ---- Steps 1-14: Decode (seq_len=1, past_len grows) ----
+  pctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 2, D});
+  pctx->setTensorAddress("inputs_embeds", d_embeds_);
+  pctx->setInputShape("cache_position", nvinfer1::Dims{1, {2}});
+  pctx->setTensorAddress("cache_position", d_cache_pos_table_);
+
+  for (int i = 0; i < n_cp_layers_; ++i) {
+    pctx->setInputShape(cp_kv_names_[2*i].c_str(),
+                        nvinfer1::Dims4{1, n_heads_, 0, head_dim_});
+    pctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
+                        nvinfer1::Dims4{1, n_heads_, 0, head_dim_});
+    pctx->setTensorAddress(cp_kv_names_[2*i].c_str(), d_kv_dummy_);
+    pctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), d_kv_dummy_);
+    pctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), d_kv_b_[2*i]);
+    pctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), d_kv_b_[2*i+1]);
+  }
+  pctx->setTensorAddress(logits_out_name, d_logits_all_);
+  if (is_single_head_) {
+    int64_t gs = 0;
+    CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+    pctx->setTensorAddress("gen_step", d_gen_step_);
+  }
+
+  bool ok = pctx->enqueueV3(stream_);
+  if (!ok) {
+    std::cerr << "[CPKV-AR] prefill enqueueV3 FAILED!" << std::endl;
+    std::abort();
+  }
+
+  // Sample group 0
+  if (use_gpu_sample) {
+    const void* logits_ptr = is_single_head_
+        ? d_logits_all_
+        : d_logits_all_;  // offset 0 for group 0
+    launchCPSampleAndEmbed(
+        stream_, logits_ptr, logits_is_bf16_,
+        reinterpret_cast<const float*>(d_embed_table_),
+        reinterpret_cast<float*>(d_embeds_),  // write embed for next step
+        d_codes_out_ + 0,
+        reinterpret_cast<int64_t*>(d_cache_pos_),  // write next cache_pos = 2
+        cp_vocab_, D, /*layer_idx=*/0,
+        /*next_cache_pos=*/2,
+        /*top_k=*/50, /*temperature=*/0.9f,
+        rng_seed, rng_counter_++);
+    // No sync — stream ordering ensures kernel completes before next enqueueV3.
+  } else {
+    codes_out[0] = sample_topk_cpu(d_logits_all_, 0);
+  }
+
+  // ---- Pre-bind decode context ----
+  dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
+  dctx->setTensorAddress("inputs_embeds", d_embeds_);
+  dctx->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
+  dctx->setTensorAddress("cache_position", d_cache_pos_);
+  dctx->setTensorAddress(logits_out_name, d_logits_decode_);
+  if (is_single_head_) {
+    dctx->setTensorAddress("gen_step", d_gen_step_);
+  }
+
+  // ---- Steps 1-14: Decode ----
   int past_len = 2;
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
   for (int j = 1; j < n_groups; ++j) {
-    // Embed previous group's sampled code
-    // embed_table: [n_layers][vocab][D], layer j-1 for group j
-    const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
+    if (use_gpu_sample) {
+      // GPU path: embed already in d_embeds_ from previous kernel,
+      // cache_pos already written by previous kernel.
+      // Only need to upload gen_step for single-head engine.
+      if (is_single_head_) {
+        int64_t gs = j;
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
+    } else {
+      // CPU path: upload embed + cache_pos from host
+      const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
+      CHECK_CUDA(cudaMemcpyAsync(d_embeds_, emb, d_bytes,
+                                 cudaMemcpyHostToDevice, stream_));
+      int64_t pos1 = past_len;
+      CHECK_CUDA(cudaMemcpyAsync(d_cache_pos_, &pos1, sizeof(int64_t),
+                                 cudaMemcpyHostToDevice, stream_));
+      if (is_single_head_) {
+        int64_t gs = j;
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
+    }
 
-    CHECK_CUDA(cudaMemcpyAsync(d_embeds_, emb, d_bytes,
-                               cudaMemcpyHostToDevice, stream_));
-    int64_t pos1 = past_len;
-    CHECK_CUDA(cudaMemcpyAsync(d_cache_pos_, &pos1, sizeof(int64_t),
-                               cudaMemcpyHostToDevice, stream_));
+    // Update KV shapes and pointers
+    for (int i = 0; i < n_cp_layers_; ++i) {
+      dctx->setInputShape(cp_kv_names_[2*i].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
+      dctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
+      dctx->setTensorAddress(cp_kv_names_[2*i].c_str(), (*kv_read)[2*i]);
+      dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
+      dctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), (*kv_write)[2*i]);
+      dctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), (*kv_write)[2*i+1]);
+    }
 
-    run_step(1, past_len, *kv_read, *kv_write);
+    ok = dctx->enqueueV3(stream_);
+    if (!ok) {
+      std::cerr << "[CPKV-AR] decode enqueueV3 FAILED! step=" << j
+                << " past=" << past_len << std::endl;
+      std::abort();
+    }
 
-    read_group_logits(j, grp_logits.data());
-    codes_out[j] = sample_topk(grp_logits.data());
+    if (use_gpu_sample) {
+      // GPU sample kernel: reads logits from GPU, writes embed + code + cache_pos
+      const void* logits_ptr;
+      if (is_single_head_) {
+        logits_ptr = d_logits_decode_;  // [1, vocab]
+      } else {
+        logits_ptr = (const char*)d_logits_decode_ +
+                     (size_t)j * cp_vocab_ * logits_elem_bytes_;
+      }
+      int64_t next_pos = past_len + 1;
+      launchCPSampleAndEmbed(
+          stream_, logits_ptr, logits_is_bf16_,
+          reinterpret_cast<const float*>(d_embed_table_),
+          reinterpret_cast<float*>(d_embeds_),
+          d_codes_out_ + j,
+          reinterpret_cast<int64_t*>(d_cache_pos_),
+          cp_vocab_, D, /*layer_idx=*/j,
+          next_pos,
+          /*top_k=*/50, /*temperature=*/0.9f,
+          rng_seed, rng_counter_++);
+      // No sync — stream ordering ensures kernel completes before next enqueueV3.
+      // setInputShape is CPU-side metadata, doesn't need GPU idle.
+    } else {
+      codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
+    }
 
     past_len++;
     std::swap(kv_read, kv_write);
+  }
+
+  // GPU path: copy codes from GPU to host
+  if (use_gpu_sample) {
+    CHECK_CUDA(cudaMemcpy(codes_out, d_codes_out_,
+                          n_groups * sizeof(int), cudaMemcpyDeviceToHost));
   }
 }
 
 void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
                                 int* codes_out) {
-  // GPU-resident autoregressive CP: all 15 steps run async on GPU stream.
-  // Only 1 H2D at start (hidden + primary_emb) + 1 D2H sync at end (15 codes).
-  // Between TRT steps, a CUDA kernel handles sampling and embedding lookup,
-  // eliminating 15 CPU<->GPU synchronization points.
+  // GPU-resident autoregressive CP with dual-context optimization.
+  // Two separate TRT execution contexts:
+  //   ctx_prefill_: always seq_len=2, past_len=0 (step 0)
+  //   ctx_decode_:  always seq_len=1, past_len varies 2→16 (steps 1-14)
+  // This eliminates shape-change overhead: each context only sees its own
+  // fixed seq_len, so TRT doesn't need to re-validate between prefill→decode.
   //
-  // Requires: d_embed_table_ loaded via LoadEmbedTable().
+  // Between TRT steps, a CUDA kernel handles sampling and embedding lookup,
+  // eliminating all CPU<->GPU synchronization points (single D2H at the end).
 
   if (!d_embed_table_) {
     std::cerr << "[CPKV-GPU] RunFrameGPU requires embed table on GPU. "
@@ -1372,7 +1522,8 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
     std::abort();
   }
 
-  auto* ctx = context_.get();
+  auto* pctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
+  auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
   int D = hidden_dim_;
   int n_groups = cp_out_groups_;  // 15
 
@@ -1380,87 +1531,103 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   unsigned long long rng_seed =
       std::chrono::high_resolution_clock::now().time_since_epoch().count();
 
-  // Helper to run one TRT inference step (same as RunFrameAutoregressive)
-  auto run_step = [&](int seq_len, int past_len,
-                      std::vector<void*>& kv_in, std::vector<void*>& kv_out) {
-    ctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, seq_len, D});
-    ctx->setTensorAddress("inputs_embeds", d_embeds_);
-    ctx->setInputShape("cache_position", nvinfer1::Dims{1, {seq_len}});
-    ctx->setTensorAddress("cache_position",
-                          seq_len == 2 ? d_cache_pos_table_ : d_cache_pos_single_);
-
-    for (int i = 0; i < n_cp_layers_; ++i) {
-      std::string kn = "past_key_" + std::to_string(i);
-      std::string vn = "past_value_" + std::to_string(i);
-      ctx->setInputShape(kn.c_str(),
-                         nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
-      ctx->setInputShape(vn.c_str(),
-                         nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
-      ctx->setTensorAddress(kn.c_str(), past_len > 0 ? kv_in[2*i] : d_kv_dummy_);
-      ctx->setTensorAddress(vn.c_str(), past_len > 0 ? kv_in[2*i+1] : d_kv_dummy_);
-
-      std::string new_kn = "new_past_key_" + std::to_string(i);
-      std::string new_vn = "new_past_value_" + std::to_string(i);
-      ctx->setTensorAddress(new_kn.c_str(), kv_out[2*i]);
-      ctx->setTensorAddress(new_vn.c_str(), kv_out[2*i+1]);
-    }
-
-    ctx->setTensorAddress("logits_all", d_logits_all_);
-    bool ok = ctx->enqueueV3(stream_);
-    if (!ok) {
-      std::cerr << "[CPKV-GPU] enqueueV3 FAILED! seq=" << seq_len
-                << " past=" << past_len << std::endl;
-      std::abort();
-    }
-  };
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
+  }
 
   // ---- Step 0: Prefill [hidden, primary_emb] (seq_len=2, past_len=0) ----
   size_t d_bytes = D * sizeof(float);
-  // Only H2D in the entire frame
   CHECK_CUDA(cudaMemcpyAsync(d_embeds_, hidden, d_bytes,
                              cudaMemcpyHostToDevice, stream_));
   CHECK_CUDA(cudaMemcpyAsync((char*)d_embeds_ + d_bytes, primary_emb, d_bytes,
                              cudaMemcpyHostToDevice, stream_));
 
-  // cache_position for prefill: d_cache_pos_table_ already has {0, 1, ...}
-  run_step(2, 0, d_kv_a_, d_kv_b_);  // output KV → d_kv_b_
+  // Bind prefill context: seq_len=2, past_len=0
+  pctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 2, D});
+  pctx->setTensorAddress("inputs_embeds", d_embeds_);
+  pctx->setInputShape("cache_position", nvinfer1::Dims{1, {2}});
+  pctx->setTensorAddress("cache_position", d_cache_pos_table_);
+
+  for (int i = 0; i < n_cp_layers_; ++i) {
+    pctx->setInputShape(cp_kv_names_[2*i].c_str(),
+                        nvinfer1::Dims4{1, n_heads_, 0, head_dim_});
+    pctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
+                        nvinfer1::Dims4{1, n_heads_, 0, head_dim_});
+    pctx->setTensorAddress(cp_kv_names_[2*i].c_str(), d_kv_dummy_);
+    pctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), d_kv_dummy_);
+    pctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), d_kv_b_[2*i]);
+    pctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), d_kv_b_[2*i+1]);
+  }
+  pctx->setTensorAddress("logits_all", d_logits_all_);
+
+  bool ok = pctx->enqueueV3(stream_);
+  if (!ok) {
+    std::cerr << "[CPKV-GPU] prefill enqueueV3 FAILED!" << std::endl;
+    std::abort();
+  }
 
   // Launch GPU sample kernel for group 0
-  // logits_all layout: [15, 2048] — group 0 is at offset 0
   const void* logits_g0 = (const char*)d_logits_all_;
   launchCPSampleAndEmbed(
       stream_, logits_g0, logits_is_bf16_,
       reinterpret_cast<const float*>(d_embed_table_),
-      reinterpret_cast<float*>(d_embeds_),  // write embed into d_embeds_ (input for step 1)
-      d_codes_out_ + 0,                     // code_out[0]
-      d_cache_pos_single_,                  // write next cache_pos = 2
+      reinterpret_cast<float*>(d_embeds_),
+      d_codes_out_ + 0,
+      d_cache_pos_single_,
       cp_vocab_, D, /*layer_idx=*/0,
       /*next_cache_pos=*/2,
       /*top_k=*/50, /*temperature=*/0.9f,
       rng_seed, rng_counter_++);
 
+  // ---- Pre-bind decode context addresses that don't change between steps ----
+  dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
+  dctx->setTensorAddress("inputs_embeds", d_embeds_);
+  dctx->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
+  dctx->setTensorAddress("cache_position", d_cache_pos_single_);
+  dctx->setTensorAddress("logits_all", d_logits_decode_);
+
   // ---- Steps 1-14: Decode (seq_len=1, past_len grows) ----
+  // NOTE: No per-step sync — all 14 decode steps queued async on stream.
+  // This path is 2x slower than RunFrameAutoregressive on single-profile
+  // engines due to TRT's shape-change overhead without sync points.
+  // Intended for future use with a dual-profile engine where seq_len is
+  // fixed within each profile.
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
   for (int j = 1; j < n_groups; ++j) {
     int past_len = j + 1;  // step 0 produced 2 KV entries, each step adds 1
 
-    // d_embeds_ was written by the previous sample kernel (embed of code[j-1])
-    // d_cache_pos_single_ was written by the previous kernel (value = past_len)
-    run_step(1, past_len, *kv_read, *kv_write);
+    // Only update the changing shapes (past_len) and KV buffer pointers
+    for (int i = 0; i < n_cp_layers_; ++i) {
+      dctx->setInputShape(cp_kv_names_[2*i].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
+      dctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
+      dctx->setTensorAddress(cp_kv_names_[2*i].c_str(), (*kv_read)[2*i]);
+      dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
+      dctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), (*kv_write)[2*i]);
+      dctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), (*kv_write)[2*i+1]);
+    }
+
+    ok = dctx->enqueueV3(stream_);
+    if (!ok) {
+      std::cerr << "[CPKV-GPU] decode enqueueV3 FAILED! step=" << j
+                << " past=" << past_len << std::endl;
+      std::abort();
+    }
 
     // Launch GPU sample kernel for group j
     size_t logits_offset = (size_t)j * cp_vocab_ * logits_elem_bytes_;
-    const void* logits_gj = (const char*)d_logits_all_ + logits_offset;
+    const void* logits_gj = (const char*)d_logits_decode_ + logits_offset;
 
     int64_t next_pos = past_len + 1;
     launchCPSampleAndEmbed(
         stream_, logits_gj, logits_is_bf16_,
         reinterpret_cast<const float*>(d_embed_table_),
-        reinterpret_cast<float*>(d_embeds_),  // overwrite for next step's input
-        d_codes_out_ + j,                     // code_out[j]
-        d_cache_pos_single_,                  // write next cache_pos
+        reinterpret_cast<float*>(d_embeds_),
+        d_codes_out_ + j,
+        d_cache_pos_single_,
         cp_vocab_, D, /*layer_idx=*/j,
         next_pos,
         /*top_k=*/50, /*temperature=*/0.9f,
@@ -1469,16 +1636,30 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
     std::swap(kv_read, kv_write);
   }
 
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
+  }
+
   // ---- Single D2H sync: read all 15 sampled codes ----
   CHECK_CUDA(cudaMemcpyAsync(codes_out, d_codes_out_,
                              n_groups * sizeof(int),
                              cudaMemcpyDeviceToHost, stream_));
-  CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+  CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+
+  if (profiling_) {
+    StepTiming t;
+    cudaEventElapsedTime(&t.kernel_ms, ev_start_, ev_kernel_done_);
+    cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
+    cudaEventElapsedTime(&t.total_ms, ev_start_, ev_d2h_done_);
+    stats_.Add(t);
+  }
 }
 
 void TRTCPKVEngine::RunFrame(const float* hidden, const float* primary_emb,
                               float* logits_out) {
-  auto* ctx = context_.get();
+  auto* ctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
 
   // H2D: copy [hidden, primary_emb] → d_embeds_ [1, 2, D]
   size_t d_bytes = hidden_dim_ * sizeof(float);

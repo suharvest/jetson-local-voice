@@ -302,6 +302,23 @@ class TRTCPKVEngine {
   std::unique_ptr<nvinfer1::IExecutionContext> context_;
   cudaStream_t stream_ = nullptr;
 
+  // Dual-context optimization: separate contexts for prefill (seq_len=2) and
+  // decode (seq_len=1) to eliminate shape-change overhead within RunFrameGPU.
+  // Each context independently tracks its shapes, so the decode context never
+  // sees a seq_len change (only past_len increments by 1 each step).
+  std::unique_ptr<nvinfer1::IExecutionContext> ctx_prefill_;
+  std::unique_ptr<nvinfer1::IExecutionContext> ctx_decode_;
+  bool has_dual_ctx_ = false;
+
+  // Dual-profile engine support: when engine has 2 optimization profiles,
+  // ctx_prefill_ uses Profile 0 (seq_len=2, past_len=0) and
+  // ctx_decode_ uses Profile 1 (seq_len=1, past_len dynamic).
+  bool has_dual_profiles_ = false;
+
+  // Single-head engine: has "gen_step" input and outputs "logits" [1, vocab]
+  // instead of "logits_all" [15, vocab]. Only computes 1 lm_head per step.
+  bool is_single_head_ = false;
+
   int n_cp_layers_;   // 5
   int hidden_dim_;    // 1024
   int n_heads_;       // 8
@@ -312,6 +329,7 @@ class TRTCPKVEngine {
   // Embedding input: [1, 2, D] (seq_len=2 for frame prefill)
   void* d_embeds_ = nullptr;
   void* d_cache_pos_ = nullptr;  // [2] int64 = {0, 1}
+  void* d_gen_step_ = nullptr;   // scalar int64 for single-head engine
 
   // Small dummy buffer for zero-size past KV inputs (TRT needs non-null ptr)
   void* d_kv_dummy_ = nullptr;  // 16 bytes — just needs to be a valid GPU address
@@ -322,6 +340,9 @@ class TRTCPKVEngine {
   std::vector<void*> d_kv_a_;   // read buffer (past KV input)
   std::vector<void*> d_kv_b_;   // write buffer (new KV output)
   int max_past_ = 20;
+
+  // Separate logits buffer for decode context (avoids binding conflicts)
+  void* d_logits_decode_ = nullptr;
 
   // Legacy: KV output buffers (used by parallel RunFrame)
   std::vector<void*> d_kv_out_;  // 2 * n_cp_layers output KV tensors
@@ -344,6 +365,10 @@ class TRTCPKVEngine {
   int64_t* d_cache_pos_table_ = nullptr;   // [max_past] int64 pre-filled {0,1,2,...}
   int64_t* d_cache_pos_single_ = nullptr;  // [1] int64 written by kernel
   unsigned long long rng_counter_ = 0;     // monotonic counter for cuRAND sequence
+
+  // Pre-cached tensor names for fast binding
+  std::vector<std::string> cp_kv_names_;     // "past_key_0", "past_value_0", ...
+  std::vector<std::string> cp_new_kv_names_; // "new_past_key_0", ...
 
   // Profiling
   bool profiling_ = false;
