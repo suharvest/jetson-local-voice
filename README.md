@@ -122,14 +122,21 @@ docker compose build && docker compose up -d
 
 Models are selected automatically based on `LANGUAGE_MODE`:
 
-| Service | Endpoint | zh_en (default) | en | Protocol |
-|---------|----------|-----------------|-----|----------|
-| **Streaming ASR** | `WS /asr/stream` | Paraformer bilingual | Zipformer English | WebSocket: int16 PCM in, JSON out |
-| **Streaming TTS** | `POST /tts/stream` | Matcha-TTS + Vocos | Kokoro v1.0 (53 speakers) | HTTP: JSON in, raw PCM stream |
-| **Batch TTS** | `POST /tts` | Matcha-TTS + Vocos | Kokoro v1.0 | HTTP: JSON in, WAV out |
-| Offline ASR | `POST /asr` | SenseVoice (zh+en+ja+ko+yue) | SenseVoice (same) | HTTP: WAV upload, JSON out |
+| Service | Endpoint | zh_en (default) | en | multilanguage | Protocol |
+|---------|----------|-----------------|-----|---------------|----------|
+| **Streaming ASR** | `WS /asr/stream` | Paraformer bilingual | Zipformer English | Qwen3-ASR (52 langs) | WebSocket: int16 PCM in, JSON out |
+| **Streaming TTS** | `POST /tts/stream` | Matcha-TTS + Vocos | Kokoro v1.0 | Qwen3-TTS (voice clone) | HTTP: JSON in, raw PCM stream |
+| **Batch TTS** | `POST /tts` | Matcha-TTS + Vocos | Kokoro v1.0 | Qwen3-TTS (voice clone) | HTTP: JSON in, WAV out |
+| Offline ASR | `POST /asr` | SenseVoice (zh+en+ja+ko+yue) | SenseVoice (same) | Qwen3-ASR (52 langs) | HTTP: WAV upload, JSON out |
 
-The service is model-agnostic at the API level — clients send audio/text, get audio/text back. Swap models without changing client code.
+**Backend capabilities differ:**
+
+| Backend | Speed control | Pitch shift | Voice clone | Languages | Streaming |
+|---------|--------------|-------------|-------------|-----------|-----------|
+| Sherpa (zh_en/en) | ✅ | ✅ | ❌ | 2 (zh+en) | ✅ |
+| Qwen3 (multilanguage) | ❌ | ❌ | ✅ (x-vector) | 52 | ✅ |
+
+The service is model-agnostic at the API level — clients send audio/text, get audio/text back. Swap models without changing client code. Unsupported parameters return `501` with `{"required_capability": "..."}`.
 
 ## API Reference
 
@@ -173,6 +180,8 @@ curl -X POST http://jetson:8000/tts \
 ```
 
 Parameters: `text` (required), `sid` (speaker ID, default 52), `speed` (rate, default 1.0)
+
+**Note:** `speed` and `pitch` parameters only work in Sherpa backend (`zh_en`/`en` mode). Qwen3-TTS (`multilanguage` mode) does not support speed/pitch adjustment — these are Sherpa-specific capabilities.
 
 ### TTS Streaming (HTTP)
 
@@ -272,12 +281,12 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English) or `en` (English only) |
+| `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English), `en` (English only), or `multilanguage` (Qwen3, 52 langs) |
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
-| `TTS_DEFAULT_SID` | `52` | Default TTS speaker ID (52=af_cute, 3=af_heart) |
-| `TTS_DEFAULT_SPEED` | `1.0` | TTS playback speed |
+| `TTS_DEFAULT_SID` | `52` | Default TTS speaker ID (52=af_cute, 3=af_heart) — Sherpa only |
+| `TTS_DEFAULT_SPEED` | `1.0` | TTS playback speed — **Sherpa only** |
 | `TTS_NUM_THREADS` | `4` | TTS inference threads |
-| `TTS_PITCH_SHIFT` | `0` | Pitch shift in semitones (e.g. `2` = higher, `-2` = lower) |
+| `TTS_PITCH_SHIFT` | `0` | Pitch shift in semitones — **Sherpa only** |
 | `SENSEVOICE_LANGUAGE` | `auto` | SenseVoice language hint |
 | `STREAMING_ASR_PROVIDER` | `cuda` | Streaming ASR execution provider |
 | `MODEL_DIR` | `/opt/models` | Model storage directory |
@@ -295,6 +304,8 @@ Auto-downloaded on first start and cached in a Docker volume:
 | Zipformer streaming en | ~65 MB | `en` | Streaming ASR (English only) |
 | Kokoro TTS v1.0 | ~719 MB | `en` | TTS synthesis (English, 53 speakers) |
 | SenseVoice zh-en-ja-ko-yue | ~500 MB | both | Offline ASR (5 languages) |
+| Qwen3-TTS 0.6B + TRT engines | ~2.5 GB | `multilanguage` | TTS + voice clone (52 languages) |
+| Qwen3-ASR encoder + decoder | ~1.5 GB | `multilanguage` | ASR (52 languages, streaming) |
 
 ## Patched sherpa-onnx
 
@@ -340,11 +351,11 @@ jetson-voice/
 
 ### v3.0-slim
 
-- **95% smaller image** — 898 MB vs 17.7 GB. Multi-stage build extracts only the runtime Python packages (onnxruntime + sherpa-onnx) from the full build image into an `ubuntu:22.04` base
+- **95% smaller image** — 898 MB vs 17.7 GB. Multi-stage build extracts only the runtime Python packages (onnxruntime + sherpa-onnx) from v2.2 into an `ubuntu:22.04` base
 - **Host GPU library mounts** — CUDA/TensorRT/cuDNN libraries are bind-mounted from the host JetPack installation instead of baked into the image, improving cross-JetPack version compatibility
 - **Same performance** — identical TTS/ASR latency and CUDA provider support (TRT + CUDA + CPU)
 
-> **Note:** v3.0-slim requires host GPU lib mounts at runtime (see Quick Start). This is standard practice for Jetson containers and matches the pattern used by vision-trt and other optimized images.
+> **Note:** v3.0-slim is derived from v2.2 (the full image). There is no standalone v3.0 fat image — `v3.0-slim` is the current production release. This version requires host GPU lib mounts at runtime (see Quick Start). This is standard practice for Jetson containers and matches the pattern used by vision-trt and other optimized images.
 
 ### v2.2
 
