@@ -1526,6 +1526,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
   int D = hidden_dim_;
   int n_groups = cp_out_groups_;  // 15
+  const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
   // Use a fixed seed derived from time for this frame, sequence from counter
   unsigned long long rng_seed =
@@ -1558,7 +1559,13 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
     pctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), d_kv_b_[2*i]);
     pctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), d_kv_b_[2*i+1]);
   }
-  pctx->setTensorAddress("logits_all", d_logits_all_);
+  pctx->setTensorAddress(logits_out_name, d_logits_all_);
+  if (is_single_head_) {
+    int64_t gs = 0;
+    CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+    pctx->setTensorAddress("gen_step", d_gen_step_);
+  }
 
   bool ok = pctx->enqueueV3(stream_);
   if (!ok) {
@@ -1584,7 +1591,10 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   dctx->setTensorAddress("inputs_embeds", d_embeds_);
   dctx->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
   dctx->setTensorAddress("cache_position", d_cache_pos_single_);
-  dctx->setTensorAddress("logits_all", d_logits_decode_);
+  dctx->setTensorAddress(logits_out_name, d_logits_decode_);
+  if (is_single_head_) {
+    dctx->setTensorAddress("gen_step", d_gen_step_);
+  }
 
   // ---- Steps 1-14: Decode (seq_len=1, past_len grows) ----
   // NOTE: No per-step sync — all 14 decode steps queued async on stream.
@@ -1608,6 +1618,12 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
       dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
       dctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), (*kv_write)[2*i]);
       dctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), (*kv_write)[2*i+1]);
+    }
+
+    if (is_single_head_) {
+      int64_t gs = j;
+      CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                 cudaMemcpyHostToDevice, stream_));
     }
 
     ok = dctx->enqueueV3(stream_);
@@ -1660,6 +1676,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
 void TRTCPKVEngine::RunFrame(const float* hidden, const float* primary_emb,
                               float* logits_out) {
   auto* ctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
+  const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
   // H2D: copy [hidden, primary_emb] → d_embeds_ [1, 2, D]
   size_t d_bytes = hidden_dim_ * sizeof(float);
@@ -1695,7 +1712,13 @@ void TRTCPKVEngine::RunFrame(const float* hidden, const float* primary_emb,
     ctx->setTensorAddress(new_vn.c_str(), d_kv_out_[2 * i + 1]);
   }
 
-  ctx->setTensorAddress("logits_all", d_logits_all_);
+  ctx->setTensorAddress(logits_out_name, d_logits_all_);
+  if (is_single_head_) {
+    int64_t gs = 0;
+    CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+    ctx->setTensorAddress("gen_step", d_gen_step_);
+  }
 
   if (profiling_) {
     CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
