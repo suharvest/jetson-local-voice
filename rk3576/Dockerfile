@@ -28,6 +28,7 @@ ENV LANG=C.UTF-8
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     libsndfile1 \
+    libgomp1 \
     espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
