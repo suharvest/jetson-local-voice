@@ -1,11 +1,16 @@
 """
-Qwen3-ASR Engine: RKNN encoder + RKLLM decoder pipeline for RK3576/RK3588.
+Qwen3-ASR Engine: RKNN encoder + RKLLM/Matmul decoder pipeline for RK3576/RK3588.
 
 Provides:
   - ``transcribe()``: Batch transcription with sliding-window memory.
   - ``create_stream()``: Streaming session (see ``stream.StreamSession``).
+
+Decoder options:
+  - RKLLM (default): Uses librkllmrt.so, ~16ms/token
+  - Matmul: Uses RKNN matmul API, ~16ms/token, no RKLLM/RKNN conflict
 """
 
+import os
 import time
 import numpy as np
 from pathlib import Path
@@ -13,7 +18,6 @@ from typing import Optional, Callable
 
 from .config import SAMPLE_RATE
 from .encoder import RknnEncoder
-from .decoder import RKLLMDecoder
 from .utils import load_audio
 from .stream import StreamSession
 
@@ -52,6 +56,7 @@ class Qwen3ASREngine:
                  decoder_quant: str = "w4a16_g128",
                  encoder_quant: str = "fp16",
                  encoder_sizes: list = None,
+                 npu_core_mask: str = "NPU_CORE_0_1",
                  enabled_cpus: int = 2,
                  max_context_len: int = 4096,
                  max_new_tokens: int = 500,
@@ -63,11 +68,13 @@ class Qwen3ASREngine:
                  presence_penalty: float = 0.0,
                  embed_flash: int = 1,
                  compact_suffix: bool = True,
+                 decoder_type: str = "rkllm",
+                 decoder_exec_mode: str = "dual_core",
                  decoder_callback: Callable = None,
                  verbose: bool = True):
         """
         Initialize the ASR engine.
-        
+
         Args:
             model_dir: Root model directory
             platform: "rk3576" or "rk3588"
@@ -88,6 +95,8 @@ class Qwen3ASREngine:
             presence_penalty: Presence penalty
             embed_flash: Flash embedding mode (1 = enabled)
             compact_suffix: Use compact suffix prompt (saves ~120ms)
+            decoder_type: "rkllm" (default) or "matmul" (no RKLLM conflict)
+            decoder_exec_mode: "single_core" or "dual_core" (matmul only)
             decoder_callback: Optional callback(text, is_finish) for streaming
             verbose: Print loading progress
         """
@@ -131,19 +140,22 @@ class Qwen3ASREngine:
         if self.vad_model_path and verbose:
             print(f"  VAD model: {vad_path}")
 
-        # Decoder model: check decoder/ then rkllm/ directory
+        # Decoder model: check decoder/ then rkllm/ directory (only for rkllm type)
         decoder_dir = model_dir / "decoder"
         if not decoder_dir.exists():
             decoder_dir = model_dir / "rkllm"
-        decoder_path = self._find_file(
-            decoder_dir, f"*qwen3*{decoder_quant}*{platform}*rkllm",
-            "decoder model", required=False
-        )
-        if decoder_path is None:
+        if decoder_type != "matmul":
             decoder_path = self._find_file(
-                decoder_dir, f"*{decoder_quant}*{platform}*rkllm",
-                "decoder model"
+                decoder_dir, f"*qwen3*{decoder_quant}*{platform}*rkllm",
+                "decoder model", required=False
             )
+            if decoder_path is None:
+                decoder_path = self._find_file(
+                    decoder_dir, f"*{decoder_quant}*{platform}*rkllm",
+                    "decoder model"
+                )
+        else:
+            decoder_path = None
 
         # Embedding table: check embed_tokens.npy or embd/ directory
         embd_path = model_dir / "embed_tokens.npy"
@@ -156,8 +168,8 @@ class Qwen3ASREngine:
         if tokenizer_path is None:
             tokenizer_path = self._find_tokenizer(model_dir)
 
-        # Lib path
-        if lib_path is None:
+        # Lib path (only needed for rkllm decoder)
+        if decoder_type != "matmul" and lib_path is None:
             lib_dir = model_dir.parent / "lib"
             if not lib_dir.exists():
                 lib_dir = model_dir / ".." / "lib"
@@ -169,6 +181,7 @@ class Qwen3ASREngine:
             print(f"\nLoading encoder...")
         self.encoder = RknnEncoder(
             str(encoder_dir), str(mel_path),
+            npu_core_mask=npu_core_mask,
             sizes=encoder_sizes,
         )
         self.max_chunk_seconds = self.encoder.max_seconds
@@ -194,23 +207,48 @@ class Qwen3ASREngine:
         n_keep = len(self._prefix_tokens)
 
         if verbose:
-            print(f"Loading decoder (n_keep={n_keep})...")
-        self.decoder = RKLLMDecoder(
-            model_path=str(decoder_path),
-            lib_path=str(lib_path),
-            max_context_len=max_context_len,
-            max_new_tokens=max_new_tokens,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            repeat_penalty=repeat_penalty,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            enabled_cpus=enabled_cpus,
-            embed_flash=embed_flash,
-            n_keep=n_keep,
-            callback_fn=decoder_callback,
-        )
+            print(f"Loading decoder (n_keep={n_keep}, type={decoder_type})...")
+
+        self.decoder_type = decoder_type
+
+        if decoder_type == "matmul":
+            # Use MatmulDecoder from rknn-matmul-parallel (no RKLLM conflict).
+            # Config is read from config.json in the weights directory.
+            # Weights dir: MATMUL_WEIGHTS_DIR env > model_dir/decoder/matmul/ > model_dir
+            from .matmul_decoder import MatmulDecoder
+            self.decoder = MatmulDecoder(
+                model_path=str(model_dir),
+                tokenizer=self.tokenizer,
+                max_context_len=max_context_len,
+                max_new_tokens=max_new_tokens,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repeat_penalty=repeat_penalty,
+                enabled_cpus=enabled_cpus,
+                exec_mode=decoder_exec_mode,
+                quant_type=os.environ.get("MATMUL_QUANT_TYPE", "int4"),
+                callback_fn=decoder_callback,
+            )
+        else:
+            # Use RKLLMDecoder (default)
+            from .decoder import RKLLMDecoder
+            self.decoder = RKLLMDecoder(
+                model_path=str(decoder_path),
+                lib_path=str(lib_path),
+                max_context_len=max_context_len,
+                max_new_tokens=max_new_tokens,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repeat_penalty=repeat_penalty,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                enabled_cpus=enabled_cpus,
+                embed_flash=embed_flash,
+                n_keep=n_keep,
+                callback_fn=decoder_callback,
+            )
 
         # KV cache reuse disabled — EMBED mode has RoPE position mismatch.
         self._prefix_kv_cached = False
@@ -220,7 +258,7 @@ class Qwen3ASREngine:
             print(f"\n=== Engine ready in {load_time:.1f}s ===")
             print(f"  Encoder sizes: {self.encoder.available_sizes} "
                   f"({self.encoder.mode})")
-            print(f"  Decoder: {enabled_cpus} CPUs, "
+            print(f"  Decoder: {decoder_type} ({decoder_exec_mode if decoder_type == 'matmul' else f'{enabled_cpus} CPUs'}), "
                   f"max_new_tokens={max_new_tokens}")
             print(f"  Embedding: {self.embedding_table.shape}")
             print(f"  Prefix KV cache: {len(self._prefix_tokens)} tokens"

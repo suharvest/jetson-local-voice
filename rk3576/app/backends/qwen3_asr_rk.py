@@ -1,7 +1,11 @@
 """Qwen3-ASR RK3576 backend: wraps qwen3asr library as ASRBackend.
 
-NPU access (encoder + decoder) is serialized via a module-level lock
-shared with the TTS backend to prevent contention on RK3576.
+With decoder_type="matmul", the decoder runs on CPU and there is no NPU
+contention with the TTS vocoder, so the NPU lock is not used by ASR.
+
+With decoder_type="rkllm", the RKLLM decoder uses the NPU and must hold the
+NPU lock while running to avoid contention with the Matcha/Vocos TTS RKNN
+models. The lock is shared across both backends via get_npu_lock().
 """
 
 from __future__ import annotations
@@ -63,22 +67,33 @@ class Qwen3ASRRKBackend(ASRBackend):
         from qwen3asr import Qwen3ASREngine
 
         model_dir = os.environ.get("ASR_MODEL_DIR", "/opt/asr/models")
-        logger.info("Loading Qwen3-ASR engine from %s", model_dir)
+        decoder_type = os.environ.get("ASR_DECODER_TYPE", "matmul")
+        logger.info("Loading Qwen3-ASR engine from %s (decoder_type=%s)", model_dir, decoder_type)
 
-        # lib_path: librkllmrt.so is installed in /usr/lib/ inside the container
-        lib_path = os.environ.get("RKLLM_LIB_PATH", "/usr/lib/librkllmrt.so")
+        # lib_path: only needed when decoder_type="rkllm"; ignored by matmul decoder.
+        # Still pass it for backward compat if the env var is set.
+        lib_path = os.environ.get("RKLLM_LIB_PATH")
 
-        self._engine = Qwen3ASREngine(
+        engine_kwargs = dict(
             model_dir=model_dir,
             platform="rk3576",
-            lib_path=lib_path,
-            decoder_quant="w4a16",      # decoder_hf.w4a16.rk3576.rkllm
+            decoder_type=decoder_type,
+            decoder_exec_mode=os.environ.get("MATMUL_EXEC_MODE", "dual_core"),
+            decoder_quant="w4a16",      # decoder_hf.w4a16.rk3576.rkllm / matmul weights
             encoder_sizes=[4],          # 4s encoder only — saves NPU memory
             enabled_cpus=2,
             repeat_penalty=1.15,
             compact_suffix=True,
             verbose=True,
+            npu_core_mask="NPU_CORE_1",  # Reserve NPU_CORE_0 for TTS vocoder
         )
+        if lib_path:
+            engine_kwargs["lib_path"] = lib_path
+
+        self._engine = Qwen3ASREngine(**engine_kwargs)
+        self._use_npu_lock = (decoder_type == "rkllm")
+        if self._use_npu_lock:
+            logger.info("NPU lock enabled for RKLLM decoder (shared with TTS).")
         self._ready = True
         logger.info("Qwen3-ASR RK backend ready.")
 
@@ -89,8 +104,18 @@ class Qwen3ASRRKBackend(ASRBackend):
         audio = self._decode_audio(audio_bytes)
         lang_hint = None if language == "auto" else language
 
-        lock = get_npu_lock()
-        with lock:
+        if self._use_npu_lock:
+            # RKLLM decoder uses NPU — serialize with TTS RKNN models.
+            with get_npu_lock():
+                result = self._engine.transcribe(
+                    audio=audio,
+                    language=lang_hint,
+                    chunk_size=4.0,
+                    memory_num=2,
+                    rollback_tokens=2,
+                )
+        else:
+            # matmul decoder runs on CPU, no NPU contention.
             result = self._engine.transcribe(
                 audio=audio,
                 language=lang_hint,
@@ -118,7 +143,7 @@ class Qwen3ASRRKBackend(ASRBackend):
             memory_num=2,
             rollback_tokens=2,
         )
-        return Qwen3ASRRKStream(stream_session)
+        return Qwen3ASRRKStream(stream_session, use_npu_lock=self._use_npu_lock)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -150,9 +175,9 @@ class Qwen3ASRRKBackend(ASRBackend):
 class Qwen3ASRRKStream(ASRStream):
     """Wraps StreamSession as ASRStream interface."""
 
-    def __init__(self, stream_session):
+    def __init__(self, stream_session, use_npu_lock: bool = False):
         self._stream = stream_session
-        self._lock = get_npu_lock()
+        self._use_npu_lock = use_npu_lock
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         """Feed float32 audio (already in [-1,1]) into stream."""
@@ -164,11 +189,13 @@ class Qwen3ASRRKStream(ASRStream):
         if sample_rate != 16000:
             audio = _resample(audio, sample_rate, 16000)
 
-        with self._lock:
-            self._stream.feed_audio(audio)
+        self._stream.feed_audio(audio)
 
     def finalize(self) -> str:
-        with self._lock:
+        if self._use_npu_lock:
+            with get_npu_lock():
+                result = self._stream.finish()
+        else:
             result = self._stream.finish()
         return result["text"]
 

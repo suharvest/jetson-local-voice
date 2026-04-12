@@ -297,7 +297,7 @@ class RKLLMDecoder:
 
         # CPU affinity
         cpu_mask = CPU_MASKS.get(enabled_cpus, 0xC0)
-        param.extend_param.base_domain_id = 0
+        param.extend_param.base_domain_id = 1  # Domain 1 to coexist with RKNN models (domain 0)
         param.extend_param.embed_flash = embed_flash
         param.extend_param.enabled_cpus_num = enabled_cpus
         param.extend_param.enabled_cpus_mask = cpu_mask

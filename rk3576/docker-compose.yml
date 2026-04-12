@@ -7,16 +7,32 @@ services:
     image: rk3576-speech:latest
     container_name: rk3576-speech
     privileged: true
+    init: true
     network_mode: host
+    mem_limit: 7500m
+    memswap_limit: 7500m
     volumes:
       - /dev:/dev
-      - /home/cat/qwen3-tts-rknn:/opt/tts/models:ro
-      - /home/cat/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:/opt/tts/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:ro
-      - /home/cat/cp_weights:/opt/tts/models/cp_weights:ro
+      - /home/cat/models/matcha-icefall-zh-en:/opt/tts/models/matcha-icefall-zh-en:ro
+      - /home/cat/models/matcha-zh-en.rknn:/opt/tts/models/matcha-zh-en.rknn:ro
+      - /home/cat/models/vocos-16khz-univ-w4a16.rknn:/opt/tts/models/vocos-16khz-univ-w4a16.rknn:ro
+      - /home/cat/matcha-data:/home/cat/matcha-data:ro
       - /home/cat/qwen3-asr-models:/opt/asr/models:ro
+      - /home/cat/project/rknn-matmul-parallel:/opt/rknn-matmul-parallel:ro
+      - /home/cat/piper-models:/opt/piper-models:ro
     restart: unless-stopped
     environment:
       - MODEL_DIR=/opt/tts/models
-      - TTS_BACKEND=qwen3_rknn
+      - TTS_BACKEND=matcha_rknn
+      - TTS_MODEL_DIR=/opt/tts/models
       - ASR_BACKEND=qwen3_asr_rk
+      - ASR_DECODER_TYPE=matmul
       - ASR_MODEL_DIR=/opt/asr/models
+      - PYTHONPATH=/opt/rknn-matmul-parallel
+      - MATCHA_MAX_PHONEMES=256
+      # Piper RKNN backend (activate by setting TTS_BACKEND=piper_rknn)
+      - PIPER_MODEL_DIR=/opt/piper-models
+      - PIPER_LANGUAGES=en_US,zh_CN,de_DE,fr_FR,ja_JP
+      - PIPER_DEFAULT_LANG=en_US
+      # Japanese CPU fallback (sherpa-onnx Kokoro v1.0); voices: jf_alpha jf_gongitsune jf_nezumi jf_tebukuro jm_kumo
+      - KOKORO_VOICE=jf_alpha

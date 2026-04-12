@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Iterator, Optional
+
+import numpy as np
 
 from tts_backend import TTSBackend
 
@@ -68,6 +70,47 @@ class Qwen3RKNNBackend(TTSBackend):
                 speed=speed or 1.0,
             )
 
+    def synthesize_stream(
+        self,
+        text: str,
+        speaker_id: int = 0,
+        speed: Optional[float] = None,
+        pitch_shift: Optional[float] = None,
+        **kwargs,
+    ) -> Iterator[tuple[np.ndarray, dict]]:
+        if self._service is None:
+            raise RuntimeError("Backend not loaded — call preload() first")
+
+        # Serialize NPU access with ASR backend if it is loaded
+        try:
+            from backends.qwen3_asr_rk import get_npu_lock
+            lock = get_npu_lock()
+        except ImportError:
+            lock = None
+
+        if lock is not None:
+            with lock:
+                yield from self._service.synthesize_stream(
+                    text=text,
+                    speaker_id=speaker_id,
+                    speed=speed or 1.0,
+                )
+        else:
+            yield from self._service.synthesize_stream(
+                text=text,
+                speaker_id=speaker_id,
+                speed=speed or 1.0,
+            )
+
     def get_sample_rate(self) -> int:
         from tts_service import SAMPLE_RATE
         return SAMPLE_RATE
+
+    def cleanup(self) -> None:
+        """Release RKNN/RKLLM resources."""
+        if self._service is not None:
+            try:
+                self._service.cleanup()
+            except Exception as e:
+                logger.warning("TTSService cleanup error: %s", e)
+            self._service = None

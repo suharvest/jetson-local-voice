@@ -1,15 +1,22 @@
 # RK3576 Speech Service Docker Container (TTS + ASR)
 #
+# TTS: Matcha-icefall-zh-en (RKNN NPU) + Vocos vocoder (RKNN NPU)
+# ASR: Qwen3-ASR encoder (RKNN NPU) + matmul decoder (rknn-matmul-parallel)
+#
 # Build on cat-remote (aarch64):
 #   docker build --network=host -t rk3576-speech -f Dockerfile .
 #
-# Run (--network=host required because RK3576 kernel lacks iptable_raw):
+# Prereqs on host:
+#   cd ~/project/rknn-matmul-parallel && make python   # builds matmul_decoder .so
+#
+# Run via docker-compose (see docker-compose.yml) or manually:
 #   docker run --privileged --network=host \
 #     -v /dev:/dev \
-#     -v /home/cat/qwen3-tts-rknn:/opt/tts/models:ro \
-#     -v /home/cat/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:/opt/tts/models/talker_fullvocab_fixed_w4a16_rk3576.rkllm:ro \
+#     -v /home/cat/models:/opt/tts/models:ro \
 #     -v /home/cat/qwen3-asr-models:/opt/asr/models:ro \
-#     -e ASR_BACKEND=qwen3_asr_rk \
+#     -v /home/cat/rknn-matmul-parallel:/opt/rknn-matmul-parallel:ro \
+#     -e TTS_BACKEND=matcha_rknn -e ASR_BACKEND=qwen3_asr_rk \
+#     -e ASR_DECODER_TYPE=matmul -e PYTHONPATH=/opt/rknn-matmul-parallel \
 #     rk3576-speech
 
 FROM debian:12-slim
@@ -17,11 +24,11 @@ FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# System deps (gcc for C engine compilation)
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     libsndfile1 \
-    gcc libc6-dev \
+    espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 # Python venv
@@ -43,6 +50,10 @@ RUN pip install --no-cache-dir \
     transformers \
     tokenizers
 
+RUN pip install --no-cache-dir pybind11
+
+RUN pip install --no-cache-dir sherpa-onnx
+
 # RKNN toolkit lite2 (aarch64 wheel from PyPI)
 RUN pip install --no-cache-dir \
     rknn-toolkit-lite2
@@ -52,29 +63,24 @@ COPY librkllmrt.so /usr/lib/librkllmrt.so
 COPY librknnrt.so /usr/lib/librknnrt.so
 RUN ldconfig
 
-RUN mkdir -p /opt/tts/models /opt/tts/lib /opt/asr/models
+RUN mkdir -p /opt/tts/models /opt/asr/models
 
-# C engine: compile cp_engine (W8A16 mode, requires .int8.bin + .scales.bin weights)
-# W8A16 uses per-column INT8 quantization via RKNN NPU matmul (~2x speedup vs FP16).
-COPY engine/ /opt/tts/engine/
-RUN cd /opt/tts/engine && \
-    gcc -O2 -fPIC -Wall -Wno-unused-result -march=armv8-a+fp16 \
-    -DCP_USE_W8A16 \
-    -I/opt/tts/engine/include \
-    -shared -o /opt/tts/lib/libcp_engine.so \
-    cp_engine.c \
-    -lrknnrt -lm && \
-    ldconfig || echo "WARNING: cp_engine.so build failed (non-fatal, C engine not used yet)"
+# matmul_decoder C extension: pre-built on host from ~/project/rknn-matmul-parallel
+# and mounted via docker-compose volume. See: make python in that repo.
+
+# Scripts (extract_codec_embed_table.py etc.)
+COPY scripts/ /opt/app/scripts/
 
 # Application code
 COPY app/ /opt/tts/app/
 
 ENV MODEL_DIR=/opt/tts/models
-ENV TTS_BACKEND=qwen3_rknn
+ENV TTS_BACKEND=matcha_rknn
+ENV TTS_MODEL_DIR=/opt/tts/models
 ENV ASR_MODEL_DIR=/opt/asr/models
 # ASR_BACKEND is intentionally unset here — enable at runtime via env var
 # e.g. -e ASR_BACKEND=qwen3_asr_rk
-ENV LD_LIBRARY_PATH=/opt/tts/lib:/usr/lib
+ENV LD_LIBRARY_PATH=/usr/lib
 WORKDIR /opt/tts/app
 EXPOSE 8621
 

@@ -16,7 +16,9 @@ import asyncio
 import logging
 import os
 import queue
+import signal
 import struct
+import sys
 
 import numpy as np
 from fastapi import FastAPI, File, Query, UploadFile, WebSocket
@@ -29,6 +31,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _signal_handler(signum, frame):
+    logger.info("Signal %d received, shutting down...", signum)
+    # FastAPI shutdown event will handle NPU resource cleanup
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
 app = FastAPI(title="RK3576 Speech Service", version="3.0.0")
 
 _backend = None
@@ -40,29 +52,31 @@ class TTSRequest(BaseModel):
     sid: int | None = None
     speed: float | None = None
     pitch: float | None = None
+    language: str | None = None  # e.g. "en_US", "zh_CN", "ja_JP", or None for auto-detect
 
 
 @app.on_event("startup")
 async def startup():
     global _backend, _asr_backend
 
-    # --- TTS (required) ---
-    from tts_backend import create_backend
-
-    backend_name = os.environ.get("TTS_BACKEND", "qwen3_rknn")
-    logger.info("Loading TTS backend: %s", backend_name)
-
-    try:
-        _backend = create_backend(backend_name)
-        _backend.preload()
-        logger.info("TTS backend '%s' ready.", _backend.name)
-    except Exception as e:
-        logger.error("Failed to load TTS backend '%s': %s", backend_name, e)
-        raise
+    # --- TTS (optional) ---
+    tts_backend_name = os.environ.get("TTS_BACKEND", "")
+    if tts_backend_name and tts_backend_name != "disabled":
+        logger.info("Loading TTS backend: %s", tts_backend_name)
+        try:
+            from tts_backend import create_backend
+            _backend = create_backend(tts_backend_name)
+            _backend.preload()
+            logger.info("TTS backend '%s' ready.", _backend.name)
+        except Exception as e:
+            logger.error("Failed to load TTS backend '%s': %s — TTS disabled", tts_backend_name, e)
+            _backend = None
+    else:
+        logger.info("TTS_BACKEND not set or disabled — TTS disabled.")
 
     # --- ASR (optional) ---
     asr_backend_name = os.environ.get("ASR_BACKEND", "")
-    if asr_backend_name:
+    if asr_backend_name and asr_backend_name != "disabled":
         logger.info("Loading ASR backend: %s", asr_backend_name)
         try:
             from asr_backend import create_asr_backend
@@ -74,6 +88,27 @@ async def startup():
             _asr_backend = None
     else:
         logger.info("ASR_BACKEND not set — ASR disabled.")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Gracefully destroy NPU resources to prevent zombie threads."""
+    global _backend, _asr_backend
+    logger.info("Shutting down — releasing NPU resources...")
+
+    if _backend and hasattr(_backend, 'cleanup'):
+        try:
+            _backend.cleanup()
+        except Exception as e:
+            logger.warning("TTS cleanup error: %s", e)
+
+    if _asr_backend and hasattr(_asr_backend, 'cleanup'):
+        try:
+            _asr_backend.cleanup()
+        except Exception as e:
+            logger.warning("ASR cleanup error: %s", e)
+
+    logger.info("Shutdown complete.")
 
 
 @app.get("/health")
@@ -102,6 +137,7 @@ async def tts(req: TTSRequest):
             speaker_id=req.sid or 0,
             speed=req.speed,
             pitch_shift=req.pitch,
+            language=req.language,
         ),
     )
     return Response(
@@ -123,37 +159,42 @@ async def tts_stream_options():
 
 @app.post("/tts/stream")
 async def tts_stream(req: TTSRequest):
-    """Stream TTS as raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks."""
+    """Stream TTS as raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks.
+
+    Uses real streaming: yields audio as soon as the first 10 AR frames are vocoded
+    (~1.3s AR + ~250ms vocoder ≈ 1.6s TTFT), then continues in 25-frame chunks.
+    """
     if not _backend or not _backend.is_ready():
         return JSONResponse({"error": "TTS not ready"}, status_code=503)
 
-    audio_queue: queue.Queue[bytes | None] = queue.Queue()
     sr = _backend.get_sample_rate()
 
-    def _generate():
-        wav_bytes, meta = _backend.synthesize(
-            text=req.text,
-            speaker_id=req.sid or 0,
-            speed=req.speed,
-            pitch_shift=req.pitch,
-        )
-        import io
-        import soundfile as sf
-        import numpy as np
-
-        buf = io.BytesIO(wav_bytes)
-        data, _ = sf.read(buf, dtype="int16")
-        chunk_size = 4800  # 400ms at 12kHz
-        for i in range(0, len(data), chunk_size):
-            audio_queue.put(data[i: i + chunk_size].tobytes())
-        audio_queue.put(None)
-
     async def stream():
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _generate)
         yield struct.pack("<I", sr)
+        loop = asyncio.get_event_loop()
+
+        q: queue.Queue[bytes | None] = queue.Queue()
+
+        def _generate():
+            try:
+                for audio_chunk, meta in _backend.synthesize_stream(
+                    text=req.text,
+                    speaker_id=req.sid or 0,
+                    speed=req.speed,
+                    pitch_shift=req.pitch,
+                    language=req.language,
+                ):
+                    pcm = (np.clip(audio_chunk * 32767, -32768, 32767)
+                           .astype(np.int16))
+                    q.put(pcm.tobytes())
+            except Exception as exc:
+                logger.error("TTS stream generation error: %s", exc)
+            finally:
+                q.put(None)
+
+        loop.run_in_executor(None, _generate)
         while True:
-            chunk = await loop.run_in_executor(None, audio_queue.get)
+            chunk = await loop.run_in_executor(None, q.get)
             if chunk is None:
                 break
             yield chunk
