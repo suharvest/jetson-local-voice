@@ -25,6 +25,10 @@ SAMPLE_RATE = 16000
 N_FFT = 1024
 HOP_LENGTH = 256
 MAX_SEQ_LEN = int(os.environ.get('MATCHA_MAX_PHONEMES', '96'))
+# RKNN model compiled input sequence length (must match the shape used during
+# rknn.build()).  All tensor inputs to the Matcha RKNN model are padded to
+# this length so that byte sizes match the static-shape expectations.
+MATCHA_MODEL_SEQ_LEN = int(os.environ.get('MATCHA_MODEL_SEQ_LEN', '256'))
 
 
 class RKNNMatchaVocoder:
@@ -46,12 +50,16 @@ class RKNNMatchaVocoder:
 
         # 加载后的模型
         self._matcha = None
+        self._matcha_backend = None  # 'rknn' or 'ort'
         self._vocos = None
         self._lexicon = None
         self._token_to_id = None
 
     def load(self):
         """加载所有模型和资源"""
+        import logging
+        log = logging.getLogger(__name__)
+
         from rknnlite.api import RKNNLite
 
         # 加载 lexicon
@@ -71,14 +79,54 @@ class RKNNMatchaVocoder:
                     # token ID = 行号 + 1 (1-indexed)
                     self._token_to_id[parts[0]] = i + 1
 
-        # 加载 Matcha RKNN
-        self._matcha = RKNNLite(verbose=False)
-        ret = self._matcha.load_rknn(self.matcha_rknn_path)
-        if ret != 0:
-            raise RuntimeError(f"加载 Matcha RKNN 失败: ret={ret}")
-        ret = self._matcha.init_runtime(core_mask=1)  # NPU_CORE_0 only; CORE_1 reserved for ASR encoder
-        if ret != 0:
-            raise RuntimeError(f"初始化 Matcha RKNN 运行时失败: ret={ret}")
+        # 加载 Matcha 声学模型 — 优先 RKNN，回退 ORT (CPU)
+        # Look for ONNX fallback: same name with .onnx, or model-steps-3.onnx
+        # in the same directory or a well-known location.
+        matcha_onnx_path = self.matcha_rknn_path.replace('.rknn', '.onnx')
+        if not os.path.exists(matcha_onnx_path):
+            # Try model-steps-3.onnx in same directory
+            alt = os.path.join(os.path.dirname(self.matcha_rknn_path), 'model-steps-3.onnx')
+            if os.path.exists(alt):
+                matcha_onnx_path = alt
+            else:
+                # Try MATCHA_ONNX_PATH env override
+                matcha_onnx_path = os.environ.get('MATCHA_ONNX_PATH', matcha_onnx_path)
+        use_ort = os.environ.get('MATCHA_USE_ORT', '').lower() in ('1', 'true', 'yes')
+
+        if not use_ort and os.path.exists(self.matcha_rknn_path):
+            try:
+                self._matcha = RKNNLite(verbose=False)
+                ret = self._matcha.load_rknn(self.matcha_rknn_path)
+                if ret != 0:
+                    raise RuntimeError(f"load_rknn ret={ret}")
+                ret = self._matcha.init_runtime(core_mask=1)
+                if ret != 0:
+                    raise RuntimeError(f"init_runtime ret={ret}")
+                self._matcha_backend = 'rknn'
+                log.info("Matcha acoustic model loaded via RKNN")
+            except Exception as e:
+                log.warning("Matcha RKNN load failed (%s), trying ORT fallback", e)
+                if self._matcha is not None:
+                    try:
+                        self._matcha.release()
+                    except Exception:
+                        pass
+                self._matcha = None
+
+        if self._matcha is None and os.path.exists(matcha_onnx_path):
+            import onnxruntime as ort
+            self._matcha = ort.InferenceSession(
+                matcha_onnx_path,
+                providers=['CPUExecutionProvider'],
+            )
+            self._matcha_backend = 'ort'
+            log.info("Matcha acoustic model loaded via ORT (CPU): %s", matcha_onnx_path)
+
+        if self._matcha is None:
+            raise RuntimeError(
+                f"无法加载 Matcha 声学模型: RKNN={self.matcha_rknn_path}, "
+                f"ONNX={matcha_onnx_path}"
+            )
 
         # 加载 Vocos RKNN
         self._vocos = RKNNLite(verbose=False)
@@ -92,11 +140,13 @@ class RKNNMatchaVocoder:
     def release(self):
         """释放资源"""
         if self._matcha:
-            try:
-                self._matcha.release()
-            except:
-                pass
+            if self._matcha_backend == 'rknn':
+                try:
+                    self._matcha.release()
+                except Exception:
+                    pass
             self._matcha = None
+            self._matcha_backend = None
         if self._vocos:
             try:
                 self._vocos.release()
@@ -108,38 +158,11 @@ class RKNNMatchaVocoder:
         """
         将文本转换为 token IDs
 
-        使用 sherpa-onnx 的文本前端：
-        1. 中文 → 拼音 (pypinyin/espeak-ng)
-        2. 拼音 → phonemes
-        3. phonemes → token IDs
+        使用 lexicon 查表：
+        1. 中文字/词 → lexicon 查找 phonemes
+        2. phonemes → token IDs
         """
-        import sherpa_onnx
-
-        # 使用 sherpa-onnx 的文本前端
-        # 创建一个最小配置，只用于文本处理
-        config = sherpa_onnx.OfflineTtsConfig(
-            model=sherpa_onnx.OfflineTtsModelConfig(
-                matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-                    acoustic_model="",  # 不需要，但我们得提供路径
-                    vocoder="",
-                    lexicon=self.lexicon_path,
-                    tokens=self.tokens_path,
-                    data_dir=self.data_dir,
-                ),
-                num_threads=1,
-                debug=False,
-            ),
-        )
-
-        # 使用内部方法获取 tokens
-        # sherpa-onnx 没有暴露这个接口，所以我们用另一种方法
-        # 直接生成音频然后丢弃，只为了触发文本处理
-
-        # 实际上，最简单的方法是用完整的 sherpa-onnx 生成，然后对比性能
-        # 但这不是我们想要的
-
-        # 替代方案：简化版文本处理
-        # 对于每个字符，从 lexicon 中查找对应的 phonemes
+        # 简化版文本处理：从 lexicon 中查找对应的 phonemes
         tokens = []
 
         # 处理文本中的每个字符/词
@@ -193,22 +216,33 @@ class RKNNMatchaVocoder:
             mel: Mel 频谱图 [1, 80, T]
             mel_frames: 有效帧数
         """
-        # Pad tokens
         num_tokens = len(tokens)
-        tokens_padded = np.zeros((1, MAX_SEQ_LEN), dtype=np.int64)
-        tokens_padded[0, :num_tokens] = tokens
-
         x_length = np.array([num_tokens], dtype=np.int64)
         noise_scale_arr = np.array([noise_scale], dtype=np.float32)
         length_scale_arr = np.array([length_scale], dtype=np.float32)
 
-        # 生成噪声
-        noise = np.random.randn(1, 80, MAX_SEQ_LEN).astype(np.float32) * 0.3
-
-        # 推理
-        mel = self._matcha.inference(
-            inputs=[tokens_padded, x_length, noise_scale_arr, length_scale_arr, noise]
-        )[0]
+        if self._matcha_backend == 'rknn':
+            # Pad tokens to the RKNN model's compiled static input length.
+            # MAX_SEQ_LEN caps the phoneme count; MATCHA_MODEL_SEQ_LEN is the
+            # tensor dimension the RKNN model was built with (must match exactly).
+            tokens_padded = np.zeros((1, MATCHA_MODEL_SEQ_LEN), dtype=np.int64)
+            tokens_padded[0, :num_tokens] = tokens
+            mel = self._matcha.inference(
+                inputs=[tokens_padded, x_length, noise_scale_arr, length_scale_arr]
+            )[0]
+        else:
+            # ORT fallback — dynamic shapes, no padding needed
+            tokens_padded = np.zeros((1, max(num_tokens, 1)), dtype=np.int64)
+            tokens_padded[0, :num_tokens] = tokens
+            mel = self._matcha.run(
+                None,
+                {
+                    'x': tokens_padded,
+                    'x_length': x_length,
+                    'noise_scale': noise_scale_arr,
+                    'length_scale': length_scale_arr,
+                },
+            )[0]
 
         # 计算有效帧数
         mel_frames = int(num_tokens * 30 * length_scale + 0.5)

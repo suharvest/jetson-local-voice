@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir pybind11
 
-RUN pip install --no-cache-dir sherpa-onnx
+RUN pip install --no-cache-dir sherpa-onnx onnxruntime
 
 # RKNN toolkit lite2 (aarch64 wheel from PyPI)
 RUN pip install --no-cache-dir \

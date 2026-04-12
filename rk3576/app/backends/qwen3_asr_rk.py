@@ -82,6 +82,7 @@ class Qwen3ASRRKBackend(ASRBackend):
             decoder_quant="w4a16",      # decoder_hf.w4a16.rk3576.rkllm / matmul weights
             encoder_sizes=[4],          # 4s encoder only — saves NPU memory
             enabled_cpus=2,
+            max_context_len=int(os.environ.get("RKLLM_MAX_CONTEXT_LEN", "512")),
             repeat_penalty=1.15,
             compact_suffix=True,
             verbose=True,
