@@ -165,25 +165,86 @@ class RKNNMatchaVocoder:
                 pass
             self._vocos = None
 
+    def _phonemize_english(self, text: str) -> list[str]:
+        """
+        Use espeak-ng to convert English text to IPA phonemes.
+
+        Falls back to empty list if espeak-ng is not available.
+        """
+        import subprocess
+        import logging
+        log = logging.getLogger(__name__)
+
+        try:
+            # Use espeak-ng with the data_dir if available
+            cmd = ["espeak-ng", "--ipa", "-v", "en-us", "-q", "--", text]
+            env = os.environ.copy()
+            if self.data_dir and os.path.isdir(self.data_dir):
+                env["ESPEAK_DATA_PATH"] = self.data_dir
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=5, env=env,
+            )
+            if result.returncode != 0:
+                log.warning("espeak-ng failed (rc=%d): %s", result.returncode, result.stderr.strip())
+                return []
+            ipa = result.stdout.strip()
+            if not ipa:
+                return []
+            # Split IPA string into individual phoneme characters/tokens.
+            # espeak-ng outputs IPA with spaces between words and stress marks.
+            # Each IPA character that exists in our token table is a valid phoneme.
+            phonemes = []
+            for ch in ipa:
+                if ch in (' ', '\n', '\t'):
+                    continue
+                phonemes.append(ch)
+            return phonemes
+        except FileNotFoundError:
+            log.warning("espeak-ng not found — English text will be skipped")
+            return []
+        except subprocess.TimeoutExpired:
+            log.warning("espeak-ng timed out")
+            return []
+
     def text_to_tokens(self, text: str) -> list[int]:
         """
         将文本转换为 token IDs
 
-        使用 lexicon 查表：
-        1. 中文字/词 → lexicon 查找 phonemes
-        2. phonemes → token IDs
+        中文：lexicon 查表 → phonemes → token IDs
+        英文：espeak-ng IPA → token IDs
+        混合文本：按语言分段处理
         """
-        # 简化版文本处理：从 lexicon 中查找对应的 phonemes
+        import re
         tokens = []
 
-        # 处理文本中的每个字符/词
-        i = 0
-        while i < len(text):
-            # 跳过标点符号
-            if text[i] in '，。！？、；：""''（）':
-                i += 1
+        # Split text into Chinese and non-Chinese (English/punctuation) segments
+        # Each segment is (is_chinese: bool, text: str)
+        segments = re.findall(r'[\u4e00-\u9fff]+|[A-Za-z][A-Za-z\' ]*[A-Za-z]|[A-Za-z]|[^\u4e00-\u9fffA-Za-z]+', text)
+
+        for seg in segments:
+            seg = seg.strip()
+            if not seg:
                 continue
 
+            # Check if segment is Chinese
+            if re.match(r'^[\u4e00-\u9fff]+$', seg):
+                # Chinese: use lexicon lookup
+                tokens.extend(self._chinese_to_tokens(seg))
+            elif re.match(r'^[A-Za-z]', seg):
+                # English: use espeak-ng phonemization
+                phonemes = self._phonemize_english(seg)
+                for p in phonemes:
+                    if p in self._token_to_id:
+                        tokens.append(self._token_to_id[p])
+            # else: punctuation/whitespace — skip
+
+        return tokens
+
+    def _chinese_to_tokens(self, text: str) -> list[int]:
+        """Convert Chinese text to token IDs via lexicon lookup."""
+        tokens = []
+        i = 0
+        while i < len(text):
             # 尝试匹配最长词
             found = False
             for length in range(min(4, len(text) - i), 0, -1):
@@ -448,8 +509,8 @@ class RKNNMatchaVocoder:
 
         audio = np.concatenate(all_audio) if all_audio else np.zeros(0, dtype=np.float32)
 
-        # 归一化
-        if np.abs(audio).max() > 0:
+        # 归一化 (guard against empty audio)
+        if len(audio) > 0 and np.abs(audio).max() > 0:
             audio = audio / np.abs(audio).max() * 0.95
 
         metadata = {
@@ -556,6 +617,15 @@ class MatchaRKNNBackend:
             **{k: v for k, v in kwargs.items() if k in ("noise_scale",)},
         )
         inference_time = time.perf_counter() - t_start
+
+        # Guard: if no audio was produced (e.g. text yielded no phonemes),
+        # return a short silence instead of crashing downstream.
+        if len(audio) == 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                "No audio produced for text: %r — returning 0.1s silence", text
+            )
+            audio = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.float32)
 
         # Encode float32 audio → WAV bytes
         buf = io.BytesIO()
