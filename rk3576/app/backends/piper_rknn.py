@@ -172,30 +172,40 @@ def phonemes_to_ids(phoneme_str: str, phoneme_id_map: dict) -> list[int]:
 
     Piper's phoneme_id_map uses special tokens:
       "^" = BOS, "$" = EOS, " " = word-separator, "_" = padding/blank
-    Each phoneme maps to a list of IDs.
+
+    VITS requires blank tokens (ID=0, "_") interspersed between every phoneme
+    for the monotonic alignment search to work correctly.
     """
-    ids: list[int] = []
+    # Remove zero-width joiner (espeak-ng 1.52+ uses U+200D in diphthongs)
+    phoneme_str = phoneme_str.replace("\u200d", "")
+
+    pad_id = phoneme_id_map.get("_", [0])[0]
+    ids: list[int] = [pad_id]
 
     # BOS
     if "^" in phoneme_id_map:
         ids.extend(phoneme_id_map["^"])
+        ids.append(pad_id)
 
     # Split on whitespace; each token is either a phoneme or a word boundary
     for token in phoneme_str.split():
         if token in phoneme_id_map:
             ids.extend(phoneme_id_map[token])
+            ids.append(pad_id)
         else:
-            # Try character-by-character fallback
             for ch in token:
                 if ch in phoneme_id_map:
                     ids.extend(phoneme_id_map[ch])
+                    ids.append(pad_id)
         # Word separator
         if " " in phoneme_id_map:
             ids.extend(phoneme_id_map[" "])
+            ids.append(pad_id)
 
     # EOS
     if "$" in phoneme_id_map:
         ids.extend(phoneme_id_map["$"])
+        ids.append(pad_id)
 
     return ids
 
