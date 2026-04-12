@@ -104,6 +104,11 @@ class Qwen3ASRRKBackend(ASRBackend):
         audio = self._decode_audio(audio_bytes)
         lang_hint = None if language == "auto" else language
 
+        # max_new_tokens: For typical ASR (2-10s audio), 50-80 tokens suffice.
+        # The default 500 lets the decoder wander past EOS, producing trailing
+        # garbage (e.g. "你好世界" → "你好世界，你") because EOS logit is weak.
+        max_new_tokens = int(os.environ.get("ASR_MAX_NEW_TOKENS", "80"))
+
         if self._use_npu_lock:
             # RKLLM decoder uses NPU — serialize with TTS RKNN models.
             with get_npu_lock():
@@ -113,6 +118,7 @@ class Qwen3ASRRKBackend(ASRBackend):
                     chunk_size=4.0,
                     memory_num=2,
                     rollback_tokens=2,
+                    max_new_tokens=max_new_tokens,
                 )
         else:
             # matmul decoder runs on CPU, no NPU contention.
@@ -122,6 +128,7 @@ class Qwen3ASRRKBackend(ASRBackend):
                 chunk_size=4.0,
                 memory_num=2,
                 rollback_tokens=2,
+                max_new_tokens=max_new_tokens,
             )
 
         return TranscriptionResult(

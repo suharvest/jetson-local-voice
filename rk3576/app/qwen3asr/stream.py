@@ -10,6 +10,8 @@ import numpy as np
 from collections import deque
 from typing import Optional, Callable
 
+import re
+
 from .config import SAMPLE_RATE
 from .utils import apply_itn, parse_asr_output
 
@@ -386,6 +388,9 @@ class StreamSession:
         else:
             lang, new_text = parse_asr_output(raw_text)
 
+        # Strip trailing garbage tokens (weak EOS → extra 1-3 chars after punct)
+        new_text = self._strip_trailing_garbage(new_text)
+
         if was_aborted:
             new_text = ""
         if self._chunk_id < self.unfixed_chunks:
@@ -426,6 +431,52 @@ class StreamSession:
               f"prefill={perf.get('prefill_time_ms', 0):.0f}ms "
               f"gen_tok={perf.get('generate_tokens', 0)}{rb}"
               f"{tag}{abort} | {new_text[:60]}...", flush=True)
+
+    # Regex patterns for trailing garbage detection.
+    # Pattern 1: sentence-end punct (。？！.?!) + 1-2 garbage chars
+    # Pattern 2: comma/semicolon (，,；) + exactly 1 garbage char
+    # Commas with 2+ chars after them are usually valid (e.g. "你好，世界").
+    _RE_TRAILING_GARBAGE = re.compile(
+        r'(?:[。？！.?!…][^。？！.?!…，,；：:、\s]{1,2}'
+        r'|[，,；][^。？！.?!…，,；：:、\s])$'
+    )
+
+    @staticmethod
+    def _strip_trailing_garbage(text: str) -> str:
+        """
+        Remove trailing garbage tokens after the last meaningful content.
+
+        The RKLLM decoder sometimes generates 1-2 extra tokens past the
+        natural ending because EOS logit is weak.  Observed pattern:
+        sentence-ending punctuation + 1 random character.  Examples:
+          "你好世界，你"       → "你好世界"
+          "今天天气怎么样？铁"  → "今天天气怎么样"
+          "今天天气怎么样？铁。" → "今天天气怎么样"
+
+        Strategy: iteratively strip trailing sentence-end punctuation and
+        [punct + 1 garbage char] patterns.
+
+        Only applied when total text is ≤200 chars (ASR of short utterances).
+        """
+        if not text or len(text) < 2:
+            return text
+        if len(text) > 200:
+            return text
+
+        SENT_END = '。？！.?!…'
+
+        prev = None
+        while text != prev and len(text) >= 2:
+            prev = text
+            # Step 1: Strip trailing sentence-end punctuation
+            text = text.rstrip(SENT_END)
+            if text == prev:
+                # Step 2: Strip [punct + 1 garbage char] at end
+                m = StreamSession._RE_TRAILING_GARBAGE.search(text)
+                if m:
+                    text = text[:m.start()]
+
+        return text
 
     def _apply_rollback(self, text: str) -> str:
         """

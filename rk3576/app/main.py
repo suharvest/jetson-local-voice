@@ -7,6 +7,7 @@ API-compatible with jetson-voice:
   POST /tts/stream  — streaming TTS (PCM chunks)
   POST /asr         — multipart upload -> {"text": ..., "language": ...}
   WS   /asr/stream  — streaming ASR (int16 PCM frames -> JSON)
+  WS   /dialogue    — streaming dialogue (text in -> PCM audio chunks out)
   GET  /health      — health check
 """
 
@@ -45,6 +46,7 @@ app = FastAPI(title="RK3576 Speech Service", version="3.0.0")
 
 _backend = None
 _asr_backend = None
+_dialogue = None
 
 
 class TTSRequest(BaseModel):
@@ -57,7 +59,7 @@ class TTSRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    global _backend, _asr_backend
+    global _backend, _asr_backend, _dialogue
 
     # --- TTS (optional) ---
     tts_backend_name = os.environ.get("TTS_BACKEND", "")
@@ -88,6 +90,12 @@ async def startup():
             _asr_backend = None
     else:
         logger.info("ASR_BACKEND not set — ASR disabled.")
+
+    # --- Dialogue orchestrator (requires TTS) ---
+    if _backend:
+        from dialogue import DialogueOrchestrator
+        _dialogue = DialogueOrchestrator(tts_backend=_backend)
+        logger.info("Dialogue orchestrator ready (echo mode — no LLM).")
 
 
 @app.on_event("shutdown")
@@ -279,6 +287,56 @@ async def asr_stream(
             await ws.send_json({"text": final_text, "is_final": True})
         except Exception:
             pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Dialogue route (streaming pipeline: text → LLM → TTS → audio)
+# ---------------------------------------------------------------------------
+
+@app.websocket("/dialogue")
+async def dialogue_ws(ws: WebSocket):
+    """Streaming dialogue: client sends text, server streams TTS audio back.
+
+    Protocol:
+      1. Client sends JSON: {"text": "用户说的话"}
+      2. Server streams binary: first 4 bytes = sample_rate (uint32 LE),
+         then int16 PCM chunks (one per sentence).
+      3. Server sends JSON: {"done": true, "chunks": N} when finished.
+      4. Client can send another message or close.
+
+    Requires TTS backend to be loaded. LLM is optional (defaults to echo mode).
+    """
+    await ws.accept()
+
+    if not _dialogue:
+        await ws.send_json({"error": "Dialogue not available (TTS not loaded)"})
+        await ws.close()
+        return
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            user_text = msg.get("text", "")
+            if not user_text:
+                await ws.send_json({"error": "empty text"})
+                continue
+
+            logger.info("dialogue: user=%r", user_text[:80])
+            chunk_count = 0
+
+            async for pcm_chunk in _dialogue.process_turn_pcm(user_text):
+                await ws.send_bytes(pcm_chunk)
+                chunk_count += 1
+
+            await ws.send_json({"done": True, "chunks": chunk_count})
+
+    except Exception as exc:
+        logger.debug("Dialogue WS error: %s", exc)
+    finally:
         try:
             await ws.close()
         except Exception:
