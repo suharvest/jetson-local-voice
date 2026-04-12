@@ -4,12 +4,20 @@ RKNN TTS Backend for RK3576
 完整流程：
 文本 → 文本前端 (sherpa-onnx, CPU) → tokens → Matcha RKNN (NPU) → mel → Vocos RKNN (NPU) → ISTFT (CPU) → 音频
 
-性能：
+Matcha acoustic model is compiled with fixed output shape (probe-first surgery).
+Available bucket models:
+  - matcha-s64.rknn:  seq_len=80,  x_len=64,  ~599 mel frames, ~9.6s, 53MB, ~430ms
+  - matcha-s140.rknn: seq_len=160, x_len=140, ~1278 mel frames, ~20s, 60MB, ~900ms
+
+Vocos vocoder compiled with fixed TIME_FRAMES:
+  - vocos-16khz-600.rknn: 600 frames input, ~26.9MB, ~80ms
+
+性能 (s64 + vocos-600, typical 50-token sentence):
 - 文本前端: <10ms (CPU 查表)
-- Matcha RKNN: ~170ms (NPU)
-- Vocos RKNN: ~33ms (NPU, w4a16)
-- ISTFT: ~25ms (CPU)
-- 总计: ~230ms, RTF ~0.07
+- Matcha RKNN: ~430ms (NPU, s64 bucket)
+- Vocos RKNN: ~80ms (NPU, 600 frames)
+- ISTFT: ~50ms (CPU)
+- 总计: ~570ms for 7.6s audio, RTF ~0.07
 """
 
 from __future__ import annotations
@@ -24,11 +32,14 @@ from typing import Optional
 SAMPLE_RATE = 16000
 N_FFT = 1024
 HOP_LENGTH = 256
-MAX_SEQ_LEN = int(os.environ.get('MATCHA_MAX_PHONEMES', '96'))
+MAX_SEQ_LEN = int(os.environ.get('MATCHA_MAX_PHONEMES', '64'))
 # RKNN model compiled input sequence length (must match the shape used during
 # rknn.build()).  All tensor inputs to the Matcha RKNN model are padded to
 # this length so that byte sizes match the static-shape expectations.
-MATCHA_MODEL_SEQ_LEN = int(os.environ.get('MATCHA_MODEL_SEQ_LEN', '256'))
+# Default 80 matches the s64 bucket model (seq_len=80, x_len=64, ~599 mel frames).
+MATCHA_MODEL_SEQ_LEN = int(os.environ.get('MATCHA_MODEL_SEQ_LEN', '80'))
+# Vocos model compiled time frame dimension (must match vocos RKNN build).
+VOCOS_FRAMES = int(os.environ.get('VOCOS_FRAMES', '600'))
 
 
 class RKNNMatchaVocoder:
@@ -244,8 +255,10 @@ class RKNNMatchaVocoder:
                 },
             )[0]
 
-        # 计算有效帧数
-        mel_frames = int(num_tokens * 30 * length_scale + 0.5)
+        # Estimate valid mel frames.  Matcha duration predictor yields roughly
+        # 9-10 mel frames per input token at length_scale=1.0.  Use 9.5 as a
+        # safe average; clamped to the actual model output width.
+        mel_frames = int(num_tokens * 9.5 * length_scale + 0.5)
         mel_frames = min(mel_frames, mel.shape[2])
 
         return mel, mel_frames
@@ -261,9 +274,10 @@ class RKNNMatchaVocoder:
         Returns:
             audio: 音频样本
         """
-        # Pad mel (Vocos 需要固定输入大小)
-        mel_padded = np.zeros((1, 80, 256), dtype=np.float32)
-        mel_padded[:, :, :min(mel_frames, 256)] = mel[:, :, :min(mel_frames, 256)]
+        # Pad mel to Vocos compiled input size
+        mel_padded = np.zeros((1, 80, VOCOS_FRAMES), dtype=np.float32)
+        use_frames = min(mel_frames, VOCOS_FRAMES, mel.shape[2])
+        mel_padded[:, :, :use_frames] = mel[:, :, :use_frames]
 
         # 推理
         outputs = self._vocos.inference(inputs=[mel_padded])
@@ -464,9 +478,12 @@ def create_rknn_tts_backend(model_dir: str = None) -> RKNNMatchaVocoder:
 
     model_dir = Path(model_dir)
 
+    matcha_name = os.environ.get('MATCHA_MODEL', 'matcha-s64.rknn')
+    vocos_name = os.environ.get('VOCOS_MODEL', 'vocos-16khz-600.rknn')
+
     return RKNNMatchaVocoder(
-        matcha_rknn_path=str(model_dir / 'matcha-zh-en.rknn'),
-        vocos_rknn_path=str(model_dir / 'vocos-16khz-univ-w4a16.rknn'),
+        matcha_rknn_path=str(model_dir / matcha_name),
+        vocos_rknn_path=str(model_dir / vocos_name),
         lexicon_path=str(model_dir / 'matcha-icefall-zh-en' / 'lexicon.txt'),
         tokens_path=str(model_dir / 'matcha-icefall-zh-en' / 'tokens.txt'),
         data_dir=str(model_dir / 'matcha-icefall-zh-en' / 'espeak-ng-data'),

@@ -14,8 +14,8 @@ services:
     volumes:
       - /dev:/dev
       - /home/cat/models/matcha-icefall-zh-en:/opt/tts/models/matcha-icefall-zh-en:ro
-      - /home/cat/models/matcha-zh-en.rknn:/opt/tts/models/matcha-zh-en.rknn:ro
-      - /home/cat/models/vocos-16khz-univ-w4a16.rknn:/opt/tts/models/vocos-16khz-univ-w4a16.rknn:ro
+      - /home/cat/models/matcha-s64.rknn:/opt/tts/models/matcha-s64.rknn:ro
+      - /home/cat/models/vocos-16khz-600.rknn:/opt/tts/models/vocos-16khz-600.rknn:ro
       - /home/cat/matcha-data:/home/cat/matcha-data:ro
       - /home/cat/qwen3-asr-models:/opt/asr/models:ro
       - /home/cat/rk3576-build/librkllmrt.so:/opt/asr/lib/librkllmrt.so:ro
@@ -31,8 +31,11 @@ services:
       - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
       - ASR_MODEL_DIR=/opt/asr/models
       - PYTHONPATH=/opt/rknn-matmul-parallel
-      - MATCHA_MAX_PHONEMES=256
-      - MATCHA_USE_ORT=1
+      - MATCHA_MAX_PHONEMES=64
+      - MATCHA_MODEL_SEQ_LEN=80
+      - MATCHA_MODEL=matcha-s64.rknn
+      - VOCOS_MODEL=vocos-16khz-600.rknn
+      - VOCOS_FRAMES=600
       - MATCHA_ONNX_PATH=/home/cat/matcha-data/model-steps-3.onnx
       # Piper RKNN backend (activate by setting TTS_BACKEND=piper_rknn)
       - PIPER_MODEL_DIR=/opt/piper-models
