@@ -36,6 +36,8 @@ services:
       - MATCHA_MODEL=matcha-s64.rknn
       - VOCOS_MODEL=vocos-16khz-600.rknn
       - VOCOS_FRAMES=600
+      # Note: vocos-16khz-600.rknn compiled for 600 mel frames
+      # Old vocos-16khz-univ-w4a16.rknn uses 256 frames
       - MATCHA_ONNX_PATH=/home/cat/matcha-data/model-steps-3.onnx
       # Piper RKNN backend (activate by setting TTS_BACKEND=piper_rknn)
       - PIPER_MODEL_DIR=/opt/piper-models

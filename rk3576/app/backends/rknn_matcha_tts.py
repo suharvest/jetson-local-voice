@@ -316,11 +316,34 @@ class RKNNMatchaVocoder:
                 },
             )[0]
 
-        # Estimate valid mel frames.  Matcha duration predictor yields roughly
-        # 9-10 mel frames per input token at length_scale=1.0.  Use 9.5 as a
-        # safe average; clamped to the actual model output width.
-        mel_frames = int(num_tokens * 9.5 * length_scale + 0.5)
-        mel_frames = min(mel_frames, mel.shape[2])
+        # Determine valid mel frames.
+        if self._matcha_backend == 'ort':
+            # ORT produces dynamic output — all frames are valid.
+            mel_frames = mel.shape[2]
+        else:
+            # RKNN produces fixed-size output; detect where real audio ends.
+            # The duration predictor fills real mel frames with speech content;
+            # padding frames repeat a constant pattern.  Detect the boundary
+            # by finding where inter-frame variance drops to near-zero
+            # (constant padding region).
+            mel_data = mel[0]  # (80, T)
+            T = mel_data.shape[1]
+            if T > 2:
+                # Compute per-frame difference magnitude (how much each frame
+                # differs from the next).  Padding frames are identical.
+                diff = np.abs(mel_data[:, 1:] - mel_data[:, :-1]).mean(axis=0)
+                # Scan from end to find last frame with meaningful change
+                threshold = 0.01
+                varying_idx = np.where(diff > threshold)[0]
+                if len(varying_idx) > 0:
+                    # Last varying frame index in diff corresponds to
+                    # mel frame (idx+1) being different from (idx).
+                    mel_frames = int(varying_idx[-1]) + 2
+                else:
+                    mel_frames = int(num_tokens * 9.5 * length_scale + 0.5)
+            else:
+                mel_frames = T
+            mel_frames = min(mel_frames, T)
 
         return mel, mel_frames
 
