@@ -18,6 +18,7 @@ services:
       - /home/cat/models/vocos-16khz-univ-w4a16.rknn:/opt/tts/models/vocos-16khz-univ-w4a16.rknn:ro
       - /home/cat/matcha-data:/home/cat/matcha-data:ro
       - /home/cat/qwen3-asr-models:/opt/asr/models:ro
+      - /home/cat/rk3576-build/librkllmrt.so:/opt/asr/lib/librkllmrt.so:ro
       - /home/cat/project/rknn-matmul-parallel:/opt/rknn-matmul-parallel:ro
       - /home/cat/piper-models:/opt/piper-models:ro
     restart: unless-stopped
@@ -26,7 +27,8 @@ services:
       - TTS_BACKEND=matcha_rknn
       - TTS_MODEL_DIR=/opt/tts/models
       - ASR_BACKEND=qwen3_asr_rk
-      - ASR_DECODER_TYPE=matmul
+      - ASR_DECODER_TYPE=rkllm
+      - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
       - ASR_MODEL_DIR=/opt/asr/models
       - PYTHONPATH=/opt/rknn-matmul-parallel
       - MATCHA_MAX_PHONEMES=256
