@@ -206,3 +206,83 @@ RK3576 内核 (6.1.99) 缺少 `iptable_raw` 模块。Docker 默认修改 iptable
 | RKLLM talker + RKNN cp × 15 + vocoder ctx25 int8 | 355ms + 682ms | 4.4 + vocoder | 当前已部署 |
 | + 展开 code_predictor (16 码本) | 125ms + 682ms | 1.6 + vocoder | 计划中 |
 | + 减到 4 码本 | 82ms + 682ms | 1.0 + vocoder | 计划中 |
+
+## 7. Matcha TTS FP16 精度分析 (2026-04-13)
+
+### 7.1 问题
+
+Matcha TTS (3-step ODE 扩散模型) 在 RK3576 NPU FP16 下 round-trip 准确率只有 5/10，短句（"你好世界"、"欢迎使用"）完全乱码。
+
+### 7.2 诊断路径
+
+**Step 1: 定位 ODE 累积误差**
+- 拆分模型为 encoder + estimator，ODE 累加在 CPU FP32
+- 结果：5/10 → 5/10（CPU ODE 没改善，因为单模型里 ODE 不是主要问题）
+- 实测帧 90+ mel 能量衰减到 ORT 的 2-10%
+
+**Step 2: 减少 ODE 步数**
+- 1-step ODE (dt=1.0, time_emb_step0)：7/10, 282ms
+- 3-step 和 1-step 的 RKNN mel 之间 cosine=0.996（差异很小）
+- 说明步数不是主因，单步 estimator 本身的 FP16 就有问题
+
+**Step 3: accuracy_analysis() 逐层分析**
+- GEGLU 激活 (ff/net.0/Mul_1): single_euc 0.17-0.18（最差单层 op）
+- InstanceNorm (exNorm): single_euc 0.08-0.12
+- 中间 Conv/MatMul: 累积 cosine 从 mid_blocks 开始降到 0.99985
+
+**Step 4: 自定义 CPU 算子实验（关键！）**
+- 替换 6 个 Snake 激活 (Mul+Sin+Pow+Mul+Add) + 13 个 InstanceNorm = 43 个 op 为 CPU FP32
+- 结果：**cosine 0.926 → 0.926（零改善！）**
+- 结论：Snake/InstanceNorm 是误差放大器，不是误差源
+
+**Step 5: 确认 Conv/MatMul 是真正瓶颈**
+- 43 个自定义 op 在 CPU FP32 跑，精度不变 → 剩下的 Conv/MatMul（90%+ 计算量）才是精度损失源
+- Conv/MatMul 是 NPU 核心运算，无法通过自定义算子替换
+
+### 7.3 自定义算子实战数据
+
+| 发现 | 详情 |
+|------|------|
+| 数据类型 | 自定义 op 收到 **FP32** 数据（RKNN 自动 FP16→FP32 转换） |
+| Buffer 复用 | 连续 CPU op 之间 **不共享 buffer**（每个 op 独立 malloc） |
+| 性能影响 | 43 个 CPU op 导致 TTS 从 282ms → 399ms（+41%） |
+| 精度影响 | cosine 0.926 → 0.926（**零改善**） |
+| 注册方式 | ctypes 调 `rknn_register_custom_ops()`，rknnlite 不暴露此 API |
+| context 获取 | `rknn_lite_obj.rknn_runtime.context` (uint64) |
+| GC 风险 | 必须保持 ctypes 引用，否则回调指针失效 → segfault |
+
+### 7.4 编译配置实验（全部无效）
+
+| 配置 | 结果 |
+|------|------|
+| optimization_level 0/1/2/3 | 真机 **无差异**（simulator 也无差异） |
+| float_dtype='bfloat16' | **编译失败** (RK3576 NPU 不支持) |
+| float_dtype='tfloat32' | **编译失败** |
+| enable_flash_attention=True | 真机 **无差异** |
+| quantize_weight=True (w8a16) | **平台不支持** |
+| compress_weight=True | **bit-identical** |
+| op_target (指定 op 走 CPU) | **对 FP16 模型无效**（只在 INT8 混合量化场景有用） |
+| ONNX Sin range reduction | 真机 **无差异** |
+| mel 后处理平滑 (kernel=3) | **反而变差**（短句模糊） |
+| mel adaptive 平滑 | **无改善** |
+
+### 7.5 ORT CPU vs RKNN NPU 对比
+
+| 模式 | TTS 延迟 | Round-trip 准确率 | 说明 |
+|------|---------|------------------|------|
+| RKNN 单模型 3-step | 535ms | 5/10 | 基线 |
+| RKNN split + 3-step CPU ODE | 535ms | 5/10 | ODE 精度修复无效 |
+| RKNN split + 1-step | 282ms | 7/10 | 减少累积次数 |
+| RKNN + 43 自定义 CPU op | 399ms | 6/10 | 激活/Norm 不是瓶颈 |
+| **ORT CPU FP32 (NEON)** | **443ms** | **9/10** | **最终方案** |
+| ORT CPU 4 threads | 251ms | — | 纯 Matcha 延迟 |
+| ORT CPU 1 thread | 590ms | — | 线程扩展 2.35x |
+
+**关键洞察**：ORT 是动态 shape，短句（≤7 tokens）比 RKNN 更快（232ms vs 280ms），因为 RKNN 固定 600 帧。
+
+### 7.6 结论
+
+1. **RK3576 FP16 NPU 的精度瓶颈在 Conv/MatMul 硬件层面**，无法通过 graph surgery、自定义算子、编译选项解决
+2. **accuracy_analysis 定位的 "worst op" 是误导**——它们是误差放大器，不是误差来源
+3. 对迭代/扩散模型，**ORT CPU NEON FP32 是 RK3576 上的最优方案**
+4. NPU 适合非迭代模型（encoder、vocoder），对 FP16 精度不敏感的场景
