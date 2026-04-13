@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Batch download and convert Piper TTS models to RKNN.
 
-Downloads Piper voice models from HuggingFace and runs the full ONNX surgery
-pipeline (fix_piper_rknn.py) before exporting to .rknn format.
+Downloads Piper voice models from HuggingFace and converts them for NPU deployment.
+
+Two conversion modes:
+  --mode hybrid  (default): Split into encoder.onnx (CPU) + flow_decoder.rknn (NPU).
+                 Encoder runs dynamic shapes on ORT CPU, flow+decoder on RKNN NPU.
+                 Best quality and performance (RTF ~0.07).
+  --mode full:   Legacy full-model RKNN via fix_piper_rknn.py ONNX surgery.
+                 Entire model on NPU with fixed seq_len. May have quality issues.
 
 Usage:
-  python batch_convert_piper.py --target rk3588 --output-dir /tmp/piper-rknn-models
-  python batch_convert_piper.py --target rk3576 --languages en_US,zh_CN,ja_JP
-  python batch_convert_piper.py --target rk3588 --languages all
+  python batch_convert_piper.py --target rk3576 --mode hybrid --output-dir /tmp/piper-models
+  python batch_convert_piper.py --target rk3588 --mode full --languages en_US,zh_CN
+  python batch_convert_piper.py --target rk3576 --languages all
 """
 
 import os
@@ -203,9 +209,108 @@ def build_rknn(fixed_onnx: str, rknn_path: str, target: str) -> bool:
     return True
 
 
+def convert_language_hybrid(lang: str, target: str, output_dir: str,
+                            mel_len: int = 256,
+                            keep_intermediate: bool = False) -> dict:
+    """Download, split, and convert a single language model (hybrid mode).
+
+    Hybrid: encoder.onnx (CPU ORT) + flow_decoder.rknn (NPU).
+    Returns a result dict with keys: lang, status, error, encoder_path, rknn_path, config_path.
+    """
+    result = {'lang': lang, 'status': 'fail', 'encoder_path': None,
+              'rknn_path': None, 'config_path': None, 'error': None}
+
+    if lang not in MODEL_REGISTRY:
+        result['error'] = f"Unknown language: {lang}"
+        return result
+
+    hf_subpath, model_name = MODEL_REGISTRY[lang]
+    onnx_url   = f"{HF_BASE}/{hf_subpath}/{model_name}.onnx"
+    config_url = f"{HF_BASE}/{hf_subpath}/{model_name}.onnx.json"
+
+    lang_dir = os.path.join(output_dir, lang)
+    os.makedirs(lang_dir, exist_ok=True)
+
+    raw_onnx    = os.path.join(lang_dir, f"{model_name}.onnx")
+    config_src  = os.path.join(lang_dir, f"{model_name}.onnx.json")
+    config_dst  = os.path.join(lang_dir, "config.json")
+
+    # --- Download ONNX ---
+    print(f"\n  [{lang}] Downloading ONNX model...")
+    if not download_file(onnx_url, raw_onnx):
+        result['error'] = f"Download failed: {onnx_url}"
+        return result
+
+    # --- Download config JSON ---
+    print(f"  [{lang}] Downloading config JSON...")
+    if not download_file(config_url, config_src):
+        print(f"  [{lang}] WARNING: config JSON download failed (non-fatal)")
+    else:
+        # Copy to config.json (canonical name) and keep original
+        import shutil
+        shutil.copy2(config_src, config_dst)
+        # Also keep as model.onnx.json for backward compat
+        model_onnx_json = os.path.join(lang_dir, "model.onnx.json")
+        if not os.path.exists(model_onnx_json):
+            shutil.copy2(config_src, model_onnx_json)
+        result['config_path'] = config_dst
+
+    # --- Split into encoder + flow_decoder ---
+    print(f"  [{lang}] Splitting into encoder + flow_decoder...")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    try:
+        from split_piper_vits import split_model
+        encoder_path, fd_onnx_path = split_model(
+            raw_onnx, lang_dir, mel_len=mel_len,
+        )
+        result['encoder_path'] = encoder_path
+    except Exception as e:
+        result['error'] = f"Split failed: {e}\n{traceback.format_exc()}"
+        return result
+
+    # --- Build RKNN from flow_decoder.onnx ---
+    rknn_path = os.path.join(lang_dir, "flow_decoder.rknn")
+    print(f"  [{lang}] Building RKNN from flow_decoder ({target})...")
+    try:
+        ok = build_rknn(fd_onnx_path, rknn_path, target)
+        if not ok:
+            result['error'] = "RKNN build returned False"
+            return result
+    except ImportError:
+        print(f"  [{lang}] WARNING: rknn.api not available, skipping RKNN build.")
+        result['status'] = 'onnx_only'
+        result['rknn_path'] = fd_onnx_path
+        return result
+    except Exception as e:
+        result['error'] = f"RKNN build exception: {e}\n{traceback.format_exc()}"
+        return result
+
+    # --- Cleanup intermediate files ---
+    if not keep_intermediate:
+        for f in [raw_onnx, config_src]:
+            try:
+                if os.path.exists(f) and f != config_dst:
+                    os.remove(f)
+            except OSError:
+                pass
+        # Keep flow_decoder.onnx only if requested
+        try:
+            if os.path.exists(fd_onnx_path):
+                os.remove(fd_onnx_path)
+        except OSError:
+            pass
+
+    result['status'] = 'success'
+    result['rknn_path'] = rknn_path
+    return result
+
+
 def convert_language(lang: str, target: str, output_dir: str, seq_len: int,
                      keep_intermediate: bool = False) -> dict:
-    """Download, fix, and convert a single language model.
+    """Download, fix, and convert a single language model (full/legacy mode).
 
     Returns a result dict with keys: lang, status, rknn_path, config_path, error.
     """
@@ -303,8 +408,16 @@ def main():
              f'Available: {", ".join(sorted(MODEL_REGISTRY.keys()))}'
     )
     parser.add_argument(
+        '--mode', default='hybrid', choices=['hybrid', 'full'],
+        help='Conversion mode: hybrid (encoder CPU + decoder NPU) or full (legacy). Default: hybrid'
+    )
+    parser.add_argument(
         '--seq-len', type=int, default=128,
-        help='Token sequence length / bucket size for ONNX surgery (default: 128)'
+        help='Token sequence length for full mode ONNX surgery (default: 128)'
+    )
+    parser.add_argument(
+        '--mel-len', type=int, default=256,
+        help='Fixed mel length for hybrid mode flow_decoder (default: 256)'
     )
     parser.add_argument(
         '--keep-intermediate', action='store_true',
@@ -319,11 +432,15 @@ def main():
         langs = [l.strip() for l in args.languages.split(',') if l.strip()]
 
     print("=" * 60)
-    print("Piper TTS → RKNN Batch Converter")
+    print("Piper TTS -> RKNN Batch Converter")
     print(f"  Target:     {args.target}")
+    print(f"  Mode:       {args.mode}")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Languages:  {', '.join(langs)}")
-    print(f"  Seq len:    {args.seq_len}")
+    if args.mode == 'hybrid':
+        print(f"  Mel len:    {args.mel_len}")
+    else:
+        print(f"  Seq len:    {args.seq_len}")
     print("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -331,27 +448,38 @@ def main():
     results = []
     for lang in langs:
         print(f"\n{'='*60}")
-        print(f"Processing: {lang}")
+        print(f"Processing: {lang} (mode={args.mode})")
         print('='*60)
         t0 = time.time()
-        result = convert_language(
-            lang=lang,
-            target=args.target,
-            output_dir=args.output_dir,
-            seq_len=args.seq_len,
-            keep_intermediate=args.keep_intermediate,
-        )
+
+        if args.mode == 'hybrid':
+            result = convert_language_hybrid(
+                lang=lang,
+                target=args.target,
+                output_dir=args.output_dir,
+                mel_len=args.mel_len,
+                keep_intermediate=args.keep_intermediate,
+            )
+        else:
+            result = convert_language(
+                lang=lang,
+                target=args.target,
+                output_dir=args.output_dir,
+                seq_len=args.seq_len,
+                keep_intermediate=args.keep_intermediate,
+            )
+
         elapsed = time.time() - t0
         result['elapsed_s'] = round(elapsed, 1)
         results.append(result)
 
         if result['status'] == 'success':
             rknn_sz = os.path.getsize(result['rknn_path']) / (1024 * 1024) if result['rknn_path'] else 0
-            print(f"\n  [{lang}] SUCCESS in {elapsed:.0f}s — {result['rknn_path']} ({rknn_sz:.1f} MB)")
+            print(f"\n  [{lang}] SUCCESS in {elapsed:.0f}s -- {result['rknn_path']} ({rknn_sz:.1f} MB)")
         elif result['status'] == 'onnx_only':
-            print(f"\n  [{lang}] ONNX ONLY (no RKNN toolkit) in {elapsed:.0f}s — {result['rknn_path']}")
+            print(f"\n  [{lang}] ONNX ONLY (no RKNN toolkit) in {elapsed:.0f}s -- {result['rknn_path']}")
         else:
-            print(f"\n  [{lang}] FAILED in {elapsed:.0f}s — {result['error']}")
+            print(f"\n  [{lang}] FAILED in {elapsed:.0f}s -- {result['error']}")
 
     # Save results JSON
     results_file = os.path.join(args.output_dir, 'conversion_results.json')

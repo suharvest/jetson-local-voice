@@ -10,9 +10,15 @@ Env vars:
   PIPER_SEQ_LEN: max phoneme sequence length (default: 128)
   KOKORO_VOICE: default Kokoro voice for Japanese (default: jf_alpha)
 
-Model directory structure:
-  /opt/piper-models/{lang}/model.rknn       — RKNN NPU models (all non-Japanese)
-  /opt/piper-models/{lang}/model.onnx.json  — Piper phoneme config
+Model directory structure (hybrid mode, preferred):
+  /opt/piper-models/{lang}/encoder.onnx       -- Encoder+DP+LR on ORT CPU
+  /opt/piper-models/{lang}/flow_decoder.rknn   -- Flow+Decoder on RKNN NPU
+  /opt/piper-models/{lang}/model.onnx.json     -- Piper phoneme config
+  (or config.json)
+
+Model directory structure (legacy full-RKNN mode, fallback):
+  /opt/piper-models/{lang}/model.rknn       -- Full model on RKNN NPU
+  /opt/piper-models/{lang}/model.onnx.json  -- Piper phoneme config
 
 Japanese CPU fallback (sherpa-onnx Kokoro v1.0):
   /opt/piper-models/ja_JP/kokoro-v1.0.onnx
@@ -242,12 +248,26 @@ def _trim_silence(audio: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -
 # ---------------------------------------------------------------------------
 
 class _LangModel:
-    """Holds one RKNNLite context + config for a single language."""
+    """Holds model context + config for a single language.
+
+    Supports two modes:
+    - Hybrid (preferred): encoder.onnx on ORT CPU + flow_decoder.rknn on NPU.
+    - Legacy: full model.rknn on NPU (fixed seq_len).
+
+    Auto-detects mode based on available files in model_dir.
+    """
+
+    # Fixed mel length for NPU flow_decoder (must match RKNN build)
+    MAX_MEL_LEN = 256
+    # HiFi-GAN hop size: each mel frame = 256 audio samples
+    HOP_SIZE = 256
 
     def __init__(self, lang: str, model_dir: Path) -> None:
         self.lang = lang
         self.model_dir = model_dir
         self._rknn = None
+        self._encoder = None  # ORT session for hybrid mode
+        self._hybrid = False
         self.config: dict = {}
         self.phoneme_id_map: dict = {}
         self.espeak_voice: str = "en-us"
@@ -256,19 +276,26 @@ class _LangModel:
         self.noise_w: float = 0.8
         self.sample_rate: int = SAMPLE_RATE
 
-    def load(self) -> None:
-        from rknnlite.api import RKNNLite
-
-        rknn_path = self.model_dir / "model.rknn"
-        config_path = self.model_dir / "model.onnx.json"
-
-        if not rknn_path.exists():
-            raise FileNotFoundError(f"RKNN model not found: {rknn_path}")
-        if not config_path.exists():
-            raise FileNotFoundError(f"Piper config not found: {config_path}")
-
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = json.load(f)
+    def _load_config(self) -> None:
+        """Load phoneme config from model directory."""
+        # Try multiple config file names
+        for name in ("config.json", "model.onnx.json"):
+            config_path = self.model_dir / name
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    self.config = json.load(f)
+                break
+        else:
+            # Try any .onnx.json file
+            json_files = list(self.model_dir.glob("*.onnx.json"))
+            if json_files:
+                with open(json_files[0], "r", encoding="utf-8") as f:
+                    self.config = json.load(f)
+            else:
+                raise FileNotFoundError(
+                    f"No config file found in {self.model_dir}. "
+                    "Expected config.json or model.onnx.json."
+                )
 
         audio_cfg = self.config.get("audio", {})
         self.sample_rate = audio_cfg.get("sample_rate", SAMPLE_RATE)
@@ -283,6 +310,52 @@ class _LangModel:
         self.length_scale = inference_cfg.get("length_scale", 1.0)
         self.noise_w = inference_cfg.get("noise_w", 0.8)
 
+    def load(self) -> None:
+        self._load_config()
+
+        encoder_path = self.model_dir / "encoder.onnx"
+        fd_rknn_path = self.model_dir / "flow_decoder.rknn"
+        legacy_rknn_path = self.model_dir / "model.rknn"
+
+        if encoder_path.exists() and fd_rknn_path.exists():
+            self._load_hybrid(encoder_path, fd_rknn_path)
+        elif legacy_rknn_path.exists():
+            self._load_legacy(legacy_rknn_path)
+        else:
+            raise FileNotFoundError(
+                f"No model files found in {self.model_dir}. "
+                "Expected encoder.onnx + flow_decoder.rknn (hybrid) "
+                "or model.rknn (legacy)."
+            )
+
+    def _load_hybrid(self, encoder_path: Path, fd_rknn_path: Path) -> None:
+        """Load hybrid mode: encoder ORT CPU + flow_decoder RKNN NPU."""
+        import onnxruntime as ort
+        from rknnlite.api import RKNNLite
+
+        self._encoder = ort.InferenceSession(
+            str(encoder_path), providers=["CPUExecutionProvider"]
+        )
+
+        self._rknn = RKNNLite(verbose=False)
+        ret = self._rknn.load_rknn(str(fd_rknn_path))
+        if ret != 0:
+            raise RuntimeError(f"Failed to load RKNN for {self.lang}: ret={ret}")
+        ret = self._rknn.init_runtime()
+        if ret != 0:
+            raise RuntimeError(f"Failed to init RKNN runtime for {self.lang}: ret={ret}")
+
+        self._hybrid = True
+        logger.info(
+            "Loaded Piper HYBRID model for %s (voice=%s, sr=%d) "
+            "encoder=ORT_CPU, decoder=RKNN_NPU",
+            self.lang, self.espeak_voice, self.sample_rate,
+        )
+
+    def _load_legacy(self, rknn_path: Path) -> None:
+        """Load legacy full-RKNN mode."""
+        from rknnlite.api import RKNNLite
+
         self._rknn = RKNNLite(verbose=False)
         ret = self._rknn.load_rknn(str(rknn_path))
         if ret != 0:
@@ -291,8 +364,9 @@ class _LangModel:
         if ret != 0:
             raise RuntimeError(f"Failed to init RKNN runtime for {self.lang}: ret={ret}")
 
+        self._hybrid = False
         logger.info(
-            "Loaded Piper RKNN model for %s (voice=%s, sr=%d)",
+            "Loaded Piper LEGACY RKNN model for %s (voice=%s, sr=%d)",
             self.lang, self.espeak_voice, self.sample_rate,
         )
 
@@ -303,6 +377,7 @@ class _LangModel:
             except Exception:
                 pass
             self._rknn = None
+        self._encoder = None
 
     def infer(
         self,
@@ -311,7 +386,68 @@ class _LangModel:
         noise_scale: float,
         noise_w: float,
     ) -> np.ndarray:
-        """Run RKNN inference. Returns raw float32 audio samples."""
+        """Run inference. Returns raw float32 audio samples."""
+        if self._hybrid:
+            return self._infer_hybrid(token_ids, length_scale, noise_scale, noise_w)
+        return self._infer_legacy(token_ids, length_scale, noise_scale, noise_w)
+
+    def _infer_hybrid(
+        self,
+        token_ids: list[int],
+        length_scale: float,
+        noise_scale: float,
+        noise_w: float,
+    ) -> np.ndarray:
+        """Hybrid inference: encoder on CPU, flow+decoder on NPU."""
+        n = len(token_ids)
+        # Encoder accepts dynamic-length input
+        tokens = np.array([token_ids], dtype=np.int64)  # (1, n) dynamic
+        lengths = np.array([n], dtype=np.int64)
+        scales = np.array([noise_scale, length_scale, noise_w], dtype=np.float32)
+
+        # Step 1: Encoder on CPU (dynamic shapes)
+        enc_inputs = {
+            "input": tokens,
+            "input_lengths": lengths,
+            "scales": scales,
+        }
+        # Add sid if encoder expects it
+        enc_input_names = {inp.name for inp in self._encoder.get_inputs()}
+        if "sid" in enc_input_names:
+            enc_inputs["sid"] = np.array([0], dtype=np.int64)
+
+        enc_out = self._encoder.run(None, enc_inputs)
+        z = enc_out[0]        # (1, 192, mel_len)
+        y_mask = enc_out[1]   # (1, 1, mel_len)
+        mel_len = z.shape[2]
+
+        # Step 2: Pad to fixed size for NPU
+        actual_mel = min(mel_len, self.MAX_MEL_LEN)
+        z_pad = np.zeros((1, 192, self.MAX_MEL_LEN), dtype=np.float32)
+        z_pad[:, :, :actual_mel] = z[:, :, :actual_mel]
+
+        mask_pad = np.zeros((1, 1, self.MAX_MEL_LEN), dtype=np.float32)
+        mask_pad[:, :, :actual_mel] = y_mask[:, :, :actual_mel]
+
+        # Step 3: Flow+Decoder on NPU
+        dec_out = self._rknn.inference(inputs=[z_pad, mask_pad])
+        if dec_out is None or len(dec_out) == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        # Trim to actual audio length (actual_mel * hop_size)
+        audio = dec_out[0].flatten()
+        actual_samples = actual_mel * self.HOP_SIZE
+        audio = audio[:actual_samples]
+        return audio.astype(np.float32)
+
+    def _infer_legacy(
+        self,
+        token_ids: list[int],
+        length_scale: float,
+        noise_scale: float,
+        noise_w: float,
+    ) -> np.ndarray:
+        """Legacy full-RKNN inference with fixed seq_len."""
         n = min(len(token_ids), SEQ_LEN)
         tokens = np.zeros((1, SEQ_LEN), dtype=np.int64)
         tokens[0, :n] = token_ids[:n]
