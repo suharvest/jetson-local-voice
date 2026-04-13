@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """Batch download and convert Piper TTS models to RKNN.
 
-Downloads Piper voice models from HuggingFace and converts them for NPU deployment.
-
-Two conversion modes:
-  --mode hybrid  (default): Split into encoder.onnx (CPU) + flow_decoder.rknn (NPU).
-                 Encoder runs dynamic shapes on ORT CPU, flow+decoder on RKNN NPU.
-                 Best quality and performance (RTF ~0.07).
-  --mode full:   Legacy full-model RKNN via fix_piper_rknn.py ONNX surgery.
-                 Entire model on NPU with fixed seq_len. May have quality issues.
+Downloads Piper voice models from HuggingFace and converts them for hybrid
+NPU deployment: encoder.onnx (CPU ORT, dynamic shapes) + flow_decoder.rknn
+(RKNN NPU, fixed mel_len=256). RTF ~0.07 on RK3576.
 
 Usage:
-  python batch_convert_piper.py --target rk3576 --mode hybrid --output-dir /tmp/piper-models
-  python batch_convert_piper.py --target rk3588 --mode full --languages en_US,zh_CN
+  python batch_convert_piper.py --target rk3576 --output-dir /tmp/piper-models
+  python batch_convert_piper.py --target rk3588 --languages en_US,zh_CN
   python batch_convert_piper.py --target rk3576 --languages all
 """
 
@@ -81,101 +76,6 @@ def download_file(url: str, dest: str, max_retries: int = 3) -> bool:
         if attempt < max_retries:
             time.sleep(5 * attempt)
     return False
-
-
-def apply_onnx_pipeline(onnx_path: str, fixed_path: str, seq_len: int) -> bool:
-    """Run the fix_piper_rknn.py ONNX surgery pipeline. Returns True on success."""
-    import numpy as np
-    import onnx
-    import onnxruntime as ort
-
-    # Add fix_piper_rknn.py to path
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-
-    from fix_piper_rknn import (
-        load_and_simplify,
-        fix_range_nodes,
-        fix_erf_nodes,
-        fix_softplus_nodes,
-        fix_ceil_ops,
-        fix_nonzero_nodes,
-        replace_cpu_fallback_ops,
-        fix_3d_matmul_for_rknn,
-        fix_random_noise,
-    )
-
-    tokens = np.zeros((1, seq_len), dtype=np.int64)
-    tokens[0, :5] = [1, 2, 3, 4, 5]
-    test_inputs = {
-        'input': tokens,
-        'input_lengths': np.array([5], dtype=np.int64),
-        'scales': np.array([0.667, 1.0, 0.8], dtype=np.float32),
-    }
-
-    # Auto-detect multi-speaker models: add 'sid' if the model requires it
-    _probe = onnx.load(onnx_path)
-    _input_names = {inp.name for inp in _probe.graph.input}
-    if 'sid' in _input_names:
-        print("    [auto] Multi-speaker model detected — adding sid=0 to test inputs")
-        test_inputs['sid'] = np.array([0], dtype=np.int64)
-    del _probe
-
-    print(f"    [1/6] onnxsim simplification (seq_len={seq_len})...")
-    model = load_and_simplify(onnx_path, seq_len)
-
-    print("    [2/6] Replacing Range nodes...")
-    model = fix_range_nodes(model, test_inputs)
-
-    print("    [3/6] Replacing Erf nodes...")
-    model = fix_erf_nodes(model)
-
-    print("    [4/6] Replacing Softplus nodes...")
-    model = fix_softplus_nodes(model)
-
-    print("    [4b] Replacing Ceil ops...")
-    model = fix_ceil_ops(model)
-
-    print("    [5a/6] Replacing NonZero nodes...")
-    model = fix_nonzero_nodes(model, test_inputs)
-
-    # Re-run onnxsim after baking NonZero constants
-    print("    [5a-sim] Re-running onnxsim after NonZero baking...")
-    import onnxsim
-    tmp_nz = tempfile.mktemp(suffix='.onnx')
-    onnx.save(model, tmp_nz)
-    model2, ok2 = onnxsim.simplify(onnx.load(tmp_nz))
-    os.unlink(tmp_nz)
-    print(f"      Re-simplified: ok={ok2}, nodes={len(model2.graph.node)}")
-    model = model2
-
-    print("    [5a2/6] Replacing ScatterND/GatherND/CumSum with NPU-native ops...")
-    model = replace_cpu_fallback_ops(model, test_inputs)
-
-    print("    [5b/6] Fixing 3D MatMul for RKNN exMatMul bug...")
-    model = fix_3d_matmul_for_rknn(model, test_inputs)
-
-    print("    [5c/6] Replacing RandomNormalLike / RandomUniformLike...")
-    model = fix_random_noise(model, test_inputs)
-
-    print("    [verify] ORT verification...")
-    try:
-        model = onnx.shape_inference.infer_shapes(model)
-    except Exception as e:
-        print(f"      Warning (shape inference): {e}")
-
-    sess = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
-    out = sess.run(None, test_inputs)
-    audio = out[0]
-    import numpy as np
-    print(f"      Output shape: {audio.shape}, RMS={float(np.sqrt(np.mean(audio**2))):.4f}")
-    print("      ORT OK")
-
-    onnx.save(model, fixed_path)
-    sz = os.path.getsize(fixed_path) / (1024 * 1024)
-    print(f"      Saved fixed ONNX: {fixed_path} ({sz:.1f} MB)")
-    return True
 
 
 def build_rknn(fixed_onnx: str, rknn_path: str, target: str) -> bool:
@@ -308,87 +208,6 @@ def convert_language_hybrid(lang: str, target: str, output_dir: str,
     return result
 
 
-def convert_language(lang: str, target: str, output_dir: str, seq_len: int,
-                     keep_intermediate: bool = False) -> dict:
-    """Download, fix, and convert a single language model (full/legacy mode).
-
-    Returns a result dict with keys: lang, status, rknn_path, config_path, error.
-    """
-    result = {'lang': lang, 'status': 'fail', 'rknn_path': None, 'config_path': None, 'error': None}
-
-    if lang not in MODEL_REGISTRY:
-        result['error'] = f"Unknown language: {lang}"
-        return result
-
-    hf_subpath, model_name = MODEL_REGISTRY[lang]
-    onnx_url  = f"{HF_BASE}/{hf_subpath}/{model_name}.onnx"
-    config_url = f"{HF_BASE}/{hf_subpath}/{model_name}.onnx.json"
-
-    lang_dir = os.path.join(output_dir, lang)
-    os.makedirs(lang_dir, exist_ok=True)
-
-    raw_onnx   = os.path.join(lang_dir, f"{model_name}.onnx")
-    fixed_onnx = os.path.join(lang_dir, f"{model_name}-rknn-ready.onnx")
-    rknn_path  = os.path.join(lang_dir, f"{model_name}.rknn")
-    config_path = os.path.join(lang_dir, f"{model_name}.onnx.json")
-
-    # --- Download ONNX ---
-    print(f"\n  [{lang}] Downloading ONNX model...")
-    if not download_file(onnx_url, raw_onnx):
-        result['error'] = f"Download failed: {onnx_url}"
-        return result
-
-    # --- Download config JSON ---
-    print(f"  [{lang}] Downloading config JSON...")
-    if not download_file(config_url, config_path):
-        print(f"  [{lang}] WARNING: config JSON download failed (non-fatal)")
-    else:
-        result['config_path'] = config_path
-
-    # --- ONNX surgery ---
-    print(f"  [{lang}] Running ONNX fix pipeline...")
-    try:
-        ok = apply_onnx_pipeline(raw_onnx, fixed_onnx, seq_len)
-        if not ok:
-            result['error'] = "ONNX pipeline returned False"
-            return result
-    except Exception as e:
-        result['error'] = f"ONNX pipeline exception: {e}\n{traceback.format_exc()}"
-        return result
-
-    # --- RKNN build ---
-    print(f"  [{lang}] Building RKNN ({target})...")
-    try:
-        ok = build_rknn(fixed_onnx, rknn_path, target)
-        if not ok:
-            result['error'] = "RKNN build returned False"
-            return result
-    except ImportError:
-        # RKNN toolkit not installed — save fixed ONNX and skip
-        print(f"  [{lang}] WARNING: rknn.api not available, skipping RKNN build. Fixed ONNX saved.")
-        result['status'] = 'onnx_only'
-        result['rknn_path'] = fixed_onnx
-        if not keep_intermediate:
-            # keep raw onnx only if rknn failed
-            pass
-        return result
-    except Exception as e:
-        result['error'] = f"RKNN build exception: {e}\n{traceback.format_exc()}"
-        return result
-
-    # --- Cleanup intermediate files ---
-    if not keep_intermediate:
-        for f in [raw_onnx, fixed_onnx]:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-
-    result['status'] = 'success'
-    result['rknn_path'] = rknn_path
-    return result
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Batch download and convert Piper TTS models to RKNN'
@@ -406,14 +225,6 @@ def main():
         '--languages', default='all',
         help='Comma-separated language codes, or "all" (default: all). '
              f'Available: {", ".join(sorted(MODEL_REGISTRY.keys()))}'
-    )
-    parser.add_argument(
-        '--mode', default='hybrid', choices=['hybrid', 'full'],
-        help='Conversion mode: hybrid (encoder CPU + decoder NPU) or full (legacy). Default: hybrid'
-    )
-    parser.add_argument(
-        '--seq-len', type=int, default=128,
-        help='Token sequence length for full mode ONNX surgery (default: 128)'
     )
     parser.add_argument(
         '--mel-len', type=int, default=256,
@@ -434,13 +245,9 @@ def main():
     print("=" * 60)
     print("Piper TTS -> RKNN Batch Converter")
     print(f"  Target:     {args.target}")
-    print(f"  Mode:       {args.mode}")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Languages:  {', '.join(langs)}")
-    if args.mode == 'hybrid':
-        print(f"  Mel len:    {args.mel_len}")
-    else:
-        print(f"  Seq len:    {args.seq_len}")
+    print(f"  Mel len:    {args.mel_len}")
     print("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -452,22 +259,13 @@ def main():
         print('='*60)
         t0 = time.time()
 
-        if args.mode == 'hybrid':
-            result = convert_language_hybrid(
-                lang=lang,
-                target=args.target,
-                output_dir=args.output_dir,
-                mel_len=args.mel_len,
-                keep_intermediate=args.keep_intermediate,
-            )
-        else:
-            result = convert_language(
-                lang=lang,
-                target=args.target,
-                output_dir=args.output_dir,
-                seq_len=args.seq_len,
-                keep_intermediate=args.keep_intermediate,
-            )
+        result = convert_language_hybrid(
+            lang=lang,
+            target=args.target,
+            output_dir=args.output_dir,
+            mel_len=args.mel_len,
+            keep_intermediate=args.keep_intermediate,
+        )
 
         elapsed = time.time() - t0
         result['elapsed_s'] = round(elapsed, 1)
