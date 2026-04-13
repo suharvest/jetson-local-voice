@@ -1,153 +1,134 @@
 # RK3576 Speech Service
 
-中英文 TTS + ASR 全栈语音服务，部署在 RK3576（6 TOPS NPU）上。
+RK3576（6 TOPS NPU）上的可插拔语音服务框架。支持多种 TTS/ASR 后端，通过环境变量切换。
 
 ## 架构
 
 ```
-TTS: 文本 → 文本前端(CPU) → Matcha ORT(CPU FP32) → mel → Vocos RKNN(NPU FP16) → ISTFT(CPU) → 音频
-ASR: 音频 → VAD(CPU) → Encoder RKNN(NPU FP16) → RKLLM Decoder(NPU W4A16) → 文本
+┌─────────────────────────────────────────────────┐
+│                HTTP API (:8621)                  │
+│   POST /tts   POST /asr   WS /dialogue          │
+├──────────────────────┬──────────────────────────┤
+│     TTS Backend      │      ASR Backend          │
+│  (可插拔, 环境变量切换)  │   (可插拔, 环境变量切换)    │
+├──────────────────────┼──────────────────────────┤
+│ • matcha_rknn (推荐)  │ • qwen3_asr_rk (推荐)    │
+│ • piper_rknn         │                          │
+│ • qwen3_rknn         │                          │
+└──────────────────────┴──────────────────────────┘
 ```
 
-**为什么 Matcha 走 CPU 而非 NPU？**
+每个后端内部自动选择最优执行路径（NPU / ORT CPU / 混合），调用方无感知。
 
-Matcha TTS 是扩散模型（3-step ODE），RK3576 NPU 只有 FP16 精度。经过完整的精度分析（`accuracy_analysis()`、自定义算子实验、逐层 A/B 对比），确认 FP16 精度损失在 Conv/MatMul 硬件层面，无法通过自定义算子或 graph surgery 解决。ORT CPU (NEON FP32) 精度 9/10，延迟 443ms，是最优方案。
-
-详细分析过程见 `rknn-optimization` skill 文档。
-
-## 快速部署
-
-### 前提条件
-
-- RK3576 开发板（4GB+ 内存）
-- Docker + docker-compose
-- 设备需要以下模型文件（见下方获取方式）
-
-### 1. 获取模型
-
-```bash
-# 在设备上创建目录
-mkdir -p /home/cat/models/matcha-icefall-zh-en
-mkdir -p /home/cat/matcha-data
-mkdir -p /home/cat/qwen3-asr-models
-
-# Matcha TTS 模型（sherpa-onnx 官方）
-# 下载 matcha-icefall-zh-en 到 /home/cat/models/matcha-icefall-zh-en/
-#   包含: lexicon.txt, tokens.txt, espeak-ng-data/
-# 下载 model-steps-3.onnx 到 /home/cat/matcha-data/
-
-# Vocos vocoder（需在 x86 上用 rknn-toolkit2 编译）
-# 见下方"编译 Vocos RKNN"
-
-# Qwen3-ASR 模型
-# encoder: /home/cat/qwen3-asr-models/encoder/
-# decoder: /home/cat/qwen3-asr-models/decoder/
-# vad: /home/cat/qwen3-asr-models/vad/
-```
-
-### 2. 编译 Vocos RKNN（x86 上执行）
-
-```bash
-# 需要 rknn-toolkit2 >= 2.3.2
-pip install rknn-toolkit2
-
-# 编译
-python rk3576/scripts/convert_vocos_16khz_rknn.py \
-    --input vocos-16khz.onnx \
-    --output vocos-16khz-600.rknn \
-    --time-frames 600
-
-# 传输到设备
-scp vocos-16khz-600.rknn <device>:/home/cat/models/
-```
-
-### 3. 部署 Docker 服务
+## 快速开始
 
 ```bash
 cd rk3576/
-
-# 构建镜像
 docker compose build
-
-# 启动
 docker compose up -d
-
-# 检查健康
 curl http://localhost:8621/health
-# 应返回: {"tts":true,"tts_backend":"matcha_rknn","asr":true,...}
 ```
 
-### 4. 测试
+## TTS 后端
 
-```bash
-# TTS
-curl -X POST http://localhost:8621/tts \
-    -H "Content-Type: application/json" \
-    -d '{"text":"你好世界","language":"zh"}' \
-    --output test.wav
+通过 `TTS_BACKEND` 环境变量切换。
 
-# ASR
-curl -X POST http://localhost:8621/asr \
-    -F "file=@test.wav"
+### matcha_rknn（推荐）
+
+Matcha-icefall-zh-en，中英文，16kHz。
+
+```yaml
+TTS_BACKEND: matcha_rknn
+MATCHA_USE_ORT: 1              # ORT CPU FP32 (推荐, 精度 9/10, ~443ms)
+                                # 去掉此行则自动走 RKNN NPU (7/10, ~282ms)
+MATCHA_ONNX_PATH: /path/to/model-steps-3.onnx
 ```
 
-## 配置说明
+| 执行模式 | 延迟 | 精度 | 条件 |
+|---------|------|------|------|
+| ORT CPU FP32 | ~443ms | 9/10 | `MATCHA_USE_ORT=1` |
+| RKNN split + 1-step | ~282ms | 7/10 | matcha-split/ 存在，无 ORT flag |
+| RKNN 单模型 | ~535ms | 5/10 | 仅 matcha-s64.rknn |
 
-关键环境变量（`docker-compose.yml`）：
+**所需模型**:
+- `model-steps-3.onnx` — Matcha 声学模型（[sherpa-onnx 官方](https://github.com/k2-fsa/sherpa-onnx)）
+- `vocos-16khz-600.rknn` — Vocos vocoder（用 `scripts/convert_vocos_16khz_rknn.py` 编译）
+- `matcha-icefall-zh-en/` — 文本前端（lexicon.txt, tokens.txt）
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `TTS_BACKEND` | `matcha_rknn` | TTS 后端选择 |
-| `MATCHA_USE_ORT` | `1` | **推荐**: Matcha 走 ORT CPU FP32 (9/10 精度) |
-| `MATCHA_MAX_PHONEMES` | `64` | 单段最大音素数 |
-| `ASR_BACKEND` | `qwen3_asr_rk` | ASR 后端 |
-| `ASR_DECODER_TYPE` | `rkllm` | ASR decoder 类型 |
+### piper_rknn
 
-### 切换到 RKNN NPU 模式（可选）
+Piper VITS，多语言（en/zh/de/fr/ja），16kHz。
 
-如果对延迟有极端要求（282ms vs 443ms），可以切换到 RKNN split 模式：
-
-```bash
-# 1. 生成 split 模型（x86 上执行）
-python rk3576/scripts/fix_matcha_rknn.py \
-    --input model-steps-3.onnx --output model-fixed.onnx
-python rk3576/scripts/split_matcha_rknn.py \
-    --all --onnx model-fixed.onnx --output-dir matcha-split/
-
-# 2. 传输到设备
-scp matcha-split/*.rknn matcha-split/*.npy <device>:/home/cat/models/matcha-split/
-
-# 3. 去掉 MATCHA_USE_ORT 环境变量（docker-compose.yml）
-# 服务会自动检测 matcha-split/ 目录并使用 split 模式
-
-# 4. 设置 1-step ODE（推荐，减少 FP16 累积误差）
-# 添加: MATCHA_ODE_STEPS=1
+```yaml
+TTS_BACKEND: piper_rknn
+PIPER_MODEL_DIR: /opt/piper-models
+PIPER_DEFAULT_LANG: en_US
 ```
 
-**注意**: RKNN 模式精度 7/10，部分音节会失真（FP16 Conv/MatMul 硬件限制）。
+混合部署：Encoder+DP 走 ORT CPU，Flow+Decoder 走 RKNN NPU。RTF ~0.07。
 
-## 性能数据
+### qwen3_rknn
 
-### TTS (Matcha + Vocos)
+Qwen3-TTS 0.6B codec 模型（实验性）。
 
-| 模式 | 延迟 (7 tokens) | 精度 (round-trip) |
-|------|-----------------|-------------------|
-| **ORT CPU FP32 (推荐)** | **443ms** | **9/10** |
-| RKNN split + 1-step | 282ms | 7/10 |
-| RKNN 单模型 3-step | 535ms | 5/10 |
+## ASR 后端
 
-### ASR (Qwen3-ASR)
+通过 `ASR_BACKEND` 环境变量切换。
+
+### qwen3_asr_rk（推荐）
+
+Qwen3-ASR，RKNN encoder + RKLLM decoder，52 语言，流式。
+
+```yaml
+ASR_BACKEND: qwen3_asr_rk
+ASR_DECODER_TYPE: rkllm
+ASR_MODEL_DIR: /opt/asr/models
+```
 
 | 指标 | 值 |
 |------|-----|
 | RTF | 0.44 |
 | 延迟 (2s 音频) | ~1.2s |
+| 流式 | 支持 (WebSocket) |
 
-### 端到端 V2V
+## 模型编译
 
-| 指标 | 值 |
-|------|-----|
-| TTS + ASR | ~1.6s |
+NPU 模型需要在 x86 主机上用 rknn-toolkit2 编译。
+
+```bash
+# Vocos vocoder
+python scripts/convert_vocos_16khz_rknn.py --input vocos.onnx --output vocos-16khz-600.rknn
+
+# Matcha split (可选，RKNN 模式用)
+python scripts/fix_matcha_rknn.py --input model-steps-3.onnx --output model-fixed.onnx
+python scripts/split_matcha_rknn.py --all --onnx model-fixed.onnx
+
+# Piper VITS
+python scripts/fix_piper_rknn.py --input piper-model.onnx --output piper-fixed.onnx
+```
+
+## 自定义算子框架
+
+本项目实现了 RKNN 自定义 CPU 算子的完整 pipeline，可用于任何需要在 NPU 模型中插入 CPU FP32 精度计算的场景：
+
+1. ONNX 中 1:1 替换 `op_type`（不改图拓扑）
+2. Toolkit 端注册 `shape_infer` + `compute`
+3. Runtime 端 ctypes 调 `rknn_register_custom_ops()`
+4. C 实现带 ARM NEON SIMD（`cst_ops_neon.c`）
+
+已实现算子：Sin, Mul, Pow, Add, InstanceNorm, SplineCoupling。
+
+详见 `app/backends/rknn_custom_ops.py`。
+
+## 关键配置
+
+| 变量 | 说明 |
+|------|------|
+| `TTS_BACKEND` | `matcha_rknn` / `piper_rknn` / `qwen3_rknn` |
+| `ASR_BACKEND` | `qwen3_asr_rk` |
+| `MATCHA_USE_ORT` | `1` = CPU FP32 (精度优先), 不设 = NPU (速度优先) |
+| `MATCHA_ODE_STEPS` | RKNN 模式 ODE 步数, `1` 推荐 |
+| `ASR_DECODER_TYPE` | `rkllm` (NPU) / `matmul` (NPU matmul API) |
 
 ## 文件结构
 
@@ -156,71 +137,28 @@ rk3576/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── app/
-│   ├── main.py                      # FastAPI 服务 (TTS/ASR/streaming/dialogue)
-│   ├── tts_backend.py               # TTS backend 抽象
-│   ├── tts_service.py               # Qwen3-TTS service (备选)
-│   ├── asr_backend.py               # ASR backend 抽象
-│   ├── backends/
-│   │   ├── rknn_matcha_tts.py       # Matcha TTS (ORT/RKNN split/RKNN single)
-│   │   ├── rknn_custom_ops.py       # RKNN 自定义算子 ctypes 注册
-│   │   ├── cst_ops_neon.c           # ARM NEON 自定义算子 (Sin/Mul/Pow/Add/InstanceNorm)
-│   │   ├── qwen3_asr_rk.py          # Qwen3-ASR backend
-│   │   └── piper_rknn.py            # Piper VITS backend (备选)
-│   └── qwen3asr/
-│       ├── engine.py                # ASR engine
-│       ├── stream.py                # 流式 ASR
-│       └── mel.py                   # 纯 numpy STFT
-├── scripts/
-│   ├── fix_matcha_rknn.py           # Matcha ONNX surgery (probe-first)
-│   ├── split_matcha_rknn.py         # Matcha 模型拆分 (encoder+estimator)
-│   ├── convert_vocos_16khz_rknn.py  # Vocos RKNN 编译
-│   ├── replace_all_ops.py           # 批量 ONNX op 替换为自定义 op
-│   ├── fix_piper_rknn.py            # Piper VITS ONNX surgery
-│   └── surgery_piper_custom_ops.py  # Piper 自定义算子 surgery
-└── tests/                           # pytest 测试套件
-    ├── conftest.py
-    ├── metrics.py
-    ├── test_roundtrip.py
-    ├── test_tts.py
-    ├── test_asr.py
-    └── test_latency.py
+│   ├── main.py                      # FastAPI 服务
+│   ├── tts_backend.py               # TTS backend 接口
+│   ├── asr_backend.py               # ASR backend 接口
+│   ├── backends/                    # 各后端实现
+│   │   ├── rknn_matcha_tts.py
+│   │   ├── piper_rknn.py
+│   │   ├── qwen3_asr_rk.py
+│   │   ├── rknn_custom_ops.py       # 自定义算子注册
+│   │   └── cst_ops_neon.c           # NEON 算子实现
+│   └── qwen3asr/                    # ASR engine
+├── scripts/                         # 模型编译/转换工具
+│   ├── fix_matcha_rknn.py
+│   ├── split_matcha_rknn.py
+│   ├── convert_vocos_16khz_rknn.py
+│   ├── fix_piper_rknn.py
+│   └── replace_all_ops.py
+└── tests/                           # pytest 测试
 ```
-
-## 设备上的模型目录
-
-```
-/home/cat/models/
-├── matcha-icefall-zh-en/        # Matcha 文本前端 (lexicon, tokens)
-├── vocos-16khz-600.rknn         # Vocos vocoder RKNN
-├── matcha-s64.rknn              # Matcha 单体 RKNN (RKNN 模式备选)
-└── matcha-split/                # Matcha split 模型 (RKNN split 模式用)
-    ├── matcha-encoder-fp16.rknn
-    ├── matcha-estimator-fp16.rknn
-    └── time_emb_step{0,1,2}.npy
-
-/home/cat/matcha-data/
-└── model-steps-3.onnx           # Matcha ONNX (ORT 模式用)
-
-/home/cat/qwen3-asr-models/
-├── encoder/                     # ASR encoder RKNN
-├── decoder/                     # ASR decoder RKLLM
-└── vad/                         # VAD 模型
-```
-
-## 自定义算子框架
-
-本项目实现了完整的 RKNN 自定义 CPU 算子框架，可复用于其他模型部署：
-
-1. **ONNX 端**: 1:1 替换 `op_type`（如 `Sin` → `CstSin`），不改图拓扑
-2. **Toolkit 端**: `rknn.reg_custom_op()` 注册 Python shape_infer + compute
-3. **Runtime 端**: ctypes 调 `rknn_register_custom_ops()`，注册 C/NEON compute 函数
-4. **C 实现**: `cst_ops_neon.c`，ARM NEON SIMD 加速
-
-详见 `app/backends/rknn_custom_ops.py` 和 RKNN optimization skill。
 
 ## 已知限制
 
 - RK3576 NPU 只有 FP16，扩散/ODE 类模型精度不够 → 用 ORT CPU
-- RKLLM 和 RKNN 需要 domain 隔离 (`base_domain_id=1`)
-- Vocos RKNN 固定 600 帧输入，超长句需要分段合成
-- 英文 TTS 依赖 `espeak-ng`（Dockerfile 已安装）
+- RKLLM 与 RKNN 需要 IOMMU domain 隔离 (`base_domain_id=1`)
+- NPU 内存上限 ~180MB，超大模型需拆分或走 CPU
+- 详细踩坑记录见 `rknn-optimization` skill
