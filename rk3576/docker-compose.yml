@@ -16,6 +16,7 @@ services:
       - /home/cat/models/matcha-icefall-zh-en:/opt/tts/models/matcha-icefall-zh-en:ro
       - /home/cat/models/matcha-s64.rknn:/opt/tts/models/matcha-s64.rknn:ro
       - /home/cat/models/vocos-16khz-600.rknn:/opt/tts/models/vocos-16khz-600.rknn:ro
+      - /home/cat/models/matcha-split:/opt/tts/models/matcha-split:ro
       - /home/cat/matcha-data:/home/cat/matcha-data:ro
       - /home/cat/qwen3-asr-models:/opt/asr/models:ro
       - /home/cat/rk3576-build/librkllmrt.so:/opt/asr/lib/librkllmrt.so:ro
@@ -33,6 +34,10 @@ services:
       - PYTHONPATH=/opt/rknn-matmul-parallel
       - MATCHA_MAX_PHONEMES=64
       - MATCHA_MODEL_SEQ_LEN=80
+      # Matcha acoustic model: ORT CPU FP32 recommended for best quality (9/10).
+      # RKNN split mode (7/10, faster for long sentences) auto-activates if
+      # matcha-split/ models exist and MATCHA_USE_ORT is not set.
+      - MATCHA_USE_ORT=1
       - MATCHA_MODEL=matcha-s64.rknn
       - VOCOS_MODEL=vocos-16khz-600.rknn
       - VOCOS_FRAMES=600

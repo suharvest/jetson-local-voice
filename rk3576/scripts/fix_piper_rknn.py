@@ -86,6 +86,49 @@ import onnx
 from onnx import numpy_helper, TensorProto, helper
 import onnxruntime as ort
 
+# Recognized ONNX standard domains (others are treated as custom)
+_STANDARD_DOMAINS = {'', 'ai.onnx', 'ai.onnx.ml', 'com.microsoft', 'ai.onnx.training'}
+
+
+def _stub_custom_ops(model_proto: onnx.ModelProto) -> onnx.ModelProto:
+    """Replace custom-domain op nodes with Identity stubs so ORT can load the model.
+
+    Used for probing intermediate tensor shapes when the model contains custom ops
+    (e.g. PiperSplineCoupling) that ORT cannot execute. The stub maps the first
+    input to the first output via Identity; any remaining outputs are left dangling
+    (acceptable since we only probe specific upstream tensors).
+    """
+    patched = []
+    for n in model_proto.graph.node:
+        if n.domain not in _STANDARD_DOMAINS:
+            if n.input and n.output:
+                stub = onnx.helper.make_node(
+                    'Identity', inputs=[n.input[0]], outputs=[n.output[0]],
+                    name=(n.name or n.op_type) + '__stub')
+                patched.append(stub)
+            # Drop nodes with no inputs/outputs entirely
+        else:
+            patched.append(n)
+    del model_proto.graph.node[:]
+    model_proto.graph.node.extend(patched)
+    return model_proto
+
+
+def _ort_session_with_stub(model_proto: onnx.ModelProto) -> tuple:
+    """Save model with custom op stubs to a temp file and return (session, tmp_path).
+
+    Caller is responsible for unlinking tmp_path after use.
+    """
+    m_stub = onnx.ModelProto()
+    m_stub.CopyFrom(model_proto)
+    _stub_custom_ops(m_stub)
+    del m_stub.graph.value_info[:]
+    tmp = tempfile.mktemp(suffix='.onnx')
+    onnx.save(m_stub, tmp)
+    sess = ort.InferenceSession(tmp, providers=['CPUExecutionProvider'])
+    return sess, tmp
+
+
 # Fixed parameters
 SEQ_LEN = 128   # Max token sequence length (bucket size)
 
@@ -935,19 +978,24 @@ def replace_cpu_fallback_ops(model: onnx.ModelProto, test_inputs: dict) -> onnx.
     # Clear stale intermediate value_info to avoid type conflicts when adding
     # probe outputs (e.g. int64 tensors mistakenly annotated as float after surgery).
     del m_probe.graph.value_info[:]
+
+    # Replace any custom-domain ops (e.g. PiperSplineCoupling) with Identity stubs
+    # so that ORT can load and execute the model. Custom ops are only needed at
+    # RKNN runtime; the probing session only needs to run through upstream nodes.
     existing = {o.name for o in m_probe.graph.output}
     for tname in probe_tensors:
         if tname not in existing:
             # Use UNDEFINED type — ORT will infer the actual type from the graph.
-            # We create a ValueInfoProto with just the name and no type constraint.
             vi = onnx.ValueInfoProto()
             vi.name = tname
             m_probe.graph.output.append(vi)
 
-    tmp = tempfile.mktemp(suffix='.onnx')
-    onnx.save(m_probe, tmp)
-    sess = ort.InferenceSession(tmp, providers=['CPUExecutionProvider'])
-    all_out = sess.run(None, test_inputs)
+    # Use stub helper to handle any custom domain ops (e.g. PiperSplineCoupling)
+    sess, tmp = _ort_session_with_stub(m_probe)
+    # Filter test_inputs to only what this model actually requires
+    model_input_names = {i.name for i in sess.get_inputs()}
+    filtered_inputs = {k: v for k, v in test_inputs.items() if k in model_input_names}
+    all_out = sess.run(None, filtered_inputs)
     os.unlink(tmp)
 
     out_names = [o.name for o in m_probe.graph.output]
@@ -1377,11 +1425,11 @@ def fix_3d_matmul_for_rknn(model: onnx.ModelProto, test_inputs: dict) -> onnx.Mo
     for tname in probe_tensors:
         vi = helper.make_tensor_value_info(tname, TensorProto.FLOAT, None)
         m_probe.graph.output.append(vi)
-    tmp = tempfile.mktemp(suffix='.onnx')
-    onnx.save(m_probe, tmp)
     try:
-        sess = ort.InferenceSession(tmp, providers=['CPUExecutionProvider'])
-        all_out = sess.run(None, test_inputs)
+        sess, tmp = _ort_session_with_stub(m_probe)
+        model_input_names = {i.name for i in sess.get_inputs()}
+        filtered = {k: v for k, v in test_inputs.items() if k in model_input_names}
+        all_out = sess.run(None, filtered)
         out_names = [o.name for o in m_probe.graph.output]
         input_shapes = {name: val.shape for name, val in zip(out_names, all_out)
                         if name in probe_tensors}
@@ -1389,7 +1437,10 @@ def fix_3d_matmul_for_rknn(model: onnx.ModelProto, test_inputs: dict) -> onnx.Mo
         print(f"  Warning: could not probe MatMul shapes: {e}")
         input_shapes = {}
     finally:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
 
     # Find MatMul nodes where first input has square last two dims (3D or 4D)
     # RKNN exMatMul bug: when A[-2] == A[-1] (i.e. M == K), exMatMul_infer remaps
@@ -1485,16 +1536,16 @@ def fix_random_noise(model: onnx.ModelProto, test_inputs: dict) -> onnx.ModelPro
         print("  No RandomNormalLike / RandomUniformLike nodes found")
         return model
 
-    # Probe to get output shapes
+    # Probe to get output shapes (use stub to handle any custom ops in the graph)
     m_probe = onnx.ModelProto()
     m_probe.CopyFrom(model)
     for rn in rn_nodes:
         vi = helper.make_tensor_value_info(rn.output[0], TensorProto.FLOAT, None)
         m_probe.graph.output.append(vi)
-    tmp = tempfile.mktemp(suffix='.onnx')
-    onnx.save(m_probe, tmp)
-    sess = ort.InferenceSession(tmp, providers=['CPUExecutionProvider'])
-    all_out = sess.run(None, test_inputs)
+    sess, tmp = _ort_session_with_stub(m_probe)
+    model_input_names = {i.name for i in sess.get_inputs()}
+    filtered_inputs = {k: v for k, v in test_inputs.items() if k in model_input_names}
+    all_out = sess.run(None, filtered_inputs)
     os.unlink(tmp)
     shapes = {name: val.shape for name, val in zip([o.name for o in m_probe.graph.output], all_out)
               if any(rn.output[0] == name for rn in rn_nodes)}
@@ -1539,6 +1590,10 @@ def main():
                         help=f'Max token sequence length / bucket size (default: {SEQ_LEN})')
     parser.add_argument('--wav', default=None,
                         help='Generate a test WAV file at this path')
+    parser.add_argument('--stop-after-step4b', action='store_true',
+                        help='Stop after Step 4b (Ceil fix), before spline ops (use with surgery_piper_custom_ops.py)')
+    parser.add_argument('--start-from-step5b', action='store_true',
+                        help='Skip steps 0-5a2, only apply 5b (3D MatMul) + 5c (RandomNoise) on --input')
     args = parser.parse_args()
 
     input_path = os.path.expanduser(args.input)
@@ -1588,6 +1643,33 @@ def main():
         'cumulative_durations': cumulative_durations,
     }
 
+    # Jump-start from step 5a2 or 5b (for custom-op surgery workflow)
+    if args.start_from_step5b:
+        print(f"\n[start-from-step5b] Loading model (skipping steps 0-5a2)...")
+        model = onnx.load(input_path)
+        print(f"  Nodes: {len(model.graph.node)}")
+        # Step 5a2: Replace remaining ScatterND/GatherND/CumSum
+        print("\n[5a2] Replacing remaining ScatterND/GatherND/CumSum with NPU-native ops...")
+        model = replace_remaining_cpu_ops(model, test_inputs)
+        # Step 5b: Fix 3D MatMul for RKNN exMatMul broadcast bug
+        print("\n[5b] Fixing 3D MatMul nodes for RKNN compatibility...")
+        model = fix_3d_matmul_for_rknn(model, test_inputs)
+        # Step 5c: RandomNormalLike / RandomUniformLike
+        print("\n[5c] Replacing RandomNormalLike / RandomUniformLike...")
+        model = fix_random_noise(model, test_inputs)
+        # Check remaining problematic ops
+        warn_ops = ['Range', 'Erf', 'Softplus', 'NonZero', 'RandomNormalLike', 'RandomUniformLike',
+                    'ScatterND', 'GatherND', 'CumSum']
+        for op in warn_ops:
+            n = sum(1 for node in model.graph.node if node.op_type == op)
+            if n:
+                print(f"  WARNING: {n} {op} node(s) remain")
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        onnx.save(model, output_path)
+        sz = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"\nSaved: {output_path} ({sz:.1f} MB), {len(model.graph.node)} nodes")
+        return
+
     # Step 1: onnxsim
     print("\n[1/5] onnxsim simplification...")
     model = load_and_simplify(input_path, seq_len)
@@ -1607,6 +1689,16 @@ def main():
     # Step 4b: Ceil ops
     print("\n[4b] Replacing Ceil with Neg(Floor(Neg(x)))...")
     model = fix_ceil_ops(model)
+
+    # Early exit for custom-op surgery workflow
+    if args.stop_after_step4b:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        onnx.save(model, output_path)
+        sz = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"\n[stop-after-step4b] Saved intermediate model: {output_path} ({sz:.1f} MB)")
+        print(f"  Nodes: {len(model.graph.node)}")
+        print(f"  Next: python surgery_piper_custom_ops.py --input {output_path} ...")
+        return
 
     # Step 5a: Replace spline NonZero/GatherND/ScatterND with Clip+Where
     print("\n[5a/6] Replacing spline NonZero/GatherND/ScatterND with Clip+Where...")

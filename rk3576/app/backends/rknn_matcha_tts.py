@@ -41,6 +41,18 @@ MATCHA_MODEL_SEQ_LEN = int(os.environ.get('MATCHA_MODEL_SEQ_LEN', '80'))
 # Vocos model compiled time frame dimension (must match vocos RKNN build).
 VOCOS_FRAMES = int(os.environ.get('VOCOS_FRAMES', '600'))
 
+# Split model constants (encoder + estimator with CPU FP32 ODE loop)
+MEL_SIGMA = 5.446792
+MEL_MEAN = -2.9521978
+# ODE constants for split RKNN mode (not used in ORT mode).
+# The default runtime step count is 1 (env MATCHA_ODE_STEPS=1) for best
+# FP16 precision; N_ODE_STEPS=3 is only used for loading time_emb files.
+ODE_DT = 1.0 / 3.0
+N_ODE_STEPS = 3  # number of pre-computed time_emb files (always 3)
+MAX_FRAMES = 600
+TIME_EMB_DIM = 256
+N_TIME_BLOCKS = 6
+
 
 class RKNNMatchaVocoder:
     """RKNN 加速的 Matcha TTS 引擎"""
@@ -61,7 +73,11 @@ class RKNNMatchaVocoder:
 
         # 加载后的模型
         self._matcha = None
-        self._matcha_backend = None  # 'rknn' or 'ort'
+        self._matcha_backend = None  # 'rknn', 'rknn_split', or 'ort'
+        self._matcha_encoder = None   # split mode: encoder RKNN
+        self._matcha_estimator = None  # split mode: estimator RKNN
+        self._cstsin_refs = None      # ctypes refs for CstSin custom op (prevent GC)
+        self._time_emb_steps = None   # split mode: [3, 6, 256] time embeddings
         self._vocos = None
         self._lexicon = None
         self._token_to_id = None
@@ -90,21 +106,68 @@ class RKNNMatchaVocoder:
                     # token ID = 行号 + 1 (1-indexed)
                     self._token_to_id[parts[0]] = i + 1
 
-        # 加载 Matcha 声学模型 — 优先 RKNN，回退 ORT (CPU)
-        # Look for ONNX fallback: same name with .onnx, or model-steps-3.onnx
-        # in the same directory or a well-known location.
-        matcha_onnx_path = self.matcha_rknn_path.replace('.rknn', '.onnx')
-        if not os.path.exists(matcha_onnx_path):
-            # Try model-steps-3.onnx in same directory
-            alt = os.path.join(os.path.dirname(self.matcha_rknn_path), 'model-steps-3.onnx')
-            if os.path.exists(alt):
-                matcha_onnx_path = alt
-            else:
-                # Try MATCHA_ONNX_PATH env override
-                matcha_onnx_path = os.environ.get('MATCHA_ONNX_PATH', matcha_onnx_path)
+        # 加载 Matcha 声学模型
+        # Priority: 1) split RKNN (best FP16 precision), 2) single RKNN, 3) ORT fallback
+        matcha_dir = os.path.dirname(self.matcha_rknn_path)
+        split_dir = os.environ.get('MATCHA_SPLIT_DIR',
+                                   os.path.join(matcha_dir, 'matcha-split'))
+        enc_path = os.path.join(split_dir, 'matcha-encoder-fp16.rknn')
+        est_path = os.path.join(split_dir, 'matcha-estimator-fp16.rknn')
+        te_path = os.path.join(split_dir, 'time_emb_step0.npy')
+
         use_ort = os.environ.get('MATCHA_USE_ORT', '').lower() in ('1', 'true', 'yes')
 
-        if not use_ort and os.path.exists(self.matcha_rknn_path):
+        # Try split RKNN mode first (best precision: ODE loop on CPU FP32)
+        if not use_ort and os.path.exists(enc_path) and os.path.exists(est_path) and os.path.exists(te_path):
+            try:
+                self._matcha_encoder = RKNNLite(verbose=False)
+                ret = self._matcha_encoder.load_rknn(enc_path)
+                if ret != 0:
+                    raise RuntimeError(f"load encoder ret={ret}")
+                ret = self._matcha_encoder.init_runtime(core_mask=1)
+                if ret != 0:
+                    raise RuntimeError(f"init encoder runtime ret={ret}")
+
+                self._matcha_estimator = RKNNLite(verbose=False)
+                ret = self._matcha_estimator.load_rknn(est_path)
+                if ret != 0:
+                    raise RuntimeError(f"load estimator ret={ret}")
+                ret = self._matcha_estimator.init_runtime(core_mask=1)
+                if ret != 0:
+                    raise RuntimeError(f"init estimator runtime ret={ret}")
+
+                # Register custom CPU ops if the .so exists
+                cstops_so = os.environ.get(
+                    'CSTOPS_LIB', '/opt/tts/lib/libcstops.so')
+                if os.path.exists(cstops_so):
+                    from backends.rknn_custom_ops import register_custom_ops
+                    self._cstsin_refs = register_custom_ops(
+                        self._matcha_estimator,
+                        lib_path=cstops_so,
+                    )
+                    if self._cstsin_refs is None:
+                        log.warning("Custom op registration failed")
+                else:
+                    self._cstsin_refs = None
+
+                self._time_emb_steps = [
+                    np.load(os.path.join(split_dir, f'time_emb_step{i}.npy'))
+                    for i in range(N_ODE_STEPS)
+                ]
+                self._matcha_backend = 'rknn_split'
+                log.info("Matcha loaded via split RKNN (encoder+estimator, CPU FP32 ODE)")
+            except Exception as e:
+                log.warning("Matcha split RKNN load failed (%s), trying single RKNN", e)
+                for m in (self._matcha_encoder, self._matcha_estimator):
+                    if m is not None:
+                        try:
+                            m.release()
+                        except Exception:
+                            pass
+                self._matcha_encoder = self._matcha_estimator = self._time_emb_steps = None
+
+        # Try single RKNN
+        if self._matcha_backend is None and not use_ort and os.path.exists(self.matcha_rknn_path):
             try:
                 self._matcha = RKNNLite(verbose=False)
                 ret = self._matcha.load_rknn(self.matcha_rknn_path)
@@ -114,7 +177,7 @@ class RKNNMatchaVocoder:
                 if ret != 0:
                     raise RuntimeError(f"init_runtime ret={ret}")
                 self._matcha_backend = 'rknn'
-                log.info("Matcha acoustic model loaded via RKNN")
+                log.info("Matcha acoustic model loaded via RKNN (single model)")
             except Exception as e:
                 log.warning("Matcha RKNN load failed (%s), trying ORT fallback", e)
                 if self._matcha is not None:
@@ -124,19 +187,28 @@ class RKNNMatchaVocoder:
                         pass
                 self._matcha = None
 
-        if self._matcha is None and os.path.exists(matcha_onnx_path):
-            import onnxruntime as ort
-            self._matcha = ort.InferenceSession(
-                matcha_onnx_path,
-                providers=['CPUExecutionProvider'],
-            )
-            self._matcha_backend = 'ort'
-            log.info("Matcha acoustic model loaded via ORT (CPU): %s", matcha_onnx_path)
+        # ORT fallback
+        if self._matcha_backend is None:
+            matcha_onnx_path = self.matcha_rknn_path.replace('.rknn', '.onnx')
+            if not os.path.exists(matcha_onnx_path):
+                alt = os.path.join(matcha_dir, 'model-steps-3.onnx')
+                if os.path.exists(alt):
+                    matcha_onnx_path = alt
+                else:
+                    matcha_onnx_path = os.environ.get('MATCHA_ONNX_PATH', matcha_onnx_path)
+            if os.path.exists(matcha_onnx_path):
+                import onnxruntime as ort
+                self._matcha = ort.InferenceSession(
+                    matcha_onnx_path,
+                    providers=['CPUExecutionProvider'],
+                )
+                self._matcha_backend = 'ort'
+                log.info("Matcha acoustic model loaded via ORT (CPU): %s", matcha_onnx_path)
 
-        if self._matcha is None:
+        if self._matcha_backend is None:
             raise RuntimeError(
-                f"无法加载 Matcha 声学模型: RKNN={self.matcha_rknn_path}, "
-                f"ONNX={matcha_onnx_path}"
+                f"无法加载 Matcha 声学模型: split={split_dir}, "
+                f"RKNN={self.matcha_rknn_path}"
             )
 
         # 加载 Vocos RKNN
@@ -150,18 +222,20 @@ class RKNNMatchaVocoder:
 
     def release(self):
         """释放资源"""
-        if self._matcha:
-            if self._matcha_backend == 'rknn':
+        for m in (self._matcha, self._matcha_encoder, self._matcha_estimator):
+            if m is not None:
                 try:
-                    self._matcha.release()
+                    m.release()
                 except Exception:
                     pass
-            self._matcha = None
-            self._matcha_backend = None
+        self._matcha = self._matcha_encoder = self._matcha_estimator = None
+        self._cstsin_refs = None
+        self._time_emb_steps = None
+        self._matcha_backend = None
         if self._vocos:
             try:
                 self._vocos.release()
-            except:
+            except Exception:
                 pass
             self._vocos = None
 
@@ -293,10 +367,34 @@ class RKNNMatchaVocoder:
         noise_scale_arr = np.array([noise_scale], dtype=np.float32)
         length_scale_arr = np.array([length_scale], dtype=np.float32)
 
-        if self._matcha_backend == 'rknn':
-            # Pad tokens to the RKNN model's compiled static input length.
-            # MAX_SEQ_LEN caps the phoneme count; MATCHA_MODEL_SEQ_LEN is the
-            # tensor dimension the RKNN model was built with (must match exactly).
+        if self._matcha_backend == 'rknn_split':
+            # Split mode: encoder (NPU) + estimator (NPU) + ODE loop (CPU FP32)
+            tokens_padded = np.zeros((1, MATCHA_MODEL_SEQ_LEN), dtype=np.int64)
+            tokens_padded[0, :num_tokens] = tokens
+            enc_out = self._matcha_encoder.inference(
+                inputs=[tokens_padded, x_length, noise_scale_arr, length_scale_arr]
+            )
+            mu = enc_out[0]     # [1, 80, 600]
+            mask = enc_out[1]   # [1, 1, 600]
+            z = enc_out[2]      # [1, 80, 600] (z0 = noise * noise_scale)
+
+            # ODE loop on CPU (FP32 precision).
+            # 1-step Euler (dt=1.0) is preferred on RK3576: fewer FP16
+            # accumulation errors and 2.6x faster than 3-step.
+            n_steps = int(os.environ.get('MATCHA_ODE_STEPS', '1'))
+            dt = np.float32(1.0 / n_steps)
+            for step in range(n_steps):
+                te = self._time_emb_steps[min(step, len(self._time_emb_steps) - 1)]
+                feeds = [z, mu, mask]
+                for i in range(N_TIME_BLOCKS):
+                    feeds.append(te[i].reshape(1, TIME_EMB_DIM, 1).astype(np.float32))
+                v = self._matcha_estimator.inference(inputs=feeds)[0]
+                z = z + dt * v
+
+            # Denormalize
+            mel = z * np.float32(MEL_SIGMA) + np.float32(MEL_MEAN)
+
+        elif self._matcha_backend == 'rknn':
             tokens_padded = np.zeros((1, MATCHA_MODEL_SEQ_LEN), dtype=np.int64)
             tokens_padded[0, :num_tokens] = tokens
             mel = self._matcha.inference(
@@ -322,12 +420,14 @@ class RKNNMatchaVocoder:
             # ORT produces dynamic output — all frames are valid.
             mel_frames = T
         else:
-            # RKNN produces fixed-size output (e.g., 599 frames for s64 bucket).
+            # RKNN produces fixed-size output (e.g., 600 frames for split, 599 for single).
             # Estimate valid frames from token count. Calibrated against ORT:
-            #   n=2→76, n=4→101, n=10→162, n=30→309, n=60→549
-            # Fit: mel_frames ≈ 9.2 * n_tokens + 58, with +10% safety margin.
-            est = int((9.2 * num_tokens + 58) * length_scale * 1.1 + 0.5)
+            #   n=1→65, n=5→114, n=9→150, n=14→226, n=17→253
+            # Linear fit: 11.9 * n + 51, with 20% safety margin to avoid truncation.
+            est = int((11.9 * num_tokens + 51) * length_scale * 1.2 + 0.5)
             mel_frames = min(est, T)
+            # Clamp to ORT-observed range as safety measure.
+            mel = np.clip(mel, -25.0, 8.0)
 
         return mel, mel_frames
 
@@ -441,6 +541,61 @@ class RKNNMatchaVocoder:
                         sub_result.append(s)
                 final.extend(sub_result if sub_result else [seg])
         return final
+
+    @staticmethod
+    def _smooth_mel(mel: np.ndarray) -> np.ndarray:
+        """Fix FP16 energy anomalies in RKNN mel via adaptive per-frame correction.
+
+        RKNN FP16 estimator produces localized energy dips (40% of expected) and
+        spikes (200%) at individual frames. Instead of blanket smoothing (which
+        blurs good frames), we detect anomalous frames by comparing per-frame
+        energy against a local median, then blend only those frames with their
+        neighbors.
+
+        Args:
+            mel: [1, 80, T] mel spectrogram
+
+        Returns:
+            Corrected mel with same shape.
+        """
+        m = mel[0]  # [80, T]
+        T = m.shape[1]
+        if T < 5:
+            return mel
+
+        # Per-frame energy
+        energy = np.mean(m ** 2, axis=0)  # [T]
+
+        # Local median energy (window=5)
+        pad = 2
+        e_padded = np.pad(energy, pad, mode='reflect')
+        # Sliding window median via sorted approach
+        local_med = np.array([
+            np.median(e_padded[i:i + 5]) for i in range(T)
+        ])
+
+        # Detect anomalous frames: energy ratio vs local median
+        ratio = energy / (local_med + 1e-8)
+        # Anomaly = frame where energy < 50% or > 180% of local median
+        anomaly = (ratio < 0.5) | (ratio > 1.8)
+        n_anomaly = np.sum(anomaly)
+        if n_anomaly == 0:
+            return mel
+
+        # Blend anomalous frames with average of their 2 neighbors
+        result = m.copy()
+        for t in range(T):
+            if anomaly[t]:
+                left = max(0, t - 1)
+                right = min(T - 1, t + 1)
+                if left == t:
+                    result[:, t] = m[:, right]
+                elif right == t:
+                    result[:, t] = m[:, left]
+                else:
+                    result[:, t] = (m[:, left] + m[:, right]) * 0.5
+
+        return result[np.newaxis]
 
     def _synthesize_segment(
         self,
@@ -578,7 +733,7 @@ class MatchaRKNNBackend:
 
     def is_ready(self) -> bool:
         """Return True if the engine is loaded and ready."""
-        return self._engine is not None and self._engine._matcha is not None
+        return self._engine is not None and self._engine._matcha_backend is not None
 
     def preload(self) -> None:
         """Create and load RKNNMatchaVocoder. Called once at startup."""
