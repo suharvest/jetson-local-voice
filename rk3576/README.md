@@ -1,210 +1,226 @@
-# Qwen3-TTS on RK3576 — RKNN Deployment
+# RK3576 Speech Service
 
-## Overview
+中英文 TTS + ASR 全栈语音服务，部署在 RK3576（6 TOPS NPU）上。
 
-Deploy Qwen3-TTS (0.6B, 12Hz codec) on RK3576 (LubanCat-3, 8GB RAM, 6 TOPS NPU) with:
-- Full NPU acceleration via RKNN (all 9 models)
-- Voice cloning (x-vector mode) via speaker_encoder
-- Stateless KV-cache for talker AR generation
-
-## Architecture
+## 架构
 
 ```
-Text → text_project (RKNN) → embeddings
-                                  ↓
-                    prefill_embeds + [optional: speaker_encoder (RKNN)]
-                                  ↓
-                    talker_prefill (RKNN) → logits + KV-cache
-                                  ↓
-                    AR loop: talker_decode (RKNN) → codec tokens
-                        ↓
-                    code_predictor + code_predictor_embed (RKNN) → residual codes
-                        ↓
-                    tokenizer12hz_decode_stream (RKNN) → audio waveform
+TTS: 文本 → 文本前端(CPU) → Matcha ORT(CPU FP32) → mel → Vocos RKNN(NPU FP16) → ISTFT(CPU) → 音频
+ASR: 音频 → VAD(CPU) → Encoder RKNN(NPU FP16) → RKLLM Decoder(NPU W4A16) → 文本
 ```
 
-## RKNN Models (rk3576, FP16, all 9/9 converted)
+**为什么 Matcha 走 CPU 而非 NPU？**
 
-| Model | RKNN Size | Fixed Shape | Notes |
-|-------|----------|-------------|-------|
-| talker_prefill | 1,322 MB | embeds[1,32,1024] mask[1,32] | Max prefill 32 tokens |
-| talker_decode | 894 MB | embeds[1,1,1024] mask[1,513] 56×KV[1,8,512,128] | Max 512 AR steps (~40s audio) |
-| text_project | 606 MB | input_ids[1,128] | Text → embedding projection |
-| tokenizer12hz_decode_stream | 237 MB | audio_codes[1,75,16] | Streaming decode (ctx=50+chunk=25) |
-| tokenizer12hz_encode | 241 MB | audio[1,72000] | Audio → codec (voice clone ICL) |
-| code_predictor | 174 MB | context[1,2,1024] | Residual codebook prediction |
-| speaker_encoder | 18 MB | mel[1,300,128] | Voice cloning (onnxsim required) |
-| codec_embed | 6 MB | token_ids[1,1] | Codec token embedding |
-| code_predictor_embed | 4 MB | token_id[1,1] scalar | Residual embedding |
-| **Total** | **3,502 MB** | | |
+Matcha TTS 是扩散模型（3-step ODE），RK3576 NPU 只有 FP16 精度。经过完整的精度分析（`accuracy_analysis()`、自定义算子实验、逐层 A/B 对比），确认 FP16 精度损失在 Conv/MatMul 硬件层面，无法通过自定义算子或 graph surgery 解决。ORT CPU (NEON FP32) 精度 9/10，延迟 443ms，是最优方案。
 
-## Conversion Environment
+详细分析过程见 `rknn-optimization` skill 文档。
 
-- Machine: wsl2-local (RTX 3060, Ubuntu 24.04, Python 3.12)
-- rknn-toolkit2 2.3.2 (requires onnx<=1.16.2)
-- torch 2.4 (CPU, NOT 2.11 — TorchScript regression)
-- qwen-tts 0.1.1
+## 快速部署
 
-## Key Technical Decisions
+### 前提条件
 
-### RKLLM Abandoned
-RKLLM v1.2.3 cannot convert the talker — asymmetric attention:
-- head_dim=128 (from q_proj [2048,1024])
-- RKLLM expects head_dim = hidden_size/num_heads = 1024/16 = 64
+- RK3576 开发板（4GB+ 内存）
+- Docker + docker-compose
+- 设备需要以下模型文件（见下方获取方式）
 
-### Pure RKNN with Stateless KV-cache
-ONNX export uses explicit KV-cache tensor I/O (56 tensors: 28 layers × key+value).
-C++ manages KV-cache buffers externally, same pattern as sherpa-onnx Zipformer RKNN.
+### 1. 获取模型
 
-### Fixed Shapes Required
-RKNN needs all dimensions fixed at compile time. Reshape nodes bake constants at trace time.
-Production shapes: prefill T=32, decode past_len=512.
+```bash
+# 在设备上创建目录
+mkdir -p /home/cat/models/matcha-icefall-zh-en
+mkdir -p /home/cat/matcha-data
+mkdir -p /home/cat/qwen3-asr-models
 
-### Conversion Workarounds
-- speaker_encoder: run `onnxsim.simplify()` before RKNN to resolve If-node constant folding
-- tokenizer decoder: force `attn_implementation="eager"` (SDPA breaks tracing)
-- torch `_is_torch_greater_or_equal_than_2_5 = True` to avoid `aten::__ior_` export failure
+# Matcha TTS 模型（sherpa-onnx 官方）
+# 下载 matcha-icefall-zh-en 到 /home/cat/models/matcha-icefall-zh-en/
+#   包含: lexicon.txt, tokens.txt, espeak-ng-data/
+# 下载 model-steps-3.onnx 到 /home/cat/matcha-data/
 
-## Files on wsl2-local
+# Vocos vocoder（需在 x86 上用 rknn-toolkit2 编译）
+# 见下方"编译 Vocos RKNN"
 
-```
-~/qwen3-tts-export/
-├── qwen3-tts-0.6b-12hz-fixed/      # Fixed-shape ONNX models (5.7 GB)
-├── qwen3-tts-0.6b-12hz-rknn-fixed/ # RKNN models for rk3576 (3.5 GB)
-├── export_fixed_shapes.py           # Main 7-model ONNX export
-├── export_remaining_v2.py           # tokenizer12hz_encode export
-├── export_decode_stream.py          # tokenizer12hz_decode_stream export
-└── convert_rknn_fixed.py            # Batch RKNN conversion
+# Qwen3-ASR 模型
+# encoder: /home/cat/qwen3-asr-models/encoder/
+# decoder: /home/cat/qwen3-asr-models/decoder/
+# vad: /home/cat/qwen3-asr-models/vad/
 ```
 
-## Voice Cloning (C++ integration)
+### 2. 编译 Vocos RKNN（x86 上执行）
 
-Implemented in sherpa-onnx fork (`offline-tts-qwen3-impl.cc`):
-- Speaker embedding extracted via FeatureExtractor (128-dim mel, 24kHz) + speaker_encoder
-- Injected at prefill position 7 via element-wise ADD with tts_pad embedding
-- GenerationConfig.reference_audio/reference_sample_rate fields (already existed)
-- Graceful fallback when speaker_encoder not loaded
+```bash
+# 需要 rknn-toolkit2 >= 2.3.2
+pip install rknn-toolkit2
 
-## E2E Quality Verification (2026-04-04)
+# 编译
+python rk3576/scripts/convert_vocos_16khz_rknn.py \
+    --input vocos-16khz.onnx \
+    --output vocos-16khz-600.rknn \
+    --time-frames 600
 
-TTS → ASR loop on RTX 3060 (bfloat16, PyTorch eager attention):
-
-| Input | ASR Result | RTF | Match |
-|-------|-----------|-----|-------|
-| 你好 | 你好 | 2.62 | MATCH |
-| 今天天气真不错 | 今天天气真不错 | 2.31 | MATCH |
-| Hello nice to meet you | hello nice to meet you | 1.97 | MATCH |
-| 我是你的语音助手 | 我是你的语音助手 | 2.01 | MATCH |
-
-ASR endpoint: `ws://100.67.111.58:8621/asr/stream` (Paraformer streaming)
-
-## Resolved Issues
-
-- tokenizer12hz_decode_stream: exported with eager attention + RKNN converted (237 MB)
-- speaker_encoder RKNN: fixed by running onnxsim.simplify() before conversion (18 MB)
-- export-onnx.py bugs: text_embed_tokens→text_embedding, lm_head→codec_head, head_dim, DynamicCache
-- System torch broken by agent: fixed with uv venv isolation
-
-## RK3576 Hardware Benchmark (2026-04-04)
-
-Runtime: librknnrt 2.3.2, NPU driver 0.9.8, dual-core enabled
-
-| Model | past_len | Quant | ms/step | RTF | Speedup |
-|-------|----------|-------|---------|-----|---------|
-| talker_decode | 512 | FP16 | 1306 | 16.3 | baseline |
-| talker_decode | 128 | FP16 | 472 | 5.9 | 2.8x |
-| talker_decode | 64 | FP16 | 342 | 4.3 | 3.8x |
-| talker_decode | 32 | INT8 | 256 | 3.2 | 5.1x |
-| talker_prefill | — | FP16 | 343 | — | one-shot |
-
-Other models: codec_embed 1ms, code_predictor 20ms, speaker_encoder 24ms, text_project 63ms.
-
-**Root cause**: NPU profiler shows 121ms pure compute for p32 across 422 ops + 140ms dispatch overhead. RK3576 NPU (6 TOPS / ~1.5 TFLOPS FP16) insufficient for 0.6B 28-layer transformer.
-
-**Conclusion**: RK3576 cannot run Qwen3-TTS 0.6B in real-time. Best RTF=3.2x (need <1.0).
-
-## RKLLM Breakthrough (2026-04-04)
-
-RKLLM conversion initially failed (vocab_size=3072 too small). Fixed by padding to 151936.
-
-| Metric | Value |
-|--------|-------|
-| Talker decode (RKLLM W4A16) | **55ms/step** (with code_predictor feedback) |
-| Talker prefill | **56ms** |
-| Vocab=151936 model | 683 MB, fastest decode |
-| KV-cache persistence | `keep_history=1` required |
-| Step-by-step API | mode=1 (GET_LAST_HIDDEN_LAYER) + CPU codec_head matmul |
-
-### RKLLM Step-by-Step AR Loop
-```
-Per step:
-  1. rkllm_run(embed, mode=1, keep_history=1) → hidden [1024]     45ms
-  2. logits = hidden @ codec_head_weight (CPU numpy)                1ms
-  3. sample primary token from logits[:3072]                        <1ms
-  4. code_predictor(hidden) → 15 residual codes                    5-10ms
-  5. next_embed = sum(16 codebook embeddings) + text_embed          <1ms
-  Total: ~55ms/step
+# 传输到设备
+scp vocos-16khz-600.rknn <device>:/home/cat/models/
 ```
 
-## Vocoder Optimization (2026-04-04)
+### 3. 部署 Docker 服务
 
-Original: 10,547ms (29 Sin ops fallback to CPU).
-After Sin→polynomial replacement: **1,942ms** (5.4x speedup).
+```bash
+cd rk3576/
 
-| Fix | Before | After |
-|-----|--------|-------|
-| Remove Gather (embedding lookup) | 10,547ms | 10,495ms (no effect) |
-| Replace 29 Sin → 7th-order Taylor + Clip | 10,495ms | **1,942ms** |
+# 构建镜像
+docker compose build
 
-Vocoder RTF: 1942ms / 6s audio = **0.32** (faster than real-time).
+# 启动
+docker compose up -d
 
-Script: `rk3576/scripts/replace_sin_polynomial.py`
+# 检查健康
+curl http://localhost:8621/health
+# 应返回: {"tts":true,"tts_backend":"matcha_rknn","asr":true,...}
+```
 
-## Current E2E Pipeline Performance
+### 4. 测试
 
-| Stage | Time | Notes |
-|-------|------|-------|
-| text_project (RKNN) | 63ms | one-shot |
-| talker prefill (RKLLM) | 56ms | one-shot |
-| talker decode × 25 (RKLLM) | 1375ms | 25 frames = 2s audio |
-| code_predictor × 25 (RKNN) | 250ms | 15 residual codes per frame |
-| vocoder (RKNN, 75 frames) | 1942ms | 6s audio, RTF=0.32 |
-| **First-chunk latency** | **~210ms** | 1 frame: prefill + decode + vocoder |
-| **E2E for 2s audio** | **~2.4s (RTF≈1.2)** | |
+```bash
+# TTS
+curl -X POST http://localhost:8621/tts \
+    -H "Content-Type: application/json" \
+    -d '{"text":"你好世界","language":"zh"}' \
+    --output test.wav
 
-## Remaining Optimizations
+# ASR
+curl -X POST http://localhost:8621/asr \
+    -F "file=@test.wav"
+```
 
-| Optimization | Expected | Actual | Status |
-|-------------|----------|--------|--------|
-| Vocoder ctx50→ctx25 FP16 | ~1300ms | 1183ms | Done |
-| Vocoder ctx25 INT8 | ~650ms | **682ms** | Done ✅ Production |
-| Vocoder ctx0 INT8 | ~350ms | **327ms** | Done (quality=0.83) |
-| text_project shape [1,128]→[1,16] | ~10ms | — | Not done |
-| Pipeline parallelism (talker∥vocoder) | — | — | Architecture |
+## 配置说明
 
-### Optimized Pipeline (ctx25 INT8 vocoder)
+关键环境变量（`docker-compose.yml`）：
 
-| Stage | Time | Notes |
-|-------|------|-------|
-| text_project (RKNN) | 63ms | one-shot |
-| talker prefill (RKLLM) | 56ms | one-shot |
-| talker decode × 25 (RKLLM) | 1375ms | 2s audio |
-| code_predictor × 25 | 250ms | |
-| vocoder ctx25 INT8 (RKNN) | 682ms | 2s audio, RTF=0.34 |
-| **First-chunk latency** | **~210ms** | |
-| **E2E 2s audio** | **~2.4s (RTF≈1.2)** | |
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `TTS_BACKEND` | `matcha_rknn` | TTS 后端选择 |
+| `MATCHA_USE_ORT` | `1` | **推荐**: Matcha 走 ORT CPU FP32 (9/10 精度) |
+| `MATCHA_MAX_PHONEMES` | `64` | 单段最大音素数 |
+| `ASR_BACKEND` | `qwen3_asr_rk` | ASR 后端 |
+| `ASR_DECODER_TYPE` | `rkllm` | ASR decoder 类型 |
 
-### Model files for production
+### 切换到 RKNN NPU 模式（可选）
 
-| Model | File | Size |
-|-------|------|------|
-| talker (RKLLM W4A16) | talker_fullvocab_fixed_w4a16_rk3576.rkllm | 683 MB |
-| vocoder (RKNN INT8) | decoder_ctx25_int8.rknn | 133 MB |
-| text_project (RKNN FP16) | text_project.rknn | 606 MB |
-| code_predictor (RKNN FP16) | code_predictor.rknn | 174 MB |
-| codec_embed (RKNN FP16) | codec_embed.rknn | 6 MB |
-| code_predictor_embed (RKNN FP16) | code_predictor_embed.rknn | 4 MB |
-| speaker_encoder (ONNX CPU) | speaker_encoder.onnx | 34 MB |
-| codec_head weight (numpy) | codec_head.npy | ~12 MB |
-| codebook embeddings (numpy) | codebook_embeds/ | ~32 MB |
-| **Total** | | **~1.7 GB** |
+如果对延迟有极端要求（282ms vs 443ms），可以切换到 RKNN split 模式：
+
+```bash
+# 1. 生成 split 模型（x86 上执行）
+python rk3576/scripts/fix_matcha_rknn.py \
+    --input model-steps-3.onnx --output model-fixed.onnx
+python rk3576/scripts/split_matcha_rknn.py \
+    --all --onnx model-fixed.onnx --output-dir matcha-split/
+
+# 2. 传输到设备
+scp matcha-split/*.rknn matcha-split/*.npy <device>:/home/cat/models/matcha-split/
+
+# 3. 去掉 MATCHA_USE_ORT 环境变量（docker-compose.yml）
+# 服务会自动检测 matcha-split/ 目录并使用 split 模式
+
+# 4. 设置 1-step ODE（推荐，减少 FP16 累积误差）
+# 添加: MATCHA_ODE_STEPS=1
+```
+
+**注意**: RKNN 模式精度 7/10，部分音节会失真（FP16 Conv/MatMul 硬件限制）。
+
+## 性能数据
+
+### TTS (Matcha + Vocos)
+
+| 模式 | 延迟 (7 tokens) | 精度 (round-trip) |
+|------|-----------------|-------------------|
+| **ORT CPU FP32 (推荐)** | **443ms** | **9/10** |
+| RKNN split + 1-step | 282ms | 7/10 |
+| RKNN 单模型 3-step | 535ms | 5/10 |
+
+### ASR (Qwen3-ASR)
+
+| 指标 | 值 |
+|------|-----|
+| RTF | 0.44 |
+| 延迟 (2s 音频) | ~1.2s |
+
+### 端到端 V2V
+
+| 指标 | 值 |
+|------|-----|
+| TTS + ASR | ~1.6s |
+
+## 文件结构
+
+```
+rk3576/
+├── Dockerfile
+├── docker-compose.yml
+├── app/
+│   ├── main.py                      # FastAPI 服务 (TTS/ASR/streaming/dialogue)
+│   ├── tts_backend.py               # TTS backend 抽象
+│   ├── tts_service.py               # Qwen3-TTS service (备选)
+│   ├── asr_backend.py               # ASR backend 抽象
+│   ├── backends/
+│   │   ├── rknn_matcha_tts.py       # Matcha TTS (ORT/RKNN split/RKNN single)
+│   │   ├── rknn_custom_ops.py       # RKNN 自定义算子 ctypes 注册
+│   │   ├── cst_ops_neon.c           # ARM NEON 自定义算子 (Sin/Mul/Pow/Add/InstanceNorm)
+│   │   ├── qwen3_asr_rk.py          # Qwen3-ASR backend
+│   │   └── piper_rknn.py            # Piper VITS backend (备选)
+│   └── qwen3asr/
+│       ├── engine.py                # ASR engine
+│       ├── stream.py                # 流式 ASR
+│       └── mel.py                   # 纯 numpy STFT
+├── scripts/
+│   ├── fix_matcha_rknn.py           # Matcha ONNX surgery (probe-first)
+│   ├── split_matcha_rknn.py         # Matcha 模型拆分 (encoder+estimator)
+│   ├── convert_vocos_16khz_rknn.py  # Vocos RKNN 编译
+│   ├── replace_all_ops.py           # 批量 ONNX op 替换为自定义 op
+│   ├── fix_piper_rknn.py            # Piper VITS ONNX surgery
+│   └── surgery_piper_custom_ops.py  # Piper 自定义算子 surgery
+└── tests/                           # pytest 测试套件
+    ├── conftest.py
+    ├── metrics.py
+    ├── test_roundtrip.py
+    ├── test_tts.py
+    ├── test_asr.py
+    └── test_latency.py
+```
+
+## 设备上的模型目录
+
+```
+/home/cat/models/
+├── matcha-icefall-zh-en/        # Matcha 文本前端 (lexicon, tokens)
+├── vocos-16khz-600.rknn         # Vocos vocoder RKNN
+├── matcha-s64.rknn              # Matcha 单体 RKNN (RKNN 模式备选)
+└── matcha-split/                # Matcha split 模型 (RKNN split 模式用)
+    ├── matcha-encoder-fp16.rknn
+    ├── matcha-estimator-fp16.rknn
+    └── time_emb_step{0,1,2}.npy
+
+/home/cat/matcha-data/
+└── model-steps-3.onnx           # Matcha ONNX (ORT 模式用)
+
+/home/cat/qwen3-asr-models/
+├── encoder/                     # ASR encoder RKNN
+├── decoder/                     # ASR decoder RKLLM
+└── vad/                         # VAD 模型
+```
+
+## 自定义算子框架
+
+本项目实现了完整的 RKNN 自定义 CPU 算子框架，可复用于其他模型部署：
+
+1. **ONNX 端**: 1:1 替换 `op_type`（如 `Sin` → `CstSin`），不改图拓扑
+2. **Toolkit 端**: `rknn.reg_custom_op()` 注册 Python shape_infer + compute
+3. **Runtime 端**: ctypes 调 `rknn_register_custom_ops()`，注册 C/NEON compute 函数
+4. **C 实现**: `cst_ops_neon.c`，ARM NEON SIMD 加速
+
+详见 `app/backends/rknn_custom_ops.py` 和 RKNN optimization skill。
+
+## 已知限制
+
+- RK3576 NPU 只有 FP16，扩散/ODE 类模型精度不够 → 用 ORT CPU
+- RKLLM 和 RKNN 需要 domain 隔离 (`base_domain_id=1`)
+- Vocos RKNN 固定 600 帧输入，超长句需要分段合成
+- 英文 TTS 依赖 `espeak-ng`（Dockerfile 已安装）
