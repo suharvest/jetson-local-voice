@@ -165,9 +165,147 @@ class Qwen3StreamingASRStream(ASRStream):
         )
         return all_text.strip()
 
+    def _run_encoder(self, audio_chunk: np.ndarray) -> np.ndarray:
+        """Encode a single audio chunk via ORT. Returns [1, T', 1024]."""
+        mel = self._backend._compute_mel(audio_chunk)  # [1, 128, T]
+        enc_out = self._backend._encoder.run(None, {"mel": mel})[0]  # [1, T', 1024]
+        return enc_out
+
+    def _decode_window(self, all_embd: np.ndarray, max_tokens: int = STREAMING_MAX_TOKENS) -> str | None:
+        """Prefill + decode on concatenated window embeddings.
+
+        Returns decoded text, or None if decoder immediately produced EOS.
+        """
+        audio_len = all_embd.shape[1]
+        lang = self._language if self._language != "auto" else None
+        prompt_ids = self._backend._build_prompt(audio_len, lang)
+        input_ids = np.array([prompt_ids], dtype=np.int64)
+        seq_len = len(prompt_ids)
+        audio_offset = prompt_ids.index(AUDIO_PAD)
+
+        # Prefill via ORT
+        prefill_inputs = {
+            "input_ids": input_ids,
+            "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
+            "audio_features": all_embd,
+            "audio_offset": np.array([audio_offset], dtype=np.int64),
+        }
+        valid_names = [i.name for i in self._backend._prefill.get_inputs()]
+        valid = {n: v for n, v in prefill_inputs.items() if n in valid_names}
+        outputs = self._backend._prefill.run(None, valid)
+        out_map = dict(zip(
+            [o.name for o in self._backend._prefill.get_outputs()], outputs
+        ))
+
+        logits = out_map.get("logits")
+        kv = {k.replace("present_", "past_"): v for k, v in out_map.items()
+              if k.startswith("past_") or k.startswith("present_")}
+
+        # Seed TRT KV cache
+        use_trt = (self._backend._decoder is not None
+                   and seq_len <= getattr(self._backend, '_trt_max_seq', 500))
+        if use_trt:
+            self._backend._decoder.reset()
+            for k in list(kv.keys()):
+                kv[k] = np.ascontiguousarray(kv[k].astype(np.float32))
+            self._backend._decoder.seed_kv(kv, seq_len)
+
+        # Decode loop
+        output_ids = []
+        for step in range(max_tokens):
+            next_token = int(np.argmax(logits[0, -1, :]))
+            if next_token in EOS_IDS:
+                break
+            output_ids.append(next_token)
+
+            embeds = self._backend._embed_tokens[next_token][np.newaxis, np.newaxis, :]
+            cur_pos = seq_len + step
+
+            if use_trt:
+                logits = self._backend._decoder.decode_step(embeds, 151936)
+            elif self._backend._decoder_ort:
+                step_in = {"input_embeds": embeds,
+                           "position_ids": np.array([[cur_pos]], dtype=np.int64)}
+                step_in.update(kv)
+                step_out = self._backend._decoder_ort.run(None, step_in)
+                step_map = dict(zip(
+                    [o.name for o in self._backend._decoder_ort.get_outputs()],
+                    step_out,
+                ))
+                logits = step_map.get("logits")
+                kv = {k.replace("present_", "past_").replace("new_", ""): v
+                      for k, v in step_map.items() if "logits" not in k}
+            else:
+                break
+
+        if not output_ids:
+            return None
+
+        text = self._backend._tokenizer.decode(output_ids)
+        if "<asr_text>" in text:
+            text = text.split("<asr_text>", 1)[1]
+        return text.strip()
+
     def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
-        """Placeholder — implemented in Task 2."""
-        pass
+        """Encode chunk, decode with sliding window, update output state."""
+        chunk_sec = len(audio_chunk) / 16000
+        self._total_audio_s += chunk_sec
+        self._n_chunks += 1
+
+        # 1. Encode
+        t0 = time.perf_counter()
+        enc_out = self._run_encoder(audio_chunk)
+        self._total_enc_ms += (time.perf_counter() - t0) * 1000
+
+        # 2. Update sliding window
+        if len(self._segments) >= MEMORY_NUM:
+            oldest = self._segments.popleft()
+            self._archive_text += oldest.committed_text
+        self._segments.append(SegmentInfo(embedding=enc_out))
+
+        # 3. Concatenate all window embeddings
+        all_embd = np.concatenate(
+            [s.embedding for s in self._segments], axis=1
+        )
+
+        # 4. Decode
+        max_tok = 200 if is_final else STREAMING_MAX_TOKENS
+        t0 = time.perf_counter()
+        raw_text = self._decode_window(all_embd, max_tokens=max_tok)
+        self._total_dec_ms += (time.perf_counter() - t0) * 1000
+
+        # 5. Endpoint detection
+        if raw_text is None:
+            self._eos_count += 1
+        else:
+            self._eos_count = 0
+
+        # 6. Rollback + LocalAgreement (skip for final chunk)
+        if is_final and raw_text:
+            self._stable_text = self._archive_text + raw_text
+            self._prev_text = raw_text
+        elif raw_text:
+            rolled = self._apply_rollback(raw_text)
+            stable = self._local_agreement(self._prev_text, rolled)
+            self._stable_text = self._archive_text + stable
+            self._prev_text = rolled
+
+        logger.debug(
+            "Chunk %d: %.1fs audio, enc=%.0fms, dec=%.0fms, "
+            "eos_count=%d, text='%s'",
+            self._n_chunks, chunk_sec,
+            self._total_enc_ms, self._total_dec_ms,
+            self._eos_count, self._stable_text[-50:] if self._stable_text else "",
+        )
+
+    def _apply_rollback(self, text: str) -> str:
+        """Stub — implemented in Task 3."""
+        return text
+
+    @staticmethod
+    def _local_agreement(prev: str, curr: str) -> str:
+        """Stub — implemented in Task 3."""
+        return curr
 
 
 class Qwen3ASRBackend(ASRBackend):
