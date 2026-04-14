@@ -16,6 +16,8 @@ import logging
 import os
 import time
 import wave
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -35,6 +37,20 @@ AUDIO_END = 151670
 AUDIO_PAD = 151676
 ASR_TEXT = 151704
 EOS_IDS = {151643, 151645}
+
+# Streaming parameters
+CHUNK_SIZE_SEC = 1.5
+MEMORY_NUM = 3
+ROLLBACK_TOKENS = 3
+EOS_CONFIRM_COUNT = 2
+STREAMING_MAX_TOKENS = 16
+
+
+@dataclass
+class SegmentInfo:
+    """One chunk's encoder output + committed text."""
+    embedding: np.ndarray   # [1, T', 1024]
+    committed_text: str = ""
 
 
 class Qwen3ASRStream(ASRStream):
@@ -78,6 +94,80 @@ class Qwen3ASRStream(ASRStream):
     def get_partial(self) -> tuple[str, bool]:
         # V1: no partial results; could add duration-based hints later
         return "", False
+
+
+class Qwen3StreamingASRStream(ASRStream):
+    """Real streaming ASR: encode-once + sliding window + re-prefill per chunk."""
+
+    def __init__(self, backend: "Qwen3ASRBackend", language: str = "auto"):
+        self._backend = backend
+        self._language = language
+        self._chunk_size_samples = int(CHUNK_SIZE_SEC * 16000)
+
+        # Audio buffer (accumulates until chunk_size)
+        self._sample_buf = np.array([], dtype=np.float32)
+
+        # Sliding window of encoder embeddings
+        self._segments: deque[SegmentInfo] = deque(maxlen=MEMORY_NUM)
+
+        # Output state
+        self._archive_text: str = ""
+        self._prev_text: str = ""
+        self._stable_text: str = ""
+        self._eos_count: int = 0
+
+        # Timing stats
+        self._total_audio_s: float = 0.0
+        self._total_enc_ms: float = 0.0
+        self._total_dec_ms: float = 0.0
+        self._n_chunks: int = 0
+
+    def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(samples) * ratio)
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, new_len),
+                np.arange(len(samples)),
+                samples,
+            ).astype(np.float32)
+        self._sample_buf = np.concatenate([self._sample_buf, samples])
+
+        # Process complete chunks
+        while len(self._sample_buf) >= self._chunk_size_samples:
+            chunk = self._sample_buf[:self._chunk_size_samples]
+            self._sample_buf = self._sample_buf[self._chunk_size_samples:]
+            self._process_chunk(chunk)
+
+    def get_partial(self) -> tuple[str, bool]:
+        return self._stable_text, self._eos_count >= EOS_CONFIRM_COUNT
+
+    def finalize(self) -> str:
+        # Flush remaining buffer
+        if len(self._sample_buf) > 0:
+            self._process_chunk(self._sample_buf, is_final=True)
+            self._sample_buf = np.array([], dtype=np.float32)
+        # Return all text (archive + current window)
+        all_text = self._archive_text
+        for seg in self._segments:
+            all_text += seg.committed_text
+        # If we have a more complete decode from the last chunk, prefer it
+        if self._prev_text:
+            all_text = self._archive_text + self._prev_text
+        logger.info(
+            "Qwen3 streaming finalize: %d chunks, %.1fs audio, "
+            "enc=%.0fms dec=%.0fms",
+            self._n_chunks, self._total_audio_s,
+            self._total_enc_ms, self._total_dec_ms,
+        )
+        return all_text.strip()
+
+    def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
+        """Placeholder — implemented in Task 2."""
+        pass
 
 
 class Qwen3ASRBackend(ASRBackend):
