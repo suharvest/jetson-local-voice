@@ -460,10 +460,23 @@ class Qwen3ASRBackend(ASRBackend):
                      time.time() - t0, backend_name)
         self._ready = True
 
-    def create_stream(self, language: str = "auto") -> Qwen3ASRStream:
-        """Create an accumulate-then-transcribe streaming session."""
+    def create_stream(self, language: str = "auto") -> ASRStream:
+        """Create a streaming ASR session.
+
+        Uses real streaming (encode-once + sliding window) if Python ORT
+        encoder + decoder are available. Falls back to accumulate-then-transcribe.
+        """
         if not self._ready:
             raise RuntimeError("Qwen3-ASR backend not ready")
+        # Real streaming requires: encoder + prefill + decoder (Python ORT path)
+        has_encoder = self._encoder is not None
+        has_decoder = (self._decoder is not None or self._decoder_ort is not None)
+        has_prefill = self._prefill is not None
+        if has_encoder and has_prefill and has_decoder:
+            logger.info("Creating real streaming ASR session (sliding window)")
+            return Qwen3StreamingASRStream(self, language=language)
+        # Fallback: accumulate-then-transcribe
+        logger.info("Creating accumulate-then-transcribe ASR session")
         return Qwen3ASRStream(self, language=language)
 
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
