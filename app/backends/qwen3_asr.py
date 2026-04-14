@@ -17,7 +17,7 @@ import os
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -48,9 +48,8 @@ STREAMING_MAX_TOKENS = 16
 
 @dataclass
 class SegmentInfo:
-    """One chunk's encoder output + committed text."""
+    """One chunk's encoder output stored in the sliding window."""
     embedding: np.ndarray   # [1, T', 1024]
-    committed_text: str = ""
 
 
 class Qwen3ASRStream(ASRStream):
@@ -158,13 +157,8 @@ class Qwen3StreamingASRStream(ASRStream):
         if len(self._sample_buf) > 0:
             self._process_chunk(self._sample_buf, is_final=True)
             self._sample_buf = np.array([], dtype=np.float32)
-        # Return all text (archive + current window)
-        all_text = self._archive_text
-        for seg in self._segments:
-            all_text += seg.committed_text
-        # If we have a more complete decode from the last chunk, prefer it
-        if self._prev_text:
-            all_text = self._archive_text + self._prev_text
+        # Return archive + latest window decode
+        all_text = self._archive_text + self._prev_text
         logger.info(
             "Qwen3 streaming finalize: %d chunks, %.1fs audio, "
             "enc=%.0fms dec=%.0fms",
@@ -267,8 +261,7 @@ class Qwen3StreamingASRStream(ASRStream):
 
         # 2. Update sliding window
         if len(self._segments) >= MEMORY_NUM:
-            oldest = self._segments.popleft()
-            self._archive_text += oldest.committed_text
+            self._segments.popleft()
         self._segments.append(SegmentInfo(embedding=enc_out))
 
         # 3. Concatenate all window embeddings
@@ -292,9 +285,8 @@ class Qwen3StreamingASRStream(ASRStream):
         if self._eos_count >= EOS_CONFIRM_COUNT and not is_final:
             logger.info("Semantic endpoint detected at chunk %d, resetting window",
                         self._n_chunks)
-            # Move all window text to archive
-            for seg in self._segments:
-                self._archive_text += seg.committed_text
+            # Archive current stable text, reset window for next utterance
+            self._archive_text = self._stable_text
             self._segments.clear()
             self._prev_text = ""
             self._eos_count = 0
