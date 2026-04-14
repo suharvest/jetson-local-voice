@@ -96,6 +96,14 @@ class Qwen3ASRStream(ASRStream):
         return "", False
 
 
+def _is_cjk(ch: str) -> bool:
+    """Check if character is CJK (Chinese/Japanese/Korean)."""
+    cp = ord(ch)
+    return (0x4E00 <= cp <= 0x9FFF     # CJK Unified
+            or 0x3040 <= cp <= 0x30FF   # Hiragana/Katakana
+            or 0xAC00 <= cp <= 0xD7AF)  # Hangul
+
+
 class Qwen3StreamingASRStream(ASRStream):
     """Real streaming ASR: encode-once + sliding window + re-prefill per chunk."""
 
@@ -280,6 +288,17 @@ class Qwen3StreamingASRStream(ASRStream):
         else:
             self._eos_count = 0
 
+        # 5b. Auto-reset on confirmed endpoint
+        if self._eos_count >= EOS_CONFIRM_COUNT and not is_final:
+            logger.info("Semantic endpoint detected at chunk %d, resetting window",
+                        self._n_chunks)
+            # Move all window text to archive
+            for seg in self._segments:
+                self._archive_text += seg.committed_text
+            self._segments.clear()
+            self._prev_text = ""
+            self._eos_count = 0
+
         # 6. Rollback + LocalAgreement (skip for final chunk)
         if is_final and raw_text:
             self._stable_text = self._archive_text + raw_text
@@ -299,13 +318,32 @@ class Qwen3StreamingASRStream(ASRStream):
         )
 
     def _apply_rollback(self, text: str) -> str:
-        """Stub — implemented in Task 3."""
-        return text
+        """Strip last ROLLBACK_TOKENS tokens to remove boundary jitter."""
+        if not text or ROLLBACK_TOKENS <= 0:
+            return text
+        ids = self._backend._tokenizer.encode(text).ids
+        if len(ids) <= ROLLBACK_TOKENS:
+            return ""
+        return self._backend._tokenizer.decode(ids[:-ROLLBACK_TOKENS])
 
     @staticmethod
     def _local_agreement(prev: str, curr: str) -> str:
-        """Stub — implemented in Task 3."""
-        return curr
+        """Longest common prefix between two outputs for stability."""
+        if not prev:
+            return curr
+        min_len = min(len(prev), len(curr))
+        i = 0
+        while i < min_len and prev[i] == curr[i]:
+            i += 1
+        # For CJK: each char is a word, so character boundary is fine.
+        # For English: snap back to last space boundary.
+        result = curr[:i]
+        if i < len(curr) and i > 0 and not _is_cjk(curr[i - 1]):
+            # Snap to last space
+            last_space = result.rfind(" ")
+            if last_space > 0:
+                result = result[:last_space + 1]
+        return result
 
 
 class Qwen3ASRBackend(ASRBackend):
