@@ -327,8 +327,8 @@ class Qwen3StreamingASRStream(ASRStream):
             enc_out = self._run_encoder(audio_chunk)
         self._total_enc_ms += (time.perf_counter() - t0) * 1000
 
-        # 2. Update sliding window
-        if len(self._segments) >= MEMORY_NUM:
+        # 2. Update sliding window (don't evict on final — keep full context)
+        if not is_final and len(self._segments) >= MEMORY_NUM:
             self._segments.popleft()
         self._segments.append(SegmentInfo(embedding=enc_out))
 
