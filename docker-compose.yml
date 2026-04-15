@@ -8,11 +8,15 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       # TTS backend: "sherpa" (Matcha/Kokoro) or "qwen3_trt" (Qwen3-TTS C++ TRT)
+      # Note: If LANGUAGE_MODE=multilanguage, qwen3_trt is auto-selected
       - TTS_BACKEND=${TTS_BACKEND:-sherpa}
       - TTS_PROVIDER=cuda
       - TTS_DEFAULT_SID=52
-      # Language mode: "zh_en" (Chinese+English, default) or "en" (English only)
-      - LANGUAGE_MODE=${LANGUAGE_MODE:-zh_en}
+      # Language mode:
+      #   "zh_en" (default) - Chinese+English, Sherpa TTS + Paraformer ASR
+      #   "en" - English only, Kokoro TTS + Zipformer ASR
+      #   "multilanguage" - 52 languages, Qwen3-TTS + Qwen3-ASR (requires jetson-qwen3-speech)
+      - LANGUAGE_MODE=${LANGUAGE_MODE:-multilanguage}
       - TTS_PITCH_SHIFT=${TTS_PITCH_SHIFT:-0}
       - SENSEVOICE_LANGUAGE=auto
       # CUDA perf: lazy module loading reduces init time & memory
@@ -21,11 +25,14 @@ services:
       - ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
     volumes:
       - speech-models:/opt/models
+      # app_overlay: place qwen3_tts_engine.cpython-*-aarch64-linux-gnu.so here
+      # so the C++ TRT pybind11 module is available inside the container
+      - ./app_overlay:/app/overlay
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 6G
+          memory: 10G
 
 volumes:
   speech-models:

@@ -199,7 +199,7 @@ class Qwen3TRTBackend(TTSBackend):
 
         language = kwargs.get("language") or _detect_language(text)
         speaker_embedding = kwargs.get("speaker_embedding")
-        first_chunk_frames = kwargs.get("first_chunk_frames", 10)
+        first_chunk_frames = kwargs.get("first_chunk_frames", 5)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)
 
