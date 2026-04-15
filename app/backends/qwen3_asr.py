@@ -240,8 +240,11 @@ class Qwen3StreamingASRStream(ASRStream):
         logits = out_map.get("logits")
         kv = {}
         for k, v in out_map.items():
-            # Normalize key names: present_key_0 → past_key_0
-            if k.startswith("present_"):
+            # Normalize output KV names → past_key_*/past_value_*
+            # Handles: present_key_0, new_past_key_0, past_key_0
+            if k.startswith("new_past_"):
+                kv[k.replace("new_past_", "past_")] = v
+            elif k.startswith("present_"):
                 kv[k.replace("present_", "past_")] = v
             elif k.startswith("past_"):
                 kv[k] = v
@@ -280,7 +283,9 @@ class Qwen3StreamingASRStream(ASRStream):
                 logits = step_map.get("logits")
                 kv = {}
                 for k, v in step_map.items():
-                    if k.startswith("present_"):
+                    if k.startswith("new_past_"):
+                        kv[k.replace("new_past_", "past_")] = v
+                    elif k.startswith("present_"):
                         kv[k.replace("present_", "past_")] = v
                     elif k.startswith("past_"):
                         kv[k] = v
