@@ -164,6 +164,18 @@ class Qwen3StreamingASRStream(ASRStream):
     def get_partial(self) -> tuple[str, bool]:
         return self._stable_text, self._eos_count >= EOS_CONFIRM_COUNT
 
+    def prepare_finalize(self) -> None:
+        """Pre-encode tail buffer so finalize() only needs to decode."""
+        if len(self._sample_buf) == 0:
+            return
+        # Already speculatively encoded with matching length?
+        if (self._spec_embd is not None
+                and self._spec_audio_len == len(self._sample_buf)):
+            return
+        # Encode the tail buffer now
+        self._spec_embd = self._run_encoder(self._sample_buf)
+        self._spec_audio_len = len(self._sample_buf)
+
     def finalize(self) -> str:
         # Flush remaining buffer
         if len(self._sample_buf) > 0:

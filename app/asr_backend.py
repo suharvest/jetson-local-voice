@@ -48,6 +48,13 @@ class ASRStream(ABC):
         """Return (partial_text, is_endpoint). Default: no partial results."""
         return "", False
 
+    def prepare_finalize(self) -> None:
+        """Pre-encode remaining audio buffer so finalize() only runs decoder.
+
+        Optional optimization — finalize() works without calling this first.
+        """
+        pass
+
 
 class ASRBackend(ABC):
 
@@ -81,14 +88,32 @@ class ASRBackend(ABC):
 
 
 def create_asr_backend(backend_name: Optional[str] = None) -> ASRBackend:
+    """Factory: create ASR backend by name.
+
+    Auto-detect logic:
+        - If LANGUAGE_MODE=multilanguage → qwen3 (52 languages)
+        - Otherwise, use ASR_BACKEND env var (default: sherpa)
+    """
     if backend_name is None:
-        backend_name = os.environ.get("ASR_BACKEND", "sherpa")
+        # Check LANGUAGE_MODE for automatic backend selection
+        language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
+        if language_mode == "multilanguage":
+            backend_name = "qwen3"
+            logger.info("LANGUAGE_MODE=multilanguage → using qwen3 ASR backend")
+        else:
+            backend_name = os.environ.get("ASR_BACKEND", "sherpa")
 
     if backend_name == "sherpa":
         from backends.sherpa_asr import SherpaASRBackend
         return SherpaASRBackend()
     elif backend_name == "qwen3":
-        from backends.qwen3_asr import Qwen3ASRBackend
+        # Try importing from standalone package first, fallback to local
+        try:
+            from jetson_qwen3_speech import Qwen3ASRBackend
+            logger.info("Using Qwen3ASRBackend from jetson-qwen3-speech package")
+        except ImportError:
+            from backends.qwen3_asr import Qwen3ASRBackend
+            logger.info("Using Qwen3ASRBackend from local backends/")
         return Qwen3ASRBackend()
     else:
         raise ValueError(f"Unknown ASR backend: {backend_name}")

@@ -449,7 +449,8 @@ async def _asr_stream_backend(
                 break
 
             if len(data) == 0:
-                # End of audio -- run full pipeline
+                # End of audio — pre-encode tail, then decode
+                await asyncio.to_thread(stream.prepare_finalize)
                 final_text = await asyncio.to_thread(stream.finalize)
                 await ws.send_json({
                     "text": final_text,
