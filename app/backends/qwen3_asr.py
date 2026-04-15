@@ -188,20 +188,24 @@ class Qwen3StreamingASRStream(ASRStream):
         seq_len = len(prompt_ids)
         audio_offset = prompt_ids.index(AUDIO_PAD)
 
-        # Build full input embeddings: text tokens + audio features
-        embed_tokens = self._backend._embed_tokens
-        input_embeds = np.zeros((1, seq_len, 1024), dtype=np.float32)
-        for i, tid in enumerate(prompt_ids):
-            input_embeds[0, i] = embed_tokens[tid]
-        # Inject audio embeddings at AUDIO_PAD positions
-        audio_end = min(audio_offset + audio_len, seq_len)
-        input_embeds[0, audio_offset:audio_end] = all_embd[0, :audio_end - audio_offset]
-
         # Choose decoder: prefer dedicated prefill, fall back to unified decoder_ort
         decoder_sess = self._backend._prefill or self._backend._decoder_ort
         if decoder_sess is None:
             logger.warning("No decoder session available for streaming")
             return None
+
+        # Detect model dtype from first input (FP16 or FP32)
+        first_input = decoder_sess.get_inputs()[0]
+        model_dtype = np.float16 if first_input.type == "tensor(float16)" else np.float32
+
+        # Build full input embeddings: text tokens + audio features
+        embed_tokens = self._backend._embed_tokens  # stored as FP32
+        input_embeds = np.zeros((1, seq_len, 1024), dtype=model_dtype)
+        for i, tid in enumerate(prompt_ids):
+            input_embeds[0, i] = embed_tokens[tid].astype(model_dtype)
+        # Inject audio embeddings at AUDIO_PAD positions
+        audio_end = min(audio_offset + audio_len, seq_len)
+        input_embeds[0, audio_offset:audio_end] = all_embd[0, :audio_end - audio_offset].astype(model_dtype)
 
         # Prefill: feed full sequence with empty KV cache
         n_layers = 28
@@ -216,7 +220,7 @@ class Qwen3StreamingASRStream(ASRStream):
             for kv_type in ("past_key_", "past_value_"):
                 name = f"{kv_type}{layer}"
                 if name in valid_names:
-                    prefill_in[name] = np.zeros((1, H, 0, dh), dtype=np.float32)
+                    prefill_in[name] = np.zeros((1, H, 0, dh), dtype=model_dtype)
 
         # Handle dedicated prefill session (takes input_ids + audio_features)
         if self._backend._prefill and decoder_sess is self._backend._prefill:
@@ -260,7 +264,7 @@ class Qwen3StreamingASRStream(ASRStream):
                 break
             output_ids.append(next_token)
 
-            embeds = embed_tokens[next_token][np.newaxis, np.newaxis, :]
+            embeds = embed_tokens[next_token].astype(model_dtype)[np.newaxis, np.newaxis, :]
             cur_pos = seq_len + step
 
             if use_trt:
@@ -471,15 +475,17 @@ class Qwen3ASRBackend(ASRBackend):
                 except Exception as e:
                     logger.warning("TRT decoder %s failed: %s", engine_path, e)
 
-            # ORT decoder fallback
+            # ORT decoder fallback — prefer unified (supports prefill+step)
             if self._decoder is None:
-                path = os.path.join(_BASE, "decoder_step.onnx")
-                if os.path.exists(path):
-                    try:
-                        self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
-                        logger.info("ASR ORT decoder loaded: %s", path)
-                    except Exception as e:
-                        logger.warning("ORT decoder load failed: %s", e)
+                for dec_name in ["decoder_unified.onnx", "decoder_step.onnx"]:
+                    path = os.path.join(_BASE, dec_name)
+                    if os.path.exists(path):
+                        try:
+                            self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
+                            logger.info("ASR ORT decoder loaded: %s", path)
+                            break
+                        except Exception as e:
+                            logger.warning("ORT decoder %s failed: %s", dec_name, e)
 
         # Tokenizer (needed by both paths)
         tok_path = os.path.join(_BASE, "tokenizer.json")
