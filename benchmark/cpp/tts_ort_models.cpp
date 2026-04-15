@@ -2,7 +2,9 @@
 #include "tts_ort_models.h"
 
 #include <cassert>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 
 namespace fs = std::filesystem;
@@ -30,9 +32,13 @@ Ort::SessionOptions ORTModels::MakeSessionOptions(int device_id) {
 }
 
 ORTModels::ORTModels(const std::string& model_dir,
-                     const std::string& sherpa_dir, int device_id)
+                     const std::string& sherpa_dir,
+                     ORTSkipFlags flags,
+                     int device_id)
     : env_(ORT_LOGGING_LEVEL_WARNING, "qwen3tts"),
-      mem_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
+      mem_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+      sherpa_dir_(sherpa_dir),
+      device_id_(device_id) {
   auto opts = MakeSessionOptions(device_id);
 
   std::cout << "Loading ORT models..." << std::endl;
@@ -47,13 +53,38 @@ ORTModels::ORTModels(const std::string& model_dir,
     return s;
   };
 
-  text_project_ = load(sherpa_dir + "/text_project.onnx");
+  // Try new split text_embed path first: FP16 binary + projection ONNX
+  {
+    std::string embed_path = sherpa_dir + "/text_embed_fp16.bin";
+    std::string proj_path = sherpa_dir + "/text_projection_only.onnx";
+    if (fs::exists(embed_path) && fs::exists(proj_path)) {
+      // Load FP16 embedding table
+      std::ifstream ef(embed_path, std::ios::binary | std::ios::ate);
+      size_t fsize = ef.tellg();
+      ef.seekg(0);
+      text_embed_table_.resize(fsize / 2);
+      ef.read(reinterpret_cast<char*>(text_embed_table_.data()), fsize);
+      text_embed_vocab_ = 151936;  // Qwen3 vocab
+      text_embed_dim_ = (int)(fsize / 2 / text_embed_vocab_);
+      std::cout << "  Loaded text_embed FP16: " << embed_path
+                << " (" << fsize / (1024*1024) << " MB)" << std::endl;
+      // Load projection ONNX
+      text_projection_ = std::make_unique<Ort::Session>(env_, proj_path.c_str(), opts);
+      std::cout << "  Loaded text_projection: " << proj_path << std::endl;
+      has_split_text_embed_ = true;
+    } else {
+      // Fallback to old combined text_project.onnx
+      text_project_ = load(sherpa_dir + "/text_project.onnx");
+    }
+  }
   codec_embed_ = load(sherpa_dir + "/codec_embed.onnx");
   cp_embed_ = load(sherpa_dir + "/code_predictor_embed.onnx");
-  // talker_prefill: optional — load if present (used as fallback when TRT
-  // engine doesn't support dynamic inputs_embeds seq_len)
-  // Load talker_prefill with CPU-only to avoid GPU OOM
-  {
+
+  // talker_prefill: skip if TRT prefill engine is active
+  if (flags.skip_talker_prefill) {
+    std::cout << "  Skipped talker_prefill ORT (TRT active)" << std::endl;
+  } else {
+    // Load talker_prefill with CPU-only to avoid GPU OOM
     std::string pfill_path = sherpa_dir + "/talker_prefill.onnx";
     if (fs::exists(pfill_path)) {
       auto cpu_opts = MakeCPUSessionOptions();
@@ -62,27 +93,64 @@ ORTModels::ORTModels(const std::string& model_dir,
     } else {
       std::cerr << "  Skipped (not found): " << pfill_path << std::endl;
     }
-  }
-  if (!talker_prefill_) {
-    std::cout << "  talker_prefill.onnx not found — will use TRT unified prefill"
-              << std::endl;
+    if (!talker_prefill_) {
+      std::cout << "  talker_prefill.onnx not found — will use TRT unified prefill"
+                << std::endl;
+    }
   }
 
-  // Vocoder: try multiple names/paths
-  if (fs::exists(sherpa_dir + "/vocoder.onnx"))
-    vocoder_ = load(sherpa_dir + "/vocoder.onnx");
-  else if (fs::exists(sherpa_dir + "/tokenizer12hz_decode.onnx"))
-    vocoder_ = load(sherpa_dir + "/tokenizer12hz_decode.onnx");
-  else if (fs::exists(model_dir + "/vocoder.onnx"))
-    vocoder_ = load(model_dir + "/vocoder.onnx");
-  else
-    vocoder_ = load(model_dir + "/tokenizer12hz_decode.onnx");
+  // Vocoder: skip if TRT vocoder engine is active
+  if (flags.skip_vocoder) {
+    std::cout << "  Skipped vocoder ORT (TRT active)" << std::endl;
+  } else {
+    if (fs::exists(sherpa_dir + "/vocoder.onnx"))
+      vocoder_ = load(sherpa_dir + "/vocoder.onnx");
+    else if (fs::exists(sherpa_dir + "/tokenizer12hz_decode.onnx"))
+      vocoder_ = load(sherpa_dir + "/tokenizer12hz_decode.onnx");
+    else if (fs::exists(model_dir + "/vocoder.onnx"))
+      vocoder_ = load(model_dir + "/vocoder.onnx");
+    else
+      vocoder_ = load(model_dir + "/tokenizer12hz_decode.onnx");
+  }
 
-  // Voice clone models (optional)
-  speaker_encoder_ = load(sherpa_dir + "/speaker_encoder.onnx");
-  tokenizer_encode_ = load(sherpa_dir + "/tokenizer12hz_encode.onnx");
+  // Voice clone models: load eagerly or defer
+  if (flags.lazy_speaker_encoder) {
+    std::cout << "  speaker_encoder: deferred (lazy)" << std::endl;
+  } else {
+    speaker_encoder_ = load(sherpa_dir + "/speaker_encoder.onnx");
+  }
+
+  if (flags.lazy_tokenizer_encode) {
+    std::cout << "  tokenizer_encode: deferred (lazy)" << std::endl;
+  } else {
+    tokenizer_encode_ = load(sherpa_dir + "/tokenizer12hz_encode.onnx");
+  }
 
   std::cout << "ORT models loaded." << std::endl;
+}
+
+void ORTModels::LoadSpeakerEncoder() {
+  if (speaker_encoder_) return;  // already loaded
+  std::string path = sherpa_dir_ + "/speaker_encoder.onnx";
+  if (!fs::exists(path)) {
+    std::cerr << "  speaker_encoder.onnx not found: " << path << std::endl;
+    return;
+  }
+  auto opts = MakeSessionOptions(device_id_);
+  speaker_encoder_ = std::make_unique<Ort::Session>(env_, path.c_str(), opts);
+  std::cout << "  Lazy-loaded: " << path << std::endl;
+}
+
+void ORTModels::LoadTokenizerEncode() {
+  if (tokenizer_encode_) return;  // already loaded
+  std::string path = sherpa_dir_ + "/tokenizer12hz_encode.onnx";
+  if (!fs::exists(path)) {
+    std::cerr << "  tokenizer12hz_encode.onnx not found: " << path << std::endl;
+    return;
+  }
+  auto opts = MakeSessionOptions(device_id_);
+  tokenizer_encode_ = std::make_unique<Ort::Session>(env_, path.c_str(), opts);
+  std::cout << "  Lazy-loaded: " << path << std::endl;
 }
 
 // Helper: run session with single input, return first output as float vector
@@ -104,8 +172,52 @@ static std::vector<float> RunSingle(Ort::Session* sess,
   return std::vector<float>(data, data + count);
 }
 
+// FP16→FP32 conversion helper
+static inline float fp16_to_fp32(uint16_t h) {
+  uint32_t sign = (h >> 15) & 1;
+  uint32_t exp  = (h >> 10) & 0x1F;
+  uint32_t mant =  h        & 0x3FF;
+  uint32_t bits;
+  if (exp == 0x1F)      bits = (sign << 31) | (0xFF << 23) | (mant << 13);
+  else if (exp == 0)    bits = sign << 31;
+  else                  bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
 std::vector<float> ORTModels::TextProject(
     const std::vector<int64_t>& input_ids) {
+  if (has_split_text_embed_) {
+    // New path: FP16 embedding lookup + projection ONNX
+    int T = (int)input_ids.size();
+    int D = text_embed_dim_;
+    // Gather: [T, D] float32 from FP16 table
+    std::vector<float> embeds(T * D);
+    for (int t = 0; t < T; ++t) {
+      int idx = (int)input_ids[t];
+      if (idx < 0 || idx >= text_embed_vocab_) idx = 0;
+      const uint16_t* src = text_embed_table_.data() + (size_t)idx * D;
+      for (int d = 0; d < D; ++d) {
+        embeds[t * D + d] = fp16_to_fp32(src[d]);
+      }
+    }
+    // Run projection: [1, T, D] → [1, T, D_out]
+    int64_t shape[] = {1, (int64_t)T, (int64_t)D};
+    auto val = Ort::Value::CreateTensor<float>(mem_info_, embeds.data(),
+                                               embeds.size(), shape, 3);
+    auto in_name = text_projection_->GetInputNameAllocated(0, Ort::AllocatorWithDefaultOptions());
+    auto out_name = text_projection_->GetOutputNameAllocated(0, Ort::AllocatorWithDefaultOptions());
+    const char* in_ptr = in_name.get();
+    const char* out_ptr = out_name.get();
+    auto results = text_projection_->Run(Ort::RunOptions{nullptr}, &in_ptr, &val, 1, &out_ptr, 1);
+    auto info = results[0].GetTensorTypeAndShapeInfo();
+    size_t count = info.GetElementCount();
+    const float* data = results[0].GetTensorData<float>();
+    return std::vector<float>(data, data + count);
+  }
+
+  // Old path: combined text_project.onnx
   assert(text_project_);
   int64_t shape[] = {1, (int64_t)input_ids.size()};
   auto val = Ort::Value::CreateTensor<int64_t>(mem_info_, const_cast<int64_t*>(input_ids.data()),
@@ -261,6 +373,7 @@ std::vector<float> ORTModels::Vocoder(const int64_t* codes, int n_frames,
 }
 
 std::vector<float> ORTModels::SpeakerEncode(const float* mel, int mel_frames) {
+  LoadSpeakerEncoder();
   if (!speaker_encoder_) return {};
 
   int64_t shape[] = {1, mel_frames, 128};
@@ -283,6 +396,7 @@ std::vector<float> ORTModels::SpeakerEncode(const float* mel, int mel_frames) {
 
 std::vector<int64_t> ORTModels::TokenizerEncode(const float* audio,
                                                  int num_samples) {
+  LoadTokenizerEncode();
   if (!tokenizer_encode_) return {};
 
   int64_t shape[] = {1, num_samples};

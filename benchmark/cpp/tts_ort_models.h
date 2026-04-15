@@ -6,11 +6,20 @@
 #include <string>
 #include <vector>
 
+// Flags to skip or defer loading ORT sessions when TRT engines cover them.
+// Default-constructed (all false) → identical behaviour to original code.
+struct ORTSkipFlags {
+  bool skip_vocoder = false;           // TRT vocoder loaded; skip vocoder ORT
+  bool skip_talker_prefill = false;    // TRT prefill loaded; skip talker_prefill ORT
+  bool lazy_speaker_encoder = false;   // load speaker_encoder on first use
+  bool lazy_tokenizer_encode = false;  // load tokenizer12hz_encode on first use
+};
+
 // All cold-path models loaded once, run via ORT CUDA EP
 class ORTModels {
  public:
   ORTModels(const std::string& model_dir, const std::string& sherpa_dir,
-            int device_id = 0);
+            ORTSkipFlags flags = {}, int device_id = 0);
 
   // text_project: input_ids [1, T] int64 → embeddings [1, T, D] float32
   std::vector<float> TextProject(const std::vector<int64_t>& input_ids);
@@ -49,6 +58,10 @@ class ORTModels {
   // Check if ORT talker_prefill session is loaded
   bool HasTalkerPrefill() const { return talker_prefill_ != nullptr; }
 
+  // Lazy-load on demand (no-op if already loaded)
+  void LoadSpeakerEncoder();
+  void LoadTokenizerEncode();
+
   int hidden_dim() const { return hidden_dim_; }
   int n_layers() const { return n_layers_; }
   int n_heads() const { return n_heads_; }
@@ -60,7 +73,17 @@ class ORTModels {
   Ort::SessionOptions MakeSessionOptions(int device_id);
   Ort::SessionOptions MakeCPUSessionOptions();
 
-  std::unique_ptr<Ort::Session> text_project_;
+  // Stored for lazy loading
+  std::string sherpa_dir_;
+  int device_id_ = 0;
+
+  std::unique_ptr<Ort::Session> text_project_;      // old combined model (fallback)
+  std::unique_ptr<Ort::Session> text_projection_;   // new: projection-only ONNX
+  std::vector<uint16_t> text_embed_table_;           // new: FP16 embedding table
+  int text_embed_vocab_ = 0;
+  int text_embed_dim_ = 0;
+  bool has_split_text_embed_ = false;
+
   std::unique_ptr<Ort::Session> codec_embed_;
   std::unique_ptr<Ort::Session> cp_embed_;
   std::unique_ptr<Ort::Session> talker_prefill_;
