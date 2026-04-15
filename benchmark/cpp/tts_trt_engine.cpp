@@ -128,6 +128,8 @@ TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
 }
 
 TRTTalkerEngine::~TRTTalkerEngine() {
+  FreeCudaGraphs();
+
   // Free prefill engine buffers
   for (auto p : d_prefill_kv_)
     if (p) cudaFree(p);
@@ -207,9 +209,20 @@ void TRTTalkerEngine::FreeBuffers() {
   if (d_position_id_) cudaFree(d_position_id_);
 }
 
+void TRTTalkerEngine::FreeCudaGraphs() {
+  for (int i = 0; i < 2; ++i) {
+    if (graph_exec_[i]) { cudaGraphExecDestroy(graph_exec_[i]); graph_exec_[i] = nullptr; }
+    if (cuda_graph_[i]) { cudaGraphDestroy(cuda_graph_[i]); cuda_graph_[i] = nullptr; }
+    graph_captured_[i] = false;
+  }
+  graph_warmup_steps_ = 0;
+}
+
 void TRTTalkerEngine::Reset() {
   seq_len_ = 0;
   parity_ = 0;
+  // Invalidate captured CUDA graphs (shapes/state changed)
+  FreeCudaGraphs();
   // Clear GPU KV buffers to prevent stale state between requests
   if (!kv_a_.empty()) {
     size_t kv_bytes = (size_t)n_heads_ * max_seq_ * head_dim_ * kv_elem_bytes_;
@@ -798,10 +811,16 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
     CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
   }
 
-  // Copy inputs_embeds to GPU (4KB)
+  // Copy inputs_embeds to GPU (4KB) — always outside graph (uses fixed d_emb_ address)
   size_t emb_bytes = 1 * 1 * hidden_dim_ * sizeof(float);
   CHECK_CUDA(cudaMemcpyAsync(d_emb_, inputs_embeds, emb_bytes,
                              cudaMemcpyHostToDevice, stream_));
+
+  // Update position_ids before graph (uses fixed d_position_id_ address)
+  // Placed before init block so it's available for both warmup and graph paths.
+  // Note: for CUDA Graph mode, position_ids updates are H2D to a fixed device
+  // address that is NOT captured in the graph — the graph's enqueueV3 reads
+  // from d_position_id_ which has already been updated before graph launch.
 
   // Initialize cached names on first call — auto-detect from engine.
   // For dual-profile engines, also initialize decode context (ctx_decode_)
@@ -848,7 +867,8 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       ctx->setInputShape("position_ids", nvinfer1::Dims2{1, 1});
       ctx->setTensorAddress("position_ids", d_position_id_);
     }
-    std::cout << "  TRT bind: seq_len=" << seq_len_ << std::endl;
+    std::cout << "  TRT bind: seq_len=" << seq_len_
+              << " cuda_graph=" << use_cuda_graph_ << std::endl;
     decode_first_step_ = false;
   }
 
@@ -859,8 +879,121 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
                                cudaMemcpyHostToDevice, stream_));
   }
 
-  // Bind KV cache — only shapes and addresses change per step
-  nvinfer1::Dims4 kv_shape{1, n_heads_, seq_len_, head_dim_};
+  // =========================================================================
+  // CUDA Graph fast path: replay captured graph for this parity
+  // =========================================================================
+  if (use_cuda_graph_ && graph_captured_[parity_]) {
+    // H2D (emb + position_ids) already queued above on stream_.
+    // Record H2D event for profiling before graph launch.
+    if (profiling_) {
+      CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
+    }
+
+    // Replay: single graph launch replaces 100+ kernel launches
+    CHECK_CUDA(cudaGraphLaunch(graph_exec_[parity_], stream_));
+
+    if (profiling_) {
+      CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
+    }
+
+    // D2H: copy logits + hidden from fixed device buffers.
+    // These are NOT in the graph because the host destination pointers
+    // (logits, last_hidden) may differ between calls.
+    if (logits_elem_bytes_ == sizeof(float)) {
+      size_t logits_bytes = (size_t)vocab_size_ * sizeof(float);
+      CHECK_CUDA(cudaMemcpyAsync(logits, d_logits_, logits_bytes,
+                                 cudaMemcpyDeviceToHost, stream_));
+    } else {
+      std::vector<uint16_t> logits_raw(vocab_size_);
+      CHECK_CUDA(cudaMemcpyAsync(logits_raw.data(), d_logits_,
+                                 (size_t)vocab_size_ * logits_elem_bytes_,
+                                 cudaMemcpyDeviceToHost, stream_));
+      CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+      CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+      for (int j = 0; j < vocab_size_; ++j) {
+        uint32_t bits;
+        if (logits_is_bf16_) {
+          bits = (uint32_t)logits_raw[j] << 16;
+        } else {
+          uint32_t sign = (logits_raw[j] >> 15) & 1;
+          uint32_t exp  = (logits_raw[j] >> 10) & 0x1F;
+          uint32_t mant =  logits_raw[j]        & 0x3FF;
+          if (exp == 0x1F)   bits = (sign << 31) | (0xFF << 23) | (mant << 13);
+          else if (exp == 0) bits = sign << 31;
+          else               bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+        }
+        std::memcpy(&logits[j], &bits, 4);
+      }
+    }
+
+    if (has_last_hidden_ && last_hidden != nullptr) {
+      if (hidden_elem_bytes_ == sizeof(float)) {
+        size_t hidden_bytes = (size_t)hidden_dim_ * sizeof(float);
+        CHECK_CUDA(cudaMemcpyAsync(last_hidden, d_hidden_, hidden_bytes,
+                                   cudaMemcpyDeviceToHost, stream_));
+      } else {
+        std::vector<uint16_t> hidden_raw(hidden_dim_);
+        CHECK_CUDA(cudaMemcpyAsync(hidden_raw.data(), d_hidden_,
+                                   (size_t)hidden_dim_ * hidden_elem_bytes_,
+                                   cudaMemcpyDeviceToHost, stream_));
+        CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+        CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+        for (int j = 0; j < hidden_dim_; ++j) {
+          uint32_t bits;
+          if (hidden_is_bf16_) {
+            bits = (uint32_t)hidden_raw[j] << 16;
+          } else {
+            uint32_t sign = (hidden_raw[j] >> 15) & 1;
+            uint32_t exp  = (hidden_raw[j] >> 10) & 0x1F;
+            uint32_t mant =  hidden_raw[j]        & 0x3FF;
+            if (exp == 0x1F)   bits = (sign << 31) | (0xFF << 23) | (mant << 13);
+            else if (exp == 0) bits = sign << 31;
+            else               bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+          }
+          std::memcpy(&last_hidden[j], &bits, 4);
+        }
+      }
+    }
+
+    CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+
+    if (profiling_) {
+      StepTiming t;
+      cudaEventElapsedTime(&t.h2d_ms, ev_start_, ev_h2d_done_);
+      cudaEventElapsedTime(&t.kernel_ms, ev_h2d_done_, ev_kernel_done_);
+      cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
+      cudaEventElapsedTime(&t.total_ms, ev_start_, ev_d2h_done_);
+      stats_.Add(t);
+    }
+
+    seq_len_ += 1;
+    parity_ ^= 1;
+    return;
+  }
+
+  // =========================================================================
+  // Normal path: set KV shapes and run enqueueV3 (warmup or graph disabled)
+  // For CUDA Graph capture: use max_seq_ shapes so the graph is shape-invariant.
+  //
+  // NOTE on attention dilution: The captured graph always processes max_seq-1
+  // KV entries regardless of actual seq_len_. Zero-padded KV entries produce
+  // near-zero QK^T scores but non-zero softmax weights (exp(0)=1), which
+  // dilutes attention over real entries. This dilution is strongest at early
+  // decode steps (few real KV entries vs many zeros). If TTS quality degrades,
+  // consider the re-capture approach: capture a fresh graph each step
+  // (capture cost ~0.5ms is still worthwhile if kernel launch overhead >5ms).
+  // =========================================================================
+
+  // Determine KV shape for this step.
+  // When preparing for graph capture (warmup complete but not yet captured),
+  // use max_seq_-1 so the output KV (past_len+1 = max_seq_) fits buffers.
+  bool preparing_capture = use_cuda_graph_ &&
+                           graph_warmup_steps_ >= kGraphWarmupSteps &&
+                           !graph_captured_[parity_];
+  int kv_len = preparing_capture ? (max_seq_ - 1) : seq_len_;
+  nvinfer1::Dims4 kv_shape{1, n_heads_, kv_len, head_dim_};
+
   for (int i = 0; i < n_layers_; ++i) {
     ctx->setInputShape(kv_names_[2 * i].c_str(), kv_shape);
     ctx->setTensorAddress(kv_names_[2 * i].c_str(), read[2 * i]);
@@ -876,8 +1009,38 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
     CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
   }
 
-  // Execute TRT kernel
-  ctx->enqueueV3(stream_);
+  // =========================================================================
+  // CUDA Graph capture path: capture enqueueV3 into a graph
+  // =========================================================================
+  if (preparing_capture) {
+    std::cout << "  CUDA Graph: capturing parity=" << parity_
+              << " kv_len=" << kv_len << std::endl;
+
+    // Synchronize stream before capture to ensure all prior work is complete
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+    CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+
+    // Captured operations: only the TRT enqueueV3 kernel sequence.
+    // H2D (emb, position_ids) and D2H (logits, hidden) are NOT captured
+    // because host pointers may change between calls.
+    ctx->enqueueV3(stream_);
+
+    CHECK_CUDA(cudaStreamEndCapture(stream_, &cuda_graph_[parity_]));
+    CHECK_CUDA(cudaGraphInstantiate(&graph_exec_[parity_], cuda_graph_[parity_],
+                                    nullptr, nullptr, 0));
+    graph_captured_[parity_] = true;
+
+    std::cout << "  CUDA Graph: captured parity=" << parity_ << " OK" << std::endl;
+
+    // Now actually execute this step (the capture didn't execute anything).
+    // Use the newly captured graph for execution.
+    CHECK_CUDA(cudaGraphLaunch(graph_exec_[parity_], stream_));
+  } else {
+    // Normal execution (warmup steps or graph disabled)
+    ctx->enqueueV3(stream_);
+    graph_warmup_steps_++;
+  }
 
   // Record kernel done event
   if (profiling_) {
@@ -1258,6 +1421,9 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
                           max_past_ * sizeof(int64_t), cudaMemcpyHostToDevice));
   }
 
+  // Step-sync event for GPU sampling path (lightweight, no timing overhead)
+  CHECK_CUDA(cudaEventCreateWithFlags(&ev_step_sync_, cudaEventDisableTiming));
+
   // Profiling events
   CHECK_CUDA(cudaEventCreate(&ev_start_));
   CHECK_CUDA(cudaEventCreate(&ev_kernel_done_));
@@ -1286,6 +1452,7 @@ TRTCPKVEngine::~TRTCPKVEngine() {
   if (d_codes_out_) cudaFree(d_codes_out_);
   if (d_cache_pos_table_) cudaFree(d_cache_pos_table_);
   if (d_cache_pos_single_) cudaFree(d_cache_pos_single_);
+  if (ev_step_sync_) cudaEventDestroy(ev_step_sync_);
   if (ev_start_) cudaEventDestroy(ev_start_);
   if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
   if (ev_d2h_done_) cudaEventDestroy(ev_d2h_done_);
@@ -1297,8 +1464,25 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     int* codes_out,
     const float* embed_table, int embed_vocab) {
   // Autoregressive CP: 15 sequential steps.
-  // If GPU embed table is available → GPU sampling (no CPU sync between steps).
-  // Otherwise → CPU sampling (sync each step for D2H logits).
+  //
+  // Three execution strategies (selected automatically):
+  //
+  // 1. GPU sampling + event sync (preferred): GPU embed table available.
+  //    Sampling runs entirely on GPU — no D2H logits, no H2D embeddings,
+  //    no CPU top-k sort. A lightweight cudaEventSynchronize between steps
+  //    gives TRT the stream-quiescence it needs to avoid shape-change
+  //    overhead (the root cause of the old GPU path being 2x slower).
+  //
+  // 2. CPU sampling (fallback): no GPU embed table. D2H logits + CPU sort
+  //    + H2D embedding each step. cudaStreamSynchronize provides the same
+  //    TRT quiescence benefit.
+  //
+  // Strategy 1 eliminates per-step:
+  //   - ~8KB D2H (BF16 logits) + cudaStreamSynchronize overhead
+  //   - CPU partial_sort over 2048 values + discrete_distribution
+  //   - ~4KB H2D (embedding) + 8B H2D (cache_pos)
+  // replacing all of that with a single GPU kernel (~2us) + event sync.
+  //
   auto* pctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
   auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
   int D = hidden_dim_;
@@ -1306,10 +1490,8 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   size_t d_bytes = D * sizeof(float);
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
-  // GPU sampling is slower due to TRT shape-change overhead when not syncing
-  // between steps. CPU sampling with per-step sync is actually faster (~53ms
-  // vs ~123ms) because the sync lets TRT finalize each step's execution plan.
-  bool use_gpu_sample = false;  // disabled — CPU path is faster
+  // Use GPU sampling when embed table is loaded on GPU
+  bool use_gpu_sample = (d_embed_table_ != nullptr);
 
   // RNG seed for GPU sampling
   unsigned long long rng_seed = std::chrono::high_resolution_clock::now()
@@ -1353,6 +1535,10 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     return vals[dist(cp_rng)].second;
   };
 
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
+  }
+
   // ---- Step 0: Prefill [hidden, primary_emb] (seq_len=2, past_len=0) ----
   CHECK_CUDA(cudaMemcpyAsync(d_embeds_, hidden, d_bytes,
                              cudaMemcpyHostToDevice, stream_));
@@ -1390,33 +1576,42 @@ void TRTCPKVEngine::RunFrameAutoregressive(
 
   // Sample group 0
   if (use_gpu_sample) {
-    const void* logits_ptr = is_single_head_
-        ? d_logits_all_
-        : d_logits_all_;  // offset 0 for group 0
     launchCPSampleAndEmbed(
-        stream_, logits_ptr, logits_is_bf16_,
+        stream_, d_logits_all_, logits_is_bf16_,
         reinterpret_cast<const float*>(d_embed_table_),
         reinterpret_cast<float*>(d_embeds_),  // write embed for next step
         d_codes_out_ + 0,
-        reinterpret_cast<int64_t*>(d_cache_pos_),  // write next cache_pos = 2
+        d_cache_pos_single_,  // write next cache_pos = 2
         cp_vocab_, D, /*layer_idx=*/0,
         /*next_cache_pos=*/2,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
-    // No sync — stream ordering ensures kernel completes before next enqueueV3.
+    // Event sync: let TRT see a quiesced stream before next enqueueV3.
+    // This is much cheaper than cudaStreamSynchronize (no OS context switch)
+    // but provides the same benefit: TRT's internal shape-change validation
+    // sees completed work and avoids its pathological slow path.
+    CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
+    CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
   } else {
     codes_out[0] = sample_topk_cpu(d_logits_all_, 0);
   }
 
-  // ---- Pre-bind decode context ----
-  dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
-  dctx->setTensorAddress("inputs_embeds", d_embeds_);
-  dctx->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
-  dctx->setTensorAddress("cache_position", d_cache_pos_);
-  dctx->setTensorAddress(logits_out_name, d_logits_decode_);
-  if (is_single_head_) {
-    dctx->setTensorAddress("gen_step", d_gen_step_);
+  // ---- Pre-bind decode context (one-time for non-changing addresses) ----
+  if (!decode_ctx_bound_) {
+    dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
+    dctx->setTensorAddress("inputs_embeds", d_embeds_);
+    dctx->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
+    dctx->setTensorAddress("cache_position", use_gpu_sample ? d_cache_pos_single_ : d_cache_pos_);
+    dctx->setTensorAddress(logits_out_name, d_logits_decode_);
+    if (is_single_head_) {
+      dctx->setTensorAddress("gen_step", d_gen_step_);
+    }
+    decode_ctx_bound_ = true;
   }
+  // If switching between GPU/CPU sample modes, rebind cache_position address
+  // (d_cache_pos_single_ for GPU path, d_cache_pos_ for CPU path).
+  // This is a cheap pointer set, safe to do unconditionally:
+  dctx->setTensorAddress("cache_position", use_gpu_sample ? d_cache_pos_single_ : d_cache_pos_);
 
   // ---- Steps 1-14: Decode ----
   int past_len = 2;
@@ -1424,16 +1619,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   auto* kv_write = &d_kv_a_;
 
   for (int j = 1; j < n_groups; ++j) {
-    if (use_gpu_sample) {
-      // GPU path: embed already in d_embeds_ from previous kernel,
-      // cache_pos already written by previous kernel.
-      // Only need to upload gen_step for single-head engine.
-      if (is_single_head_) {
-        int64_t gs = j;
-        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
-                                   cudaMemcpyHostToDevice, stream_));
-      }
-    } else {
+    if (!use_gpu_sample) {
       // CPU path: upload embed + cache_pos from host
       const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
       CHECK_CUDA(cudaMemcpyAsync(d_embeds_, emb, d_bytes,
@@ -1446,9 +1632,19 @@ void TRTCPKVEngine::RunFrameAutoregressive(
         CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
                                    cudaMemcpyHostToDevice, stream_));
       }
+    } else {
+      // GPU path: embed and cache_pos already written by previous sample kernel.
+      if (is_single_head_) {
+        int64_t gs = j;
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
     }
 
-    // Update KV shapes and pointers
+    // Update KV shapes (past_len changes) and ping-pong buffer addresses.
+    // Only setInputShape for past KV (shapes change); new KV shapes are
+    // inferred by TRT (past_len + seq_len). Addresses must update for
+    // the ping-pong swap.
     for (int i = 0; i < n_cp_layers_; ++i) {
       dctx->setInputShape(cp_kv_names_[2*i].c_str(),
                           nvinfer1::Dims4{1, n_heads_, past_len, head_dim_});
@@ -1468,10 +1664,10 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     }
 
     if (use_gpu_sample) {
-      // GPU sample kernel: reads logits from GPU, writes embed + code + cache_pos
+      // GPU sample kernel: reads logits, writes embed + code + cache_pos
       const void* logits_ptr;
       if (is_single_head_) {
-        logits_ptr = d_logits_decode_;  // [1, vocab]
+        logits_ptr = d_logits_decode_;
       } else {
         logits_ptr = (const char*)d_logits_decode_ +
                      (size_t)j * cp_vocab_ * logits_elem_bytes_;
@@ -1482,13 +1678,17 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           reinterpret_cast<const float*>(d_embed_table_),
           reinterpret_cast<float*>(d_embeds_),
           d_codes_out_ + j,
-          reinterpret_cast<int64_t*>(d_cache_pos_),
+          d_cache_pos_single_,
           cp_vocab_, D, /*layer_idx=*/j,
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
           rng_seed, rng_counter_++);
-      // No sync — stream ordering ensures kernel completes before next enqueueV3.
-      // setInputShape is CPU-side metadata, doesn't need GPU idle.
+      // Event sync: give TRT a quiesced stream for the next step.
+      // Using cudaEventSynchronize with a DisableTiming event is cheaper
+      // than cudaStreamSynchronize — it avoids CUDA driver's full stream
+      // query overhead while still signaling completion to TRT.
+      CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
+      CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
     } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
     }
@@ -1497,10 +1697,26 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     std::swap(kv_read, kv_write);
   }
 
-  // GPU path: copy codes from GPU to host
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
+  }
+
+  // GPU path: single D2H for all 15 codes
   if (use_gpu_sample) {
-    CHECK_CUDA(cudaMemcpy(codes_out, d_codes_out_,
-                          n_groups * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpyAsync(codes_out, d_codes_out_,
+                               n_groups * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
+  }
+
+  if (profiling_) {
+    CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
+    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    StepTiming t;
+    cudaEventElapsedTime(&t.kernel_ms, ev_start_, ev_kernel_done_);
+    cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
+    cudaEventElapsedTime(&t.total_ms, ev_start_, ev_d2h_done_);
+    stats_.Add(t);
   }
 }
 
@@ -1585,6 +1801,9 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
       /*next_cache_pos=*/2,
       /*top_k=*/50, /*temperature=*/0.9f,
       rng_seed, rng_counter_++);
+  // Event sync after sample kernel — gives TRT a quiesced stream
+  CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
+  CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
 
   // ---- Pre-bind decode context addresses that don't change between steps ----
   dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
@@ -1597,11 +1816,9 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   }
 
   // ---- Steps 1-14: Decode (seq_len=1, past_len grows) ----
-  // NOTE: No per-step sync — all 14 decode steps queued async on stream.
-  // This path is 2x slower than RunFrameAutoregressive on single-profile
-  // engines due to TRT's shape-change overhead without sync points.
-  // Intended for future use with a dual-profile engine where seq_len is
-  // fixed within each profile.
+  // Event sync between steps gives TRT the stream quiescence it needs
+  // to avoid its internal shape-change penalty, while keeping all
+  // sampling and embedding work on the GPU (no D2H/H2D per step).
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
@@ -1648,6 +1865,10 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
         next_pos,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
+
+    // Event sync — same pattern as RunFrameAutoregressive GPU path
+    CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
+    CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
 
     std::swap(kv_read, kv_write);
   }

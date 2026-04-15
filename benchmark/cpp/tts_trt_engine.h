@@ -92,9 +92,18 @@ class TRTTalkerEngine {
   const ProfilingStats& stats() const { return stats_; }
   void ResetStats() { stats_.Reset(); }
 
+  // CUDA Graph: capture decode step kernel sequence and replay as single launch.
+  // Reduces per-step overhead from 100+ kernel launches to 1 graph launch.
+  // Must be called AFTER the engine is loaded but BEFORE the first DecodeStep.
+  // Graph is captured after kGraphWarmupSteps warmup steps (one per parity).
+  void EnableCudaGraph(bool enable) { use_cuda_graph_ = enable; }
+  bool cuda_graph_enabled() const { return use_cuda_graph_; }
+  bool cuda_graph_captured() const { return graph_captured_[0] && graph_captured_[1]; }
+
  private:
   void AllocateBuffers();
   void FreeBuffers();
+  void FreeCudaGraphs();
 
   // Run prefill using the dedicated prefill engine (batch, no KV inputs).
   // Copies KV outputs directly into kv_a_ via D2D cudaMemcpy.
@@ -174,6 +183,18 @@ class TRTTalkerEngine {
 
   // Cached emb tensor name for binding (avoid re-detection)
   std::string emb_name_;
+
+  // CUDA Graph for decode step — eliminates kernel launch overhead.
+  // Two graphs captured (one per parity) to handle double-buffered KV swap.
+  // At capture time, KV shapes are set to max_seq_ so that the graph kernels
+  // are shape-invariant across steps (excess zero-padded KV entries produce
+  // near-zero attention weights and negligible compute overhead for seq_len=1).
+  bool use_cuda_graph_ = false;
+  bool graph_captured_[2] = {false, false};
+  cudaGraph_t cuda_graph_[2] = {nullptr, nullptr};
+  cudaGraphExec_t graph_exec_[2] = {nullptr, nullptr};
+  int graph_warmup_steps_ = 0;
+  static constexpr int kGraphWarmupSteps = 2;  // need at least 1 per parity
 };
 
 // ---------------------------------------------------------------------------
@@ -369,6 +390,16 @@ class TRTCPKVEngine {
   // Pre-cached tensor names for fast binding
   std::vector<std::string> cp_kv_names_;     // "past_key_0", "past_value_0", ...
   std::vector<std::string> cp_new_kv_names_; // "new_past_key_0", ...
+
+  // Decode context pre-bound flag: when true, non-changing tensor addresses
+  // (inputs_embeds, cache_position, logits, gen_step) are already bound on
+  // ctx_decode_ and don't need re-binding between RunFrame calls.
+  bool decode_ctx_bound_ = false;
+
+  // Lightweight event for inter-step sync (GPU sampling path).
+  // Inserted after each sample kernel so TRT enqueueV3 sees a finalized
+  // stream state, avoiding its internal shape-change penalty.
+  cudaEvent_t ev_step_sync_ = nullptr;
 
   // Profiling
   bool profiling_ = false;
