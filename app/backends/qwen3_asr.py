@@ -43,7 +43,7 @@ CHUNK_SIZE_SEC = 0.8
 MEMORY_NUM = 3
 ROLLBACK_TOKENS = 3
 EOS_CONFIRM_COUNT = 2
-STREAMING_MAX_TOKENS = 16
+STREAMING_MAX_TOKENS = 4
 
 
 @dataclass
@@ -201,6 +201,8 @@ class Qwen3StreamingASRStream(ASRStream):
         """Prefill + decode on concatenated window embeddings.
 
         Prefers TRT prefill (40ms) over ORT prefill (200ms).
+        For intermediate chunks (small max_tokens), exits early if decoded
+        text already covers previous result (no new information).
         Returns decoded text, or None if decoder immediately produced EOS.
         """
         audio_len = all_embd.shape[1]
@@ -337,7 +339,9 @@ class Qwen3StreamingASRStream(ASRStream):
 
         # 4. Decode
         if is_final:
-            estimated_tokens = max(20, int(chunk_sec * 15))
+            # Scale max_tokens to expected output length (~15 tokens/sec)
+            window_sec = sum(s.embedding.shape[1] for s in self._segments) / 13  # ~13 features/sec
+            estimated_tokens = max(20, int(window_sec * 15))
             max_tok = min(200, estimated_tokens)
         else:
             max_tok = STREAMING_MAX_TOKENS
