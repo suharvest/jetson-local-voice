@@ -129,6 +129,10 @@ class Qwen3StreamingASRStream(ASRStream):
         self._total_dec_ms: float = 0.0
         self._n_chunks: int = 0
 
+        # Speculative encoding
+        self._spec_embd = None
+        self._spec_audio_len = 0
+
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
@@ -142,6 +146,14 @@ class Qwen3StreamingASRStream(ASRStream):
                 samples,
             ).astype(np.float32)
         self._sample_buf = np.concatenate([self._sample_buf, samples])
+
+        # Speculative encoding: pre-encode if buffer >= 50% chunk but not yet full
+        min_spec = self._chunk_size_samples // 2
+        if (len(self._sample_buf) >= min_spec
+                and len(self._sample_buf) != self._spec_audio_len
+                and len(self._sample_buf) < self._chunk_size_samples):
+            self._spec_embd = self._run_encoder(self._sample_buf)
+            self._spec_audio_len = len(self._sample_buf)
 
         # Process complete chunks
         while len(self._sample_buf) >= self._chunk_size_samples:
@@ -304,9 +316,15 @@ class Qwen3StreamingASRStream(ASRStream):
         self._total_audio_s += chunk_sec
         self._n_chunks += 1
 
-        # 1. Encode
+        # 1. Encode (reuse speculative embedding if it matches this chunk)
         t0 = time.perf_counter()
-        enc_out = self._run_encoder(audio_chunk)
+        if (self._spec_embd is not None
+                and self._spec_audio_len == len(audio_chunk)):
+            enc_out = self._spec_embd
+            self._spec_embd = None
+            self._spec_audio_len = 0
+        else:
+            enc_out = self._run_encoder(audio_chunk)
         self._total_enc_ms += (time.perf_counter() - t0) * 1000
 
         # 2. Update sliding window
@@ -448,9 +466,12 @@ class Qwen3ASRBackend(ASRBackend):
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 
             logger.info("Loading encoder...")
-            self._encoder = ort.InferenceSession(
-                os.path.join(_BASE, "encoder.onnx"), so, providers=providers)
-            logger.info("Encoder OK")
+            for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
+                enc_path = os.path.join(_BASE, enc_name)
+                if os.path.exists(enc_path):
+                    self._encoder = ort.InferenceSession(enc_path, so, providers=providers)
+                    logger.info("Encoder loaded: %s", enc_name)
+                    break
 
             for name in ["decoder_prefill.onnx", "decoder_init.onnx"]:
                 path = os.path.join(_BASE, name)
@@ -482,11 +503,14 @@ class Qwen3ASRBackend(ASRBackend):
 
             # ORT decoder fallback — prefer unified (supports prefill+step)
             if self._decoder is None:
+                so_dec = ort.SessionOptions()
+                so_dec.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                trt_providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
                 for dec_name in ["decoder_unified.onnx", "decoder_step.onnx"]:
                     path = os.path.join(_BASE, dec_name)
                     if os.path.exists(path):
                         try:
-                            self._decoder_ort = ort.InferenceSession(path, so, providers=providers)
+                            self._decoder_ort = ort.InferenceSession(path, so_dec, providers=trt_providers)
                             logger.info("ASR ORT decoder loaded: %s", path)
                             break
                         except Exception as e:
@@ -502,6 +526,35 @@ class Qwen3ASRBackend(ASRBackend):
             "TRT" if self._decoder else "ORT" if self._decoder_ort else "none")
         logger.info("Qwen3-ASR loaded in %.1fs (decoder: %s)",
                      time.time() - t0, backend_name)
+
+        # Warm up encoder + decoder to avoid first-call penalty
+        if not self._use_cpp_pipeline and self._encoder and (self._decoder_ort or self._prefill):
+            logger.info("Warming up encoder + decoder...")
+            t_warm = time.time()
+            try:
+                dummy_audio = np.zeros(16000, dtype=np.float32)  # 1s silence
+                mel = self._compute_mel(dummy_audio)
+                enc = self._encoder.run(None, {"mel": mel})[0]
+                # Warm up decoder with tiny prefill
+                sess = self._prefill or self._decoder_ort
+                valid_names = [i.name for i in sess.get_inputs()]
+                first_input = sess.get_inputs()[0]
+                dtype = np.float16 if first_input.type == "tensor(float16)" else np.float32
+                warm_in = {
+                    "input_embeds": np.zeros((1, 2, 1024), dtype=dtype),
+                    "position_ids": np.arange(2, dtype=np.int64).reshape(1, -1),
+                }
+                for layer in range(28):
+                    for prefix in ("past_key_", "past_value_"):
+                        name = f"{prefix}{layer}"
+                        if name in valid_names:
+                            warm_in[name] = np.zeros((1, 8, 0, 128), dtype=dtype)
+                valid = {n: v for n, v in warm_in.items() if n in valid_names}
+                sess.run(None, valid)
+                logger.info("Warm-up done in %.1fs", time.time() - t_warm)
+            except Exception as e:
+                logger.warning("Warm-up failed: %s", e)
+
         self._ready = True
 
     def create_stream(self, language: str = "auto") -> ASRStream:
@@ -700,8 +753,14 @@ class Qwen3ASRBackend(ASRBackend):
         # Use chunk_length matching actual audio to avoid excessive padding
         audio_secs = len(audio) / 16000
         chunk_len = min(30, int(audio_secs) + 1)  # Round up, max 30s
-        fe = WhisperFeatureExtractor(feature_size=128, sampling_rate=16000,
-                                     n_fft=400, hop_length=160, chunk_length=chunk_len)
+        # Cache the feature extractor for common chunk lengths
+        if not hasattr(self, '_mel_cache'):
+            self._mel_cache = {}
+        if chunk_len not in self._mel_cache:
+            self._mel_cache[chunk_len] = WhisperFeatureExtractor(
+                feature_size=128, sampling_rate=16000,
+                n_fft=400, hop_length=160, chunk_length=chunk_len)
+        fe = self._mel_cache[chunk_len]
         features = fe(audio, sampling_rate=16000, return_tensors="np")
         return features["input_features"]  # [1, 128, T]
 
