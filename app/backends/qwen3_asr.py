@@ -413,7 +413,7 @@ class Qwen3ASRBackend(ASRBackend):
         # Fallback: Python ORT sessions
         self._encoder = None
         self._prefill = None
-        self._decoder = None      # C++ TRT ASRDecoder (legacy)
+        self._decoder = None      # C++ TRT decoder (qwen3_speech_engine.TRTDecoder)
         self._decoder_ort = None  # ORT fallback
         self._embed_tokens = None
         self._tokenizer = None
@@ -449,8 +449,8 @@ class Qwen3ASRBackend(ASRBackend):
 
         if engine_path:
             try:
-                import qwen3_tts_engine
-                self._pipeline = qwen3_tts_engine.ASRPipeline(
+                import qwen3_speech_engine
+                self._pipeline = qwen3_speech_engine.ASRPipeline(
                     _BASE, engine_path, 0)
                 self._use_cpp_pipeline = True
                 logger.info("C++ ASR pipeline loaded (encoder+prefill+TRT)")
@@ -458,21 +458,27 @@ class Qwen3ASRBackend(ASRBackend):
                 logger.warning("C++ ASR pipeline failed: %s, falling back to Python", e)
                 self._pipeline = None
 
-        # Fall back to Python ORT if C++ pipeline not available
+        # Load ORT sessions (needed for streaming even when C++ pipeline is available)
+        import onnxruntime as ort
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+
+        # Encoder (ORT, needed for streaming encode-once)
+        logger.info("Loading encoder...")
+        for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
+            enc_path = os.path.join(_BASE, enc_name)
+            if os.path.exists(enc_path):
+                self._encoder = ort.InferenceSession(enc_path, so, providers=providers)
+                logger.info("Encoder loaded: %s", enc_name)
+                break
+
+        # Embed tokens (needed for streaming decode)
+        emb_path = os.path.join(_BASE, "embed_tokens.bin")
+        if os.path.exists(emb_path):
+            self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
+
         if not self._use_cpp_pipeline:
-            import onnxruntime as ort
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            so = ort.SessionOptions()
-            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-
-            logger.info("Loading encoder...")
-            for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
-                enc_path = os.path.join(_BASE, enc_name)
-                if os.path.exists(enc_path):
-                    self._encoder = ort.InferenceSession(enc_path, so, providers=providers)
-                    logger.info("Encoder loaded: %s", enc_name)
-                    break
-
             for name in ["decoder_prefill.onnx", "decoder_init.onnx"]:
                 path = os.path.join(_BASE, name)
                 if not os.path.exists(path):
@@ -485,36 +491,30 @@ class Qwen3ASRBackend(ASRBackend):
                     except Exception as e:
                         logger.warning("Prefill %s failed: %s", name, e)
 
-            # Embed tokens
-            emb_path = os.path.join(_BASE, "embed_tokens.bin")
-            if os.path.exists(emb_path):
-                self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
+        # TRT decoder for streaming (loaded regardless of C++ pipeline mode)
+        if engine_path and self._decoder is None:
+            try:
+                import qwen3_speech_engine
+                self._decoder = qwen3_speech_engine.TRTDecoder(
+                    engine_path, 28, 1024, 8, 128, 151936, 500)
+                self._trt_max_seq = 500
+                logger.info("TRT decoder loaded for streaming: %s", engine_path)
+            except Exception as e:
+                logger.warning("TRT decoder %s failed: %s", engine_path, e)
 
-            # TRT decoder via pybind11
-            if engine_path:
-                try:
-                    import qwen3_tts_engine
-                    self._decoder = qwen3_tts_engine.ASRDecoder(
-                        engine_path, 28, 1024, 8, 128, 151936, 500)
-                    self._trt_max_seq = 500
-                    logger.info("ASR TRT decoder loaded: %s", engine_path)
-                except Exception as e:
-                    logger.warning("TRT decoder %s failed: %s", engine_path, e)
-
-            # ORT decoder fallback — prefer unified (supports prefill+step)
-            if self._decoder is None:
-                so_dec = ort.SessionOptions()
-                so_dec.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                trt_providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
-                for dec_name in ["decoder_unified.onnx", "decoder_step.onnx"]:
-                    path = os.path.join(_BASE, dec_name)
-                    if os.path.exists(path):
-                        try:
-                            self._decoder_ort = ort.InferenceSession(path, so_dec, providers=trt_providers)
-                            logger.info("ASR ORT decoder loaded: %s", path)
-                            break
-                        except Exception as e:
-                            logger.warning("ORT decoder %s failed: %s", dec_name, e)
+        # Unified decoder ORT for streaming prefill (loaded regardless of pipeline mode)
+        if self._decoder_ort is None:
+            so_dec = ort.SessionOptions()
+            so_dec.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            for dec_name in ["decoder_unified.onnx", "decoder_step.onnx"]:
+                path = os.path.join(_BASE, dec_name)
+                if os.path.exists(path):
+                    try:
+                        self._decoder_ort = ort.InferenceSession(path, so_dec, providers=providers)
+                        logger.info("ASR ORT decoder loaded: %s", path)
+                        break
+                    except Exception as e:
+                        logger.warning("ORT decoder %s failed: %s", dec_name, e)
 
         # Tokenizer (needed by both paths)
         tok_path = os.path.join(_BASE, "tokenizer.json")
@@ -522,10 +522,13 @@ class Qwen3ASRBackend(ASRBackend):
             from tokenizers import Tokenizer
             self._tokenizer = Tokenizer.from_file(tok_path)
 
-        backend_name = "C++" if self._use_cpp_pipeline else (
+        offline_backend = "C++" if self._use_cpp_pipeline else (
             "TRT" if self._decoder else "ORT" if self._decoder_ort else "none")
-        logger.info("Qwen3-ASR loaded in %.1fs (decoder: %s)",
-                     time.time() - t0, backend_name)
+        stream_backend = ("TRT+ORT" if self._decoder and self._decoder_ort
+                          else "TRT" if self._decoder
+                          else "ORT" if self._decoder_ort else "none")
+        logger.info("Qwen3-ASR loaded in %.1fs (offline: %s, streaming: %s)",
+                     time.time() - t0, offline_backend, stream_backend)
 
         # Warm up encoder + decoder to avoid first-call penalty
         if not self._use_cpp_pipeline and self._encoder and (self._decoder_ort or self._prefill):
