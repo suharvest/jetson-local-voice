@@ -183,6 +183,14 @@ class TTSPipeline {
   int cp_embed_vocab_ = 0;
   const float* CPEmbedLookup(int layer, int token_id) const;
 
+  // INT8 quantized cp_embed table (optional, saves ~90MB)
+  std::vector<int8_t> cp_embed_int8_table_;      // [n_layers][vocab][D]
+  std::vector<float> cp_embed_scales_;             // [n_layers][vocab] per-token scale
+  bool cp_embed_use_int8_ = false;
+  void LoadCPEmbedTableINT8(const std::string& sherpa_dir);
+  // Dequantized lookup into caller-provided buffer
+  void CPEmbedLookupINT8(int layer, int token_id, float* out) const;
+
   // CPU copy of codec_embed table: [vocab_size][D]
   std::vector<float> codec_embed_table_;
   int codec_embed_vocab_ = 0;

@@ -34,8 +34,6 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
                          const std::string& cp_engine_path, int device_id) {
   LoadConfig(sherpa_dir);
 
-  ort_ = std::make_unique<ORTModels>(model_dir, sherpa_dir, device_id);
-
   std::cout << "Loading TRT engines..." << std::endl;
   talker_ = std::make_unique<TRTTalkerEngine>(
       talker_engine_path, cfg_.num_hidden_layers, cfg_.hidden_dim, cfg_.n_heads,
@@ -46,6 +44,7 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
 
   // Auto-detect prefill engine: look for talker_prefill_fp16.engine in the
   // same directory as the decode engine. Load it if found.
+  bool trt_prefill_loaded = false;
   {
     std::string engine_dir = talker_engine_path;
     auto slash = engine_dir.rfind('/');
@@ -59,19 +58,18 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
         engine_dir + "/talker_prefill_bf16.engine",
         engine_dir + "/talker_prefill_fp16.engine",
     };
-    bool prefill_loaded = false;
     for (const auto& prefill_path : prefill_candidates) {
       std::ifstream test(prefill_path);
       if (test.good()) {
         test.close();
         std::cout << "  Found prefill engine: " << prefill_path << std::endl;
         talker_->LoadPrefillEngine(prefill_path);
-        prefill_loaded = true;
+        trt_prefill_loaded = true;
         break;
       }
     }
-    if (!prefill_loaded) {
-      std::cout << "  No prefill engine found — using iterative prefill fallback" << std::endl;
+    if (!trt_prefill_loaded) {
+      std::cout << "  No prefill engine found â using iterative prefill fallback" << std::endl;
     }
 
     // Try to load CP KV cache engine (cp_unified_bf16.engine)
@@ -90,7 +88,7 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
           cfg_.num_code_groups - 1  // 15 output groups
       );
     } else {
-      std::cout << "  No CP KV engine — using old context-copy CP" << std::endl;
+      std::cout << "  No CP KV engine â using old context-copy CP" << std::endl;
     }
 
     // Try to load vocoder TRT engine
@@ -101,8 +99,19 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
       std::cout << "  Found vocoder TRT engine: " << voc_engine_path << std::endl;
       trt_vocoder_ = std::make_unique<TRTVocoderEngine>(voc_engine_path, 200, 24000 * 20);
     } else {
-      std::cout << "  No vocoder TRT engine found — using ORT fallback" << std::endl;
+      std::cout << "  No vocoder TRT engine found â using ORT fallback" << std::endl;
     }
+  }
+
+  // Build ORT skip flags based on which TRT engines were loaded, then
+  // create ORTModels. This avoids loading sessions that are covered by TRT.
+  {
+    ORTSkipFlags skip;
+    skip.skip_vocoder = (trt_vocoder_ != nullptr);
+    skip.skip_talker_prefill = trt_prefill_loaded;
+    skip.lazy_speaker_encoder = true;   // load on first voice-clone use
+    skip.lazy_tokenizer_encode = true;  // load on first voice-clone use
+    ort_ = std::make_unique<ORTModels>(model_dir, sherpa_dir, skip, device_id);
   }
 
   // Try to load cp_embed table on GPU for fast lookup
@@ -533,8 +542,14 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       for (int j = 0; j < n_groups; ++j) {
         int rc = cp_codes[j];
         frame_codes.push_back(rc);
-        const float* re = CPEmbedLookup(j, rc);
-        VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+        if (cp_embed_use_int8_) {
+          float re_buf[1024];
+          CPEmbedLookupINT8(j, rc, re_buf);
+          VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+        } else {
+          const float* re = CPEmbedLookup(j, rc);
+          VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+        }
       }
     } else {
       // --- Old context-copy CP engine path ---
@@ -549,8 +564,14 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
         if (cp_->has_embed_table()) {
           cp_->AppendEmbeddingFromTable(j, rc);
-          const float* re = CPEmbedLookup(j, rc);
-          VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+          if (cp_embed_use_int8_) {
+            float re_buf[1024];
+            CPEmbedLookupINT8(j, rc, re_buf);
+            VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+          } else {
+            const float* re = CPEmbedLookup(j, rc);
+            VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+          }
         } else {
           auto re = ort_->CPEmbed(rc, j);
           cp_->AppendEmbedding(re.data());
@@ -679,11 +700,83 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
   if (cp_kv_) {
     cp_kv_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
   }
+
+  // Try INT8 quantized version (replaces FP32 CPU copy if available)
+  LoadCPEmbedTableINT8(sherpa_dir);
 }
 
 const float* TTSPipeline::CPEmbedLookup(int layer, int token_id) const {
   size_t offset = ((size_t)layer * cp_embed_vocab_ + token_id) * cfg_.hidden_dim;
   return cp_embed_table_.data() + offset;
+}
+
+void TTSPipeline::LoadCPEmbedTableINT8(const std::string& sherpa_dir) {
+  // Try to load pre-quantized INT8 files
+  std::string int8_path = sherpa_dir + "/cp_embed_int8.bin";
+  std::string scale_path = sherpa_dir + "/cp_embed_scales.bin";
+
+  if (!std::ifstream(int8_path).good() || !std::ifstream(scale_path).good()) {
+    std::cout << "  INT8 cp_embed not found, using FP32" << std::endl;
+    return;
+  }
+
+  int n_layers = cfg_.num_code_groups - 1;  // 15
+  int vocab = cfg_.cp_vocab;                 // 2048
+  int D = cfg_.hidden_dim;                   // 1024
+
+  // Load INT8 table: [n_layers * vocab * D] int8
+  {
+    std::ifstream f(int8_path, std::ios::binary | std::ios::ate);
+    size_t expected = (size_t)n_layers * vocab * D;
+    size_t fsize = f.tellg();
+    if (fsize != expected) {
+      std::cerr << "  INT8 cp_embed size mismatch: " << fsize << " vs " << expected << std::endl;
+      return;
+    }
+    f.seekg(0);
+    cp_embed_int8_table_.resize(expected);
+    f.read(reinterpret_cast<char*>(cp_embed_int8_table_.data()), expected);
+  }
+
+  // Load scales: [n_layers * vocab] float32
+  {
+    std::ifstream f(scale_path, std::ios::binary | std::ios::ate);
+    size_t expected = (size_t)n_layers * vocab * sizeof(float);
+    size_t fsize = f.tellg();
+    if (fsize != expected) {
+      std::cerr << "  INT8 cp_embed scales size mismatch: " << fsize << " vs " << expected << std::endl;
+      cp_embed_int8_table_.clear();
+      return;
+    }
+    f.seekg(0);
+    cp_embed_scales_.resize(n_layers * vocab);
+    f.read(reinterpret_cast<char*>(cp_embed_scales_.data()), fsize);
+  }
+
+  cp_embed_use_int8_ = true;
+
+  // Only free FP32 table if cp_kv_ is NOT in use.
+  // cp_kv_->RunFrameAutoregressive takes cp_embed_table_.data() as a CPU pointer;
+  // if cp_kv_ exists, we keep FP32 for its use. INT8 is used for direct lookups only.
+  if (!cp_kv_) {
+    cp_embed_table_.clear();
+    cp_embed_table_.shrink_to_fit();
+  }
+
+  std::cout << "  INT8 cp_embed loaded: " << (n_layers * vocab * D) / (1024*1024)
+            << "MB INT8 + " << (n_layers * vocab * 4) / 1024 << "KB scales"
+            << " (saved ~" << (n_layers * vocab * D * 3) / (1024*1024) << "MB)" << std::endl;
+}
+
+void TTSPipeline::CPEmbedLookupINT8(int layer, int token_id, float* out) const {
+  int D = cfg_.hidden_dim;
+  size_t offset = ((size_t)layer * cp_embed_vocab_ + token_id) * D;
+  size_t scale_idx = (size_t)layer * cp_embed_vocab_ + token_id;
+  float scale = cp_embed_scales_[scale_idx];
+  const int8_t* src = cp_embed_int8_table_.data() + offset;
+  for (int i = 0; i < D; ++i) {
+    out[i] = (float)src[i] * scale;
+  }
 }
 
 void TTSPipeline::LoadCodecEmbedTable(const std::string& sherpa_dir) {
@@ -942,8 +1035,14 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
       for (int j = 0; j < n_groups; ++j) {
         int rc = cp_codes[j];
         frame_codes.push_back(rc);
-        const float* re = CPEmbedLookup(j, rc);
-        VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+        if (cp_embed_use_int8_) {
+          float re_buf[1024];
+          CPEmbedLookupINT8(j, rc, re_buf);
+          VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+        } else {
+          const float* re = CPEmbedLookup(j, rc);
+          VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+        }
       }
     } else {
       cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
@@ -957,8 +1056,14 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
 
         if (cp_->has_embed_table()) {
           cp_->AppendEmbeddingFromTable(j, rc);
-          const float* re = CPEmbedLookup(j, rc);
-          VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+          if (cp_embed_use_int8_) {
+            float re_buf[1024];
+            CPEmbedLookupINT8(j, rc, re_buf);
+            VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+          } else {
+            const float* re = CPEmbedLookup(j, rc);
+            VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+          }
         } else {
           auto re = ort_->CPEmbed(rc, j);
           cp_->AppendEmbedding(re.data());
