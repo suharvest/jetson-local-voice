@@ -459,11 +459,11 @@ async def _asr_stream_backend(
                 })
                 break
 
-            # Buffer audio
+            # Buffer audio (run in thread to avoid blocking event loop)
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            stream.accept_waveform(sample_rate, samples)
+            await asyncio.to_thread(stream.accept_waveform, sample_rate, samples)
 
-            # Check for partial results (V2 feature, no-op by default)
+            # Check for partial results
             partial_text, is_endpoint = stream.get_partial()
             if partial_text:
                 await ws.send_json({
