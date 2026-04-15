@@ -96,6 +96,32 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            py::arg("input_embeds"),
            py::arg("vocab_size") = 151936)
 
+      .def("prefill",
+           [](TRTTalkerEngine& self, py::array_t<float> input_embeds) -> py::dict {
+             auto buf = input_embeds.request();
+             // Expect shape [1, S, D] or [S, D] — flatten to get seq_len
+             int total = (int)buf.size;
+             int hidden_dim = 1024;  // Qwen3-ASR hidden dim
+             int seq_len = total / hidden_dim;
+
+             self.Reset();
+             auto result = self.Prefill(static_cast<const float*>(buf.ptr), seq_len);
+
+             // Return logits as numpy array [1, S, vocab_size]
+             int vocab_size = (int)result.logits.size() / seq_len;
+             auto logits = py::array_t<float>({1, seq_len, vocab_size});
+             std::memcpy(logits.mutable_data(), result.logits.data(),
+                         result.logits.size() * sizeof(float));
+
+             py::dict d;
+             d["logits"] = logits;
+             d["seq_len"] = result.seq_len;
+             return d;
+           },
+           py::arg("input_embeds"),
+           "Run TRT prefill on full input sequence. KV cache stored on GPU.\n"
+           "After this, call decode_step() for autoregressive generation.")
+
       .def("reset", &TRTTalkerEngine::Reset);
 
 
