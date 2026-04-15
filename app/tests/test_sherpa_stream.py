@@ -7,15 +7,15 @@ import pytest
 from backends.sherpa_asr import SherpaASRStream
 
 
-def _make_svc(feed_returns=None):
-    """Build a mock svc with sensible defaults."""
-    svc = MagicMock()
-    svc.create_stream.return_value = MagicMock(name="stream")
-    if feed_returns is not None:
-        svc.feed_and_decode.side_effect = feed_returns
-    else:
-        svc.feed_and_decode.return_value = ("", False)
-    return svc
+def _make_recognizer(text="", is_endpoint=False):
+    """Build a mock sherpa_onnx OnlineRecognizer with sensible defaults."""
+    recognizer = MagicMock()
+    recognizer.create_stream.return_value = MagicMock(name="stream")
+    recognizer.is_ready.return_value = False  # decode loop won't run
+    recognizer.get_result.return_value = text
+    recognizer.is_endpoint.return_value = is_endpoint
+    recognizer.decode_stream.return_value = None
+    return recognizer
 
 
 def _dummy_samples(n=160):
@@ -27,10 +27,9 @@ def _dummy_samples(n=160):
 # ---------------------------------------------------------------------------
 
 def test_partial_text_returned():
-    svc = _make_svc()
-    svc.feed_and_decode.return_value = ("hello world", False)
+    recognizer = _make_recognizer(text="hello world", is_endpoint=False)
 
-    stream = SherpaASRStream(svc)
+    stream = SherpaASRStream(recognizer)
     stream.accept_waveform(16000, _dummy_samples())
 
     text, is_endpoint = stream.get_partial()
@@ -43,17 +42,16 @@ def test_partial_text_returned():
 # ---------------------------------------------------------------------------
 
 def test_endpoint_detected_and_stream_reset():
-    svc = _make_svc()
-    svc.feed_and_decode.return_value = ("done", True)
+    recognizer = _make_recognizer(text="done", is_endpoint=True)
 
-    stream = SherpaASRStream(svc)
+    stream = SherpaASRStream(recognizer)
     # create_stream called once during __init__
-    assert svc.create_stream.call_count == 1
+    assert recognizer.create_stream.call_count == 1
 
     stream.accept_waveform(16000, _dummy_samples())
 
     # should have been called a second time to reset the stream
-    assert svc.create_stream.call_count == 2
+    assert recognizer.create_stream.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +59,9 @@ def test_endpoint_detected_and_stream_reset():
 # ---------------------------------------------------------------------------
 
 def test_endpoint_clears_on_next_get_partial():
-    svc = _make_svc()
-    svc.feed_and_decode.return_value = ("sentence", True)
+    recognizer = _make_recognizer(text="sentence", is_endpoint=True)
 
-    stream = SherpaASRStream(svc)
+    stream = SherpaASRStream(recognizer)
     stream.accept_waveform(16000, _dummy_samples())
 
     # First read — should report endpoint and clear it
@@ -79,19 +76,19 @@ def test_endpoint_clears_on_next_get_partial():
 
 
 # ---------------------------------------------------------------------------
-# 4. finalize delegates to svc.finalize with the current stream object
+# 4. finalize uses the current inner stream object
 # ---------------------------------------------------------------------------
 
 def test_finalize_delegates():
-    svc = _make_svc()
+    recognizer = _make_recognizer(text="final text", is_endpoint=False)
     inner_stream = MagicMock(name="inner_stream")
-    svc.create_stream.return_value = inner_stream
-    svc.finalize.return_value = "final text"
+    recognizer.create_stream.return_value = inner_stream
 
-    stream = SherpaASRStream(svc)
+    stream = SherpaASRStream(recognizer)
     result = stream.finalize()
 
-    svc.finalize.assert_called_once_with(inner_stream)
+    # input_finished must be called on the inner stream
+    inner_stream.input_finished.assert_called_once()
     assert result == "final text"
 
 
@@ -100,9 +97,9 @@ def test_finalize_delegates():
 # ---------------------------------------------------------------------------
 
 def test_no_text_before_any_waveform():
-    svc = _make_svc()
+    recognizer = _make_recognizer()
 
-    stream = SherpaASRStream(svc)
+    stream = SherpaASRStream(recognizer)
     text, is_endpoint = stream.get_partial()
 
     assert text == ""
