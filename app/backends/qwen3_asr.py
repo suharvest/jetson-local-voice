@@ -476,7 +476,8 @@ class Qwen3ASRBackend(ASRBackend):
                 self._decoder = qwen3_speech_engine.TRTDecoder(
                     engine_path, 28, 1024, 8, 128, 151936, 500)
                 self._trt_max_seq = 500
-                logger.info("TRT decoder loaded: %s", engine_path)
+                self._decoder.enable_cuda_graph(True)
+                logger.info("TRT decoder loaded (CUDA Graph enabled): %s", engine_path)
             except Exception as e:
                 logger.warning("TRT decoder %s failed: %s", engine_path, e)
 

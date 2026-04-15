@@ -122,7 +122,13 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            "Run TRT prefill on full input sequence. KV cache stored on GPU.\n"
            "After this, call decode_step() for autoregressive generation.")
 
-      .def("reset", &TRTTalkerEngine::Reset);
+      .def("reset", &TRTTalkerEngine::Reset)
+
+      .def("enable_cuda_graph", &TRTTalkerEngine::EnableCudaGraph,
+           py::arg("enable") = true,
+           "Enable CUDA Graph capture for decode steps. After warmup (2 steps),\n"
+           "subsequent decode_step() calls use graph replay instead of kernel launch.")
+      .def_property_readonly("cuda_graph_captured", &TRTTalkerEngine::cuda_graph_captured);
 
 
   py::class_<SynthResult>(m, "SynthResult")
