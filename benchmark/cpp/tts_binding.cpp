@@ -270,6 +270,98 @@ PYBIND11_MODULE(qwen3_tts_engine, m) {
            py::arg("first_chunk_frames") = 10,
            py::arg("chunk_frames") = 25,
            py::arg("max_frames") = 200,
+           py::arg("seed") = 0)
+
+      .def("synthesize_streaming_clone_callback",
+           [](TTSPipeline& self, const std::string& text,
+              const std::string& lang,
+              const std::vector<int64_t>& token_ids,
+              py::bytes speaker_emb_bytes,
+              py::object callback,
+              int first_chunk_frames, int chunk_frames,
+              int max_frames, int seed) {
+             std::string emb_str = speaker_emb_bytes;
+             std::vector<float> spk(emb_str.size() / sizeof(float));
+             std::memcpy(spk.data(), emb_str.data(), emb_str.size());
+
+             StreamConfig config;
+             config.first_chunk_frames = first_chunk_frames;
+             config.chunk_frames = chunk_frames;
+             config.max_frames = max_frames;
+             config.seed = seed;
+
+             py::gil_scoped_release release;
+             self.SynthesizeStreamingWithSpeaker(text, lang, token_ids, spk,
+                 config,
+                 [&callback](const StreamChunk& chunk) {
+                   py::gil_scoped_acquire acquire;
+                   py::dict d;
+                   d["wav_bytes"] = MakeWav(chunk.audio, 24000);
+                   d["pcm_samples"] = (int)chunk.audio.size();
+                   d["total_frames"] = chunk.total_frames;
+                   d["is_final"] = chunk.is_final;
+                   callback(d);
+                 });
+           },
+           py::arg("text"),
+           py::arg("lang"),
+           py::arg("token_ids"),
+           py::arg("speaker_emb_bytes"),
+           py::arg("callback"),
+           py::arg("first_chunk_frames") = 10,
+           py::arg("chunk_frames") = 25,
+           py::arg("max_frames") = 200,
+           py::arg("seed") = 0)
+
+      .def("synthesize_streaming_clone",
+           [](TTSPipeline& self, const std::string& text,
+              const std::string& lang,
+              const std::vector<int64_t>& token_ids,
+              py::bytes speaker_emb_bytes,
+              int first_chunk_frames, int chunk_frames,
+              int max_frames, int seed) -> py::list {
+             std::string emb_str = speaker_emb_bytes;
+             std::vector<float> spk(emb_str.size() / sizeof(float));
+             std::memcpy(spk.data(), emb_str.data(), emb_str.size());
+
+             StreamConfig config;
+             config.first_chunk_frames = first_chunk_frames;
+             config.chunk_frames = chunk_frames;
+             config.max_frames = max_frames;
+             config.seed = seed;
+
+             py::list chunks;
+
+             {
+               py::gil_scoped_release release;
+
+               std::vector<StreamChunk> collected;
+               self.SynthesizeStreamingWithSpeaker(text, lang, token_ids, spk,
+                   config,
+                   [&collected](const StreamChunk& chunk) {
+                     collected.push_back(chunk);
+                   });
+
+               py::gil_scoped_acquire acquire;
+               for (auto& c : collected) {
+                 py::dict d;
+                 d["wav_bytes"] = MakeWav(c.audio, 24000);
+                 d["pcm_samples"] = (int)c.audio.size();
+                 d["total_frames"] = c.total_frames;
+                 d["is_final"] = c.is_final;
+                 chunks.append(d);
+               }
+             }
+
+             return chunks;
+           },
+           py::arg("text") = "",
+           py::arg("lang") = "english",
+           py::arg("token_ids") = std::vector<int64_t>{},
+           py::arg("speaker_emb_bytes") = py::bytes(""),
+           py::arg("first_chunk_frames") = 10,
+           py::arg("chunk_frames") = 25,
+           py::arg("max_frames") = 200,
            py::arg("seed") = 0);
 
   // ── ASR Pipeline (encoder + prefill + TRT decode, all in C++) ──
