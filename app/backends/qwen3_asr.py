@@ -176,34 +176,73 @@ class Qwen3StreamingASRStream(ASRStream):
     def _decode_window(self, all_embd: np.ndarray, max_tokens: int = STREAMING_MAX_TOKENS) -> str | None:
         """Prefill + decode on concatenated window embeddings.
 
+        Uses unified decoder (decoder_step.onnx with dynamic seq_len) for
+        both prefill and autoregressive steps. Falls back to separate
+        prefill session if available.
+
         Returns decoded text, or None if decoder immediately produced EOS.
         """
         audio_len = all_embd.shape[1]
         lang = self._language if self._language != "auto" else None
         prompt_ids = self._backend._build_prompt(audio_len, lang)
-        input_ids = np.array([prompt_ids], dtype=np.int64)
         seq_len = len(prompt_ids)
         audio_offset = prompt_ids.index(AUDIO_PAD)
 
-        # Prefill via ORT
-        prefill_inputs = {
-            "input_ids": input_ids,
+        # Build full input embeddings: text tokens + audio features
+        embed_tokens = self._backend._embed_tokens
+        input_embeds = np.zeros((1, seq_len, 1024), dtype=np.float32)
+        for i, tid in enumerate(prompt_ids):
+            input_embeds[0, i] = embed_tokens[tid]
+        # Inject audio embeddings at AUDIO_PAD positions
+        audio_end = min(audio_offset + audio_len, seq_len)
+        input_embeds[0, audio_offset:audio_end] = all_embd[0, :audio_end - audio_offset]
+
+        # Choose decoder: prefer dedicated prefill, fall back to unified decoder_ort
+        decoder_sess = self._backend._prefill or self._backend._decoder_ort
+        if decoder_sess is None:
+            logger.warning("No decoder session available for streaming")
+            return None
+
+        # Prefill: feed full sequence with empty KV cache
+        n_layers = 28
+        H, dh = 8, 128
+        prefill_in = {
+            "input_embeds": input_embeds,
             "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
-            "audio_features": all_embd,
-            "audio_offset": np.array([audio_offset], dtype=np.int64),
         }
-        valid_names = [i.name for i in self._backend._prefill.get_inputs()]
-        valid = {n: v for n, v in prefill_inputs.items() if n in valid_names}
-        outputs = self._backend._prefill.run(None, valid)
+        # Add empty KV cache for unified decoder
+        valid_names = [i.name for i in decoder_sess.get_inputs()]
+        for layer in range(n_layers):
+            for kv_type in ("past_key_", "past_value_"):
+                name = f"{kv_type}{layer}"
+                if name in valid_names:
+                    prefill_in[name] = np.zeros((1, H, 0, dh), dtype=np.float32)
+
+        # Handle dedicated prefill session (takes input_ids + audio_features)
+        if self._backend._prefill and decoder_sess is self._backend._prefill:
+            prefill_in = {
+                "input_ids": np.array([prompt_ids], dtype=np.int64),
+                "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
+                "audio_features": all_embd,
+                "audio_offset": np.array([audio_offset], dtype=np.int64),
+            }
+
+        valid = {n: v for n, v in prefill_in.items() if n in valid_names}
+        outputs = decoder_sess.run(None, valid)
         out_map = dict(zip(
-            [o.name for o in self._backend._prefill.get_outputs()], outputs
+            [o.name for o in decoder_sess.get_outputs()], outputs
         ))
 
         logits = out_map.get("logits")
-        kv = {k.replace("present_", "past_"): v for k, v in out_map.items()
-              if k.startswith("past_") or k.startswith("present_")}
+        kv = {}
+        for k, v in out_map.items():
+            # Normalize key names: present_key_0 → past_key_0
+            if k.startswith("present_"):
+                kv[k.replace("present_", "past_")] = v
+            elif k.startswith("past_"):
+                kv[k] = v
 
-        # Seed TRT KV cache
+        # Seed TRT KV cache if available
         use_trt = (self._backend._decoder is not None
                    and seq_len <= getattr(self._backend, '_trt_max_seq', 500))
         if use_trt:
@@ -212,7 +251,8 @@ class Qwen3StreamingASRStream(ASRStream):
                 kv[k] = np.ascontiguousarray(kv[k].astype(np.float32))
             self._backend._decoder.seed_kv(kv, seq_len)
 
-        # Decode loop
+        # Decode loop (use same session for step decode)
+        step_sess = self._backend._decoder_ort or decoder_sess
         output_ids = []
         for step in range(max_tokens):
             next_token = int(np.argmax(logits[0, -1, :]))
@@ -220,25 +260,26 @@ class Qwen3StreamingASRStream(ASRStream):
                 break
             output_ids.append(next_token)
 
-            embeds = self._backend._embed_tokens[next_token][np.newaxis, np.newaxis, :]
+            embeds = embed_tokens[next_token][np.newaxis, np.newaxis, :]
             cur_pos = seq_len + step
 
             if use_trt:
                 logits = self._backend._decoder.decode_step(embeds, 151936)
-            elif self._backend._decoder_ort:
+            else:
                 step_in = {"input_embeds": embeds,
                            "position_ids": np.array([[cur_pos]], dtype=np.int64)}
                 step_in.update(kv)
-                step_out = self._backend._decoder_ort.run(None, step_in)
+                step_out = step_sess.run(None, step_in)
                 step_map = dict(zip(
-                    [o.name for o in self._backend._decoder_ort.get_outputs()],
-                    step_out,
+                    [o.name for o in step_sess.get_outputs()], step_out
                 ))
                 logits = step_map.get("logits")
-                kv = {k.replace("present_", "past_").replace("new_", ""): v
-                      for k, v in step_map.items() if "logits" not in k}
-            else:
-                break
+                kv = {}
+                for k, v in step_map.items():
+                    if k.startswith("present_"):
+                        kv[k.replace("present_", "past_")] = v
+                    elif k.startswith("past_"):
+                        kv[k] = v
 
         if not output_ids:
             return None
@@ -460,11 +501,13 @@ class Qwen3ASRBackend(ASRBackend):
         """
         if not self._ready:
             raise RuntimeError("Qwen3-ASR backend not ready")
-        # Real streaming requires: encoder + prefill + decoder (Python ORT path)
+        # Real streaming requires: encoder + decoder + embed_tokens (Python ORT path)
+        # Unified decoder (decoder_step.onnx) handles both prefill and step.
         has_encoder = self._encoder is not None
-        has_decoder = (self._decoder is not None or self._decoder_ort is not None)
-        has_prefill = self._prefill is not None
-        if has_encoder and has_prefill and has_decoder:
+        has_decoder = (self._decoder is not None or self._decoder_ort is not None
+                       or self._prefill is not None)
+        has_embeds = self._embed_tokens is not None
+        if has_encoder and has_decoder and has_embeds:
             logger.info("Creating real streaming ASR session (sliding window)")
             return Qwen3StreamingASRStream(self, language=language)
         # Fallback: accumulate-then-transcribe
