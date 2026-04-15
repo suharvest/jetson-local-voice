@@ -182,34 +182,62 @@ class Qwen3TRTBackend(TTSBackend):
         return wav_bytes, meta
 
     def generate_streaming(self, text: str, **kwargs):
-        """Yield PCM int16 chunks via chunked vocoder streaming.
+        """Yield PCM int16 chunks via C++ callback-based streaming.
 
-        First chunk uses fewer frames (10) for low TTFA (~800ms),
-        subsequent chunks use 25 frames (~2s audio each).
+        The C++ engine calls our callback per chunk during generation,
+        and we yield each chunk as it arrives via a thread-safe queue.
+
+        Args:
+            text: Text to synthesize
+            language: Language code (auto-detected if not specified)
+            speaker_embedding: Optional speaker embedding bytes for voice cloning
+            first_chunk_frames: Frames in first chunk (default 10)
+            chunk_frames: Frames in subsequent chunks (default 25)
+            max_frames: Maximum total frames (default 200)
         """
+        import queue as queue_mod
 
         language = kwargs.get("language") or _detect_language(text)
+        speaker_embedding = kwargs.get("speaker_embedding")
         first_chunk_frames = kwargs.get("first_chunk_frames", 10)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)
 
         token_ids = self._tokenize(text)
 
-        chunks = self._engine.synthesize_streaming(
-            text=text,
-            lang=language,
-            token_ids=token_ids,
-            first_chunk_frames=first_chunk_frames,
-            chunk_frames=chunk_frames,
-            max_frames=max_frames,
-        )
+        chunk_queue: queue_mod.Queue = queue_mod.Queue()
 
-        for chunk in chunks:
-            # Convert WAV bytes to raw PCM int16 (strip 44-byte WAV header)
-            wav_bytes = chunk["wav_bytes"]
+        def _on_chunk(chunk_dict):
+            """Called from C++ thread per audio chunk."""
+            wav_bytes = chunk_dict["wav_bytes"]
             if len(wav_bytes) > 44:
-                pcm_data = wav_bytes[44:]  # WAV header is 44 bytes
-                yield pcm_data
+                chunk_queue.put(wav_bytes[44:])  # Strip WAV header -> raw PCM
+
+        if speaker_embedding:
+            self._engine.synthesize_streaming_clone_callback(
+                text=text,
+                lang=language,
+                token_ids=token_ids,
+                speaker_emb_bytes=speaker_embedding,
+                callback=_on_chunk,
+                first_chunk_frames=first_chunk_frames,
+                chunk_frames=chunk_frames,
+                max_frames=max_frames,
+            )
+        else:
+            self._engine.synthesize_streaming_callback(
+                text=text,
+                lang=language,
+                token_ids=token_ids,
+                callback=_on_chunk,
+                first_chunk_frames=first_chunk_frames,
+                chunk_frames=chunk_frames,
+                max_frames=max_frames,
+            )
+
+        # Drain the queue (all chunks were pushed synchronously by C++)
+        while not chunk_queue.empty():
+            yield chunk_queue.get_nowait()
 
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
         """Extract speaker embedding using Python mel computation + ORT."""

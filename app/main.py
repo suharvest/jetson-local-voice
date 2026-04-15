@@ -33,6 +33,14 @@ class CloneRequest(BaseModel):
     language: str | None = None
 
 
+class CloneStreamRequest(BaseModel):
+    text: str
+    speaker_embedding_b64: str  # base64-encoded speaker embedding
+    language: str | None = None
+    first_chunk_frames: int | None = None
+    chunk_frames: int | None = None
+
+
 _asr_backend = None
 
 def _get_asr_backend():
@@ -42,22 +50,31 @@ def _get_asr_backend():
 async def startup():
     global _asr_backend
 
+    # Log language mode configuration
+    language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
+    logger.info("=" * 60)
+    logger.info("LANGUAGE_MODE: %s", language_mode)
+    if language_mode == "multilanguage":
+        logger.info("  → Using Qwen3 TTS + ASR (52 languages, voice cloning)")
+    else:
+        logger.info("  → Using Sherpa TTS + ASR (zh/en mode)")
+    logger.info("=" * 60)
+
     import model_downloader
-    mode = os.environ.get("LANGUAGE_MODE", "zh_en")
     model_dir = os.environ.get("MODEL_DIR", "/opt/models")
-    model_downloader.ensure_models(mode, model_dir)
+    model_downloader.ensure_models(language_mode, model_dir)
 
     # ASR backend (load before TTS to avoid ORT session conflicts)
-    asr_backend_name = os.environ.get("ASR_BACKEND", "sherpa")
+    # Note: create_asr_backend() will auto-select based on LANGUAGE_MODE
     try:
         from asr_backend import create_asr_backend
-        _asr_backend = create_asr_backend(asr_backend_name)
+        _asr_backend = create_asr_backend()  # Let it auto-detect from LANGUAGE_MODE
         logger.info("Pre-loading ASR (%s)...", _asr_backend.name)
         _asr_backend.preload()
         logger.info("ASR backend: %s (capabilities: %s)",
                      _asr_backend.name, [c.value for c in _asr_backend.capabilities])
     except Exception as e:
-        logger.warning("ASR backend '%s' failed: %s. Falling back to sherpa.", asr_backend_name, e)
+        logger.warning("ASR backend failed: %s. Falling back to sherpa.", e)
         try:
             import streaming_asr_service
             streaming_asr_service.preload()
@@ -179,18 +196,27 @@ async def tts_stream(req: TTSRequest):
     async def stream():
         yield struct.pack("<I", sr)
         loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
 
-        def _gen():
-            return list(backend.generate_streaming(
-                req.text,
-                speaker_id=req.sid,
-                speed=req.speed,
-                pitch_shift=req.pitch,
-                language=req.language,
-            ))
+        def _run():
+            try:
+                for chunk in backend.generate_streaming(
+                    req.text,
+                    speaker_id=req.sid,
+                    speed=req.speed,
+                    pitch_shift=req.pitch,
+                    language=req.language,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
 
-        chunks = await loop.run_in_executor(None, _gen)
-        for chunk in chunks:
+        loop.run_in_executor(None, _run)
+
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
             yield chunk
 
     return StreamingResponse(stream(), media_type="application/octet-stream")
@@ -261,6 +287,71 @@ async def tts_extract_embedding(file: UploadFile = File(...)):
     }
 
 
+@app.post("/tts/clone/stream")
+async def tts_clone_stream(req: CloneStreamRequest):
+    """Stream TTS with voice cloning.
+
+    Returns raw PCM: first 4 bytes = sample_rate (uint32 LE), then int16 PCM chunks.
+    Requires voice_clone capability.
+    """
+    import asyncio
+    import struct
+    import base64
+    import tts_service
+    from tts_backend import TTSCapability
+
+    if not tts_service.has_capability(TTSCapability.VOICE_CLONE):
+        return JSONResponse(
+            {"error": "Voice cloning not supported by current backend",
+             "required_capability": "voice_clone",
+             "backend": tts_service.backend_name()},
+            status_code=501,
+        )
+
+    if not tts_service.has_capability(TTSCapability.STREAMING):
+        return JSONResponse(
+            {"error": "Streaming not supported by current backend",
+             "required_capability": "streaming"},
+            status_code=501,
+        )
+
+    try:
+        speaker_embedding = base64.b64decode(req.speaker_embedding_b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64 speaker_embedding_b64"}, status_code=400)
+
+    sr = tts_service.get_sample_rate()
+    backend = tts_service.get_backend()
+
+    async def stream():
+        yield struct.pack("<I", sr)
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        def _run():
+            try:
+                for chunk in backend.generate_streaming(
+                    req.text,
+                    speaker_embedding=speaker_embedding,
+                    language=req.language,
+                    first_chunk_frames=req.first_chunk_frames or 10,
+                    chunk_frames=req.chunk_frames or 25,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        loop.run_in_executor(None, _run)
+
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
+
+    return StreamingResponse(stream(), media_type="application/octet-stream")
+
+
 # ── ASR ──────────────────────────────────────────────────────────
 
 @app.post("/asr")
@@ -327,8 +418,14 @@ async def _asr_stream_backend(
     language: str,
     sample_rate: int,
 ):
-    """Streaming ASR using ASR backend (accumulate-then-transcribe)."""
+    """Streaming ASR using ASR backend (accumulate-then-transcribe).
+
+    Supports a ``reset`` control command: the client may send a JSON text
+    message ``{"command": "reset"}`` at any time.  This discards the
+    current stream and creates a fresh one without closing the WebSocket.
+    """
     import asyncio
+    import json as _json
     import numpy as np
 
     stream = asr_be.create_stream(language=language)
@@ -336,7 +433,30 @@ async def _asr_stream_backend(
 
     try:
         while True:
-            data = await ws.receive_bytes()
+            msg = await ws.receive()
+
+            # ── Text message: control command ──
+            if "text" in msg and msg["text"]:
+                try:
+                    cmd = _json.loads(msg["text"])
+                except (ValueError, TypeError):
+                    continue
+                if cmd.get("command") == "reset":
+                    stream = asr_be.create_stream(language=language)
+                    await ws.send_json({
+                        "text": "",
+                        "is_final": True,
+                        "is_stable": True,
+                        "reset": True,
+                    })
+                    logger.debug("ASR stream reset by client command (backend=%s)", asr_be.name)
+                continue
+
+            # ── Binary message: audio data ──
+            data = msg.get("bytes", b"")
+            if data is None:
+                # WebSocket disconnect frame — no bytes key
+                break
 
             if len(data) == 0:
                 # End of audio -- run full pipeline
@@ -377,8 +497,15 @@ async def _asr_stream_sherpa(
     language: str,
     sample_rate: int,
 ):
-    """Streaming ASR using sherpa-onnx OnlineRecognizer (original path)."""
+    """Streaming ASR using sherpa-onnx OnlineRecognizer (original path).
+
+    Supports a ``reset`` control command: the client may send a JSON text
+    message ``{"command": "reset"}`` at any time.  This discards the
+    current stream and creates a fresh one *without* closing the WebSocket,
+    avoiding the 100-500 ms reconnection cost on barge-in.
+    """
     import asyncio
+    import json as _json
     import numpy as np
 
     try:
@@ -393,7 +520,32 @@ async def _asr_stream_sherpa(
 
     try:
         while True:
-            data = await ws.receive_bytes()
+            msg = await ws.receive()
+
+            # ── Text message: control command ──
+            if "text" in msg and msg["text"]:
+                try:
+                    cmd = _json.loads(msg["text"])
+                except (ValueError, TypeError):
+                    continue
+                if cmd.get("command") == "reset":
+                    # Discard current stream, start fresh
+                    stream = streaming_asr_service.create_stream()
+                    prev_text = ""
+                    await ws.send_json({
+                        "text": "",
+                        "is_final": True,
+                        "is_stable": True,
+                        "reset": True,
+                    })
+                    logger.debug("ASR stream reset by client command")
+                continue
+
+            # ── Binary message: audio data ──
+            data = msg.get("bytes", b"")
+            if data is None:
+                # WebSocket disconnect frame — no bytes key
+                break
 
             if len(data) == 0:
                 final_text = await asyncio.to_thread(
