@@ -102,7 +102,7 @@ endif()
 
 if(pybind11_FOUND)
     message(STATUS "pybind11 found — building Python module")
-    pybind11_add_module(qwen3_tts_engine
+    pybind11_add_module(qwen3_speech_engine
         tts_binding.cpp
         tts_trt_engine.cpp
         tts_ort_models.cpp
@@ -110,7 +110,7 @@ if(pybind11_FOUND)
         asr_pipeline.cpp
         cp_sample_kernel.cu
     )
-    target_link_libraries(qwen3_tts_engine PRIVATE
+    target_link_libraries(qwen3_speech_engine PRIVATE
         ${TRT_LIB}
         ${ORT_LIB}
         ${CUDA_RUNTIME_LIB}

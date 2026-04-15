@@ -46,7 +46,7 @@ class Qwen3TRTBackend(TTSBackend):
     """Qwen3-TTS via C++ TRT native inference (pybind11 module, models resident)."""
 
     def __init__(self):
-        self._engine = None  # qwen3_tts_engine.Pipeline
+        self._engine = None  # qwen3_speech_engine.Pipeline
         self._tokenizer = None
         self._ready = False
 
@@ -87,8 +87,8 @@ class Qwen3TRTBackend(TTSBackend):
         logger.info("Loading Qwen3 TRT engine (this takes ~25s)...")
         t0 = time.time()
 
-        import qwen3_tts_engine
-        self._engine = qwen3_tts_engine.Pipeline(
+        import qwen3_speech_engine
+        self._engine = qwen3_speech_engine.Pipeline(
             QWEN3_MODEL_DIR, QWEN3_SHERPA_DIR,
             QWEN3_TALKER_ENGINE, QWEN3_CP_ENGINE,
         )

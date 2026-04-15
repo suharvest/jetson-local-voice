@@ -49,11 +49,11 @@ static py::bytes MakeWav(const std::vector<float>& audio, int sample_rate) {
   return py::bytes(buf.data(), buf.size());
 }
 
-PYBIND11_MODULE(qwen3_tts_engine, m) {
+PYBIND11_MODULE(qwen3_speech_engine, m) {
   m.doc() = "Qwen3-TTS/ASR C++ TRT native inference engine";
 
-  // ── ASR Decoder (reuses TRTTalkerEngine with different vocab_size) ──
-  py::class_<TRTTalkerEngine>(m, "ASRDecoder")
+  // ── TRT Decoder (reuses TRTTalkerEngine with different vocab_size) ──
+  py::class_<TRTTalkerEngine>(m, "TRTDecoder")
       .def(py::init<const std::string&, int, int, int, int, int, int>(),
            py::arg("engine_path"),
            py::arg("n_layers") = 28,
