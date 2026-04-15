@@ -108,6 +108,9 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
   // Try to load cp_embed table on GPU for fast lookup
   LoadCPEmbedTable(sherpa_dir);
 
+  // Pre-compute codec_embed table for O(1) lookup in decode loop
+  LoadCodecEmbedTable(sherpa_dir);
+
   std::cout << "Pipeline ready." << std::endl;
 }
 
@@ -509,10 +512,10 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
     // Code predictor: 15 residual codes (GPU-resident context)
     auto t_cp = Clock::now();
-    auto primary_e = ort_->CodecEmbed({(int64_t)primary_code});
+    const float* primary_e_ptr = CodecEmbedLookup(primary_code);
 
     std::vector<float> codec_sum(D);
-    VecCopy(codec_sum.data(), primary_e.data(), D);
+    VecCopy(codec_sum.data(), primary_e_ptr, D);
 
     std::vector<int> frame_codes = {primary_code};
 
@@ -524,7 +527,7 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       int n_groups = cfg_.num_code_groups - 1;
       std::vector<int> cp_codes(n_groups);
       cp_kv_->RunFrameAutoregressive(
-          last_hidden.data(), primary_e.data(), cp_codes.data(),
+          last_hidden.data(), primary_e_ptr, cp_codes.data(),
           cp_embed_table_.data(), cp_embed_vocab_);
 
       for (int j = 0; j < n_groups; ++j) {
@@ -535,7 +538,7 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       }
     } else {
       // --- Old context-copy CP engine path ---
-      cp_->BeginFrame(last_hidden.data(), primary_e.data());
+      cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
 
       for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
         std::vector<float> cp_logits(cfg_.cp_vocab);
@@ -681,6 +684,30 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
 const float* TTSPipeline::CPEmbedLookup(int layer, int token_id) const {
   size_t offset = ((size_t)layer * cp_embed_vocab_ + token_id) * cfg_.hidden_dim;
   return cp_embed_table_.data() + offset;
+}
+
+void TTSPipeline::LoadCodecEmbedTable(const std::string& sherpa_dir) {
+  int vocab = cfg_.vocab_size;  // 3072
+  int D = cfg_.hidden_dim;      // 1024
+
+  std::cout << "Pre-computing codec_embed table (" << vocab << "x" << D
+            << ")..." << std::endl;
+
+  auto t0 = std::chrono::high_resolution_clock::now();
+  // Batch: embed all tokens at once -> [1, vocab, D]
+  std::vector<int64_t> all_ids(vocab);
+  std::iota(all_ids.begin(), all_ids.end(), 0);
+  codec_embed_table_ = ort_->CodecEmbed(all_ids);
+  codec_embed_vocab_ = vocab;
+
+  auto dt = std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - t0).count();
+  std::cout << "  codec_embed table computed in " << dt << "s ("
+            << vocab * D * 4 / (1024 * 1024) << " MB)" << std::endl;
+}
+
+const float* TTSPipeline::CodecEmbedLookup(int token_id) const {
+  return codec_embed_table_.data() + (size_t)token_id * cfg_.hidden_dim;
 }
 
 SynthResult TTSPipeline::Synthesize(const std::string& text,
@@ -897,10 +924,10 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     }
 
     // Code predictor: 15 residual codes
-    auto primary_e = ort_->CodecEmbed({(int64_t)primary_code});
+    const float* primary_e_ptr = CodecEmbedLookup(primary_code);
 
     std::vector<float> codec_sum(D);
-    VecCopy(codec_sum.data(), primary_e.data(), D);
+    VecCopy(codec_sum.data(), primary_e_ptr, D);
 
     std::vector<int> frame_codes = {primary_code};
 
@@ -909,7 +936,7 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
       int n_groups = cfg_.num_code_groups - 1;
       std::vector<int> cp_codes(n_groups);
       cp_kv_->RunFrameAutoregressive(
-          last_hidden.data(), primary_e.data(), cp_codes.data(),
+          last_hidden.data(), primary_e_ptr, cp_codes.data(),
           cp_embed_table_.data(), cp_embed_vocab_);
 
       for (int j = 0; j < n_groups; ++j) {
@@ -919,7 +946,7 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
         VecAdd(codec_sum.data(), codec_sum.data(), re, D);
       }
     } else {
-      cp_->BeginFrame(last_hidden.data(), primary_e.data());
+      cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
 
       for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
         std::vector<float> cp_logits(cfg_.cp_vocab);

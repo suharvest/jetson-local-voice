@@ -183,6 +183,12 @@ class TTSPipeline {
   int cp_embed_vocab_ = 0;
   const float* CPEmbedLookup(int layer, int token_id) const;
 
+  // CPU copy of codec_embed table: [vocab_size][D]
+  std::vector<float> codec_embed_table_;
+  int codec_embed_vocab_ = 0;
+  void LoadCodecEmbedTable(const std::string& sherpa_dir);
+  const float* CodecEmbedLookup(int token_id) const;
+
   // RNG for sampling — seeded per request for reproducibility
   std::mt19937 rng_{42};
 };
