@@ -94,13 +94,11 @@ class Qwen3TRTBackend(TTSBackend):
         )
         logger.info("Qwen3 TRT engine loaded in %.1fs", time.time() - t0)
 
-        # Enable CUDA Graph for talker decode: per-step re-capture eliminates
-        # 100+ kernel launch overhead (~26ms → ~12ms per decode step)
-        try:
-            self._engine.enable_cuda_graph(True)
-            logger.info("CUDA Graph enabled for talker decode")
-        except Exception as e:
-            logger.warning("CUDA Graph enable failed (non-fatal): %s", e)
+        # CUDA Graph for talker decode: disabled.
+        # Per-step re-capture on Jetson Orin NX costs ~10ms (capture+instantiate),
+        # exceeding the ~5ms saved from eliminating kernel launches.
+        # Net effect: 26ms → 35-37ms (worse). Keep normal enqueueV3 path.
+        # TODO: revisit with graph caching or when TRT supports graph update.
 
         self._ready = True
 
