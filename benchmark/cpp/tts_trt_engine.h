@@ -411,14 +411,8 @@ class TRTCPKVEngine {
   std::vector<std::string> cp_kv_names_;     // "past_key_0", "past_value_0", ...
   std::vector<std::string> cp_new_kv_names_; // "new_past_key_0", ...
 
-  // Decode context pre-bound flag: when true, non-changing tensor addresses
-  // (inputs_embeds, cache_position, logits, gen_step) are already bound on
-  // ctx_decode_ and don't need re-binding between RunFrame calls.
-  bool decode_ctx_bound_ = false;
-
-  // Lightweight event for inter-step sync (GPU sampling path).
-  // Inserted after each sample kernel so TRT enqueueV3 sees a finalized
-  // stream state, avoiding its internal shape-change penalty.
+  // Lightweight event (kept for potential future use; currently unused
+  // with fixed-shape decode that eliminates inter-step sync).
   cudaEvent_t ev_step_sync_ = nullptr;
 
   // Profiling
