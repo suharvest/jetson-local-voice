@@ -13,6 +13,8 @@ struct ORTSkipFlags {
   bool skip_talker_prefill = false;    // TRT prefill loaded; skip talker_prefill ORT
   bool lazy_speaker_encoder = false;   // load speaker_encoder on first use
   bool lazy_tokenizer_encode = false;  // load tokenizer12hz_encode on first use
+  bool skip_cp_embed = false;    // pre-extracted cp_embed_fp32.bin available
+  bool skip_codec_embed = false; // pre-extracted codec_embed_fp32.bin available
 };
 
 // All cold-path models loaded once, run via ORT CUDA EP

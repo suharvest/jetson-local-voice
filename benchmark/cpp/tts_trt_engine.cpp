@@ -1491,7 +1491,11 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
   // Use GPU sampling when embed table is loaded on GPU
-  bool use_gpu_sample = (d_embed_table_ != nullptr);
+  // GPU sampling disabled — cudaEventSynchronize per step is too expensive on
+  // Jetson Orin NX (~12ms × 15 = 180ms overhead). CPU sampling with stream sync
+  // is faster (~53ms total) because the sync cost is amortized by CPU work.
+  // TODO: re-enable when CUDA graph capture eliminates per-step sync.
+  bool use_gpu_sample = false;
 
   // RNG seed for GPU sampling
   unsigned long long rng_seed = std::chrono::high_resolution_clock::now()

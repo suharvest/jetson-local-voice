@@ -77,8 +77,17 @@ ORTModels::ORTModels(const std::string& model_dir,
       text_project_ = load(sherpa_dir + "/text_project.onnx");
     }
   }
-  codec_embed_ = load(sherpa_dir + "/codec_embed.onnx");
-  cp_embed_ = load(sherpa_dir + "/code_predictor_embed.onnx");
+  if (flags.skip_codec_embed) {
+    std::cout << "  Skipped codec_embed ORT (pre-extracted binary available)" << std::endl;
+  } else {
+    codec_embed_ = load(sherpa_dir + "/codec_embed.onnx");
+  }
+
+  if (flags.skip_cp_embed) {
+    std::cout << "  Skipped cp_embed ORT (pre-extracted binary available)" << std::endl;
+  } else {
+    cp_embed_ = load(sherpa_dir + "/code_predictor_embed.onnx");
+  }
 
   // talker_prefill: skip if TRT prefill engine is active
   if (flags.skip_talker_prefill) {

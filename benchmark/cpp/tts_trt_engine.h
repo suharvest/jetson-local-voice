@@ -100,6 +100,11 @@ class TRTTalkerEngine {
   bool cuda_graph_enabled() const { return use_cuda_graph_; }
   bool cuda_graph_captured() const { return graph_captured_[0] && graph_captured_[1]; }
 
+  // Returns true when the engine has dual optimization profiles (Profile 0 =
+  // batch prefill, Profile 1 = autoregressive decode). When true, a separate
+  // prefill engine is unnecessary and can be skipped to save ~861 MB of VRAM.
+  bool has_dual_profiles() const { return has_dual_profiles_; }
+
  private:
   void AllocateBuffers();
   void FreeBuffers();

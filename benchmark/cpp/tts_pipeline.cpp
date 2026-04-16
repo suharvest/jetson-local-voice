@@ -39,11 +39,7 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
       talker_engine_path, cfg_.num_hidden_layers, cfg_.hidden_dim, cfg_.n_heads,
       cfg_.head_dim, cfg_.vocab_size);
 
-  cp_ = std::make_unique<TRTCPEngine>(cp_engine_path, cfg_.hidden_dim,
-                                      cfg_.cp_vocab);
-
-  // Auto-detect prefill engine: look for talker_prefill_fp16.engine in the
-  // same directory as the decode engine. Load it if found.
+  // Auto-detect engines: look in the same directory as the decode engine.
   bool trt_prefill_loaded = false;
   {
     std::string engine_dir = talker_engine_path;
@@ -53,26 +49,8 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     } else {
       engine_dir = ".";
     }
-    // Prefer BF16 (no SIGSEGV), fall back to FP16, then iterative
-    std::vector<std::string> prefill_candidates = {
-        engine_dir + "/talker_prefill_bf16.engine",
-        engine_dir + "/talker_prefill_fp16.engine",
-    };
-    for (const auto& prefill_path : prefill_candidates) {
-      std::ifstream test(prefill_path);
-      if (test.good()) {
-        test.close();
-        std::cout << "  Found prefill engine: " << prefill_path << std::endl;
-        talker_->LoadPrefillEngine(prefill_path);
-        trt_prefill_loaded = true;
-        break;
-      }
-    }
-    if (!trt_prefill_loaded) {
-      std::cout << "  No prefill engine found â using iterative prefill fallback" << std::endl;
-    }
-
-    // Try to load CP KV cache engine (cp_unified_bf16.engine)
+    // Try to load CP KV cache engine FIRST (cp_unified_bf16.engine).
+    // Must be detected before deciding whether to load the old CP engine.
     std::string cp_kv_path = engine_dir + "/cp_unified_bf16.engine";
     std::ifstream cp_kv_test(cp_kv_path);
     if (cp_kv_test.good()) {
@@ -87,8 +65,41 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
           cfg_.cp_vocab,          // 2048
           cfg_.num_code_groups - 1  // 15 output groups
       );
+    }
+
+    // Load old CP engine only when no CP KV engine is available.
+    if (!cp_kv_) {
+      cp_ = std::make_unique<TRTCPEngine>(cp_engine_path, cfg_.hidden_dim,
+                                          cfg_.cp_vocab);
+      std::cout << "  No CP KV engine — loaded old context-copy CP" << std::endl;
     } else {
-      std::cout << "  No CP KV engine â using old context-copy CP" << std::endl;
+      std::cout << "  CP KV engine active — skipped old CP engine (saves ~332MB)" << std::endl;
+    }
+
+    // Load separate prefill engine only when the decode engine lacks dual profiles.
+    // Dual-profile engines handle batch prefill via Profile 0 internally.
+    if (!talker_->has_dual_profiles()) {
+      // Prefer BF16 (no SIGSEGV), fall back to FP16, then iterative
+      std::vector<std::string> prefill_candidates = {
+          engine_dir + "/talker_prefill_bf16.engine",
+          engine_dir + "/talker_prefill_fp16.engine",
+      };
+      for (const auto& prefill_path : prefill_candidates) {
+        std::ifstream test(prefill_path);
+        if (test.good()) {
+          test.close();
+          std::cout << "  Found prefill engine: " << prefill_path << std::endl;
+          talker_->LoadPrefillEngine(prefill_path);
+          trt_prefill_loaded = true;
+          break;
+        }
+      }
+      if (!trt_prefill_loaded) {
+        std::cout << "  No prefill engine found — using iterative prefill fallback" << std::endl;
+      }
+    } else {
+      trt_prefill_loaded = true;  // dual-profile handles prefill via Profile 0
+      std::cout << "  Dual-profile decode engine — skipped separate prefill (saves ~861MB)" << std::endl;
     }
 
     // Try to load vocoder TRT engine
@@ -103,14 +114,17 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     }
   }
 
-  // Build ORT skip flags based on which TRT engines were loaded, then
-  // create ORTModels. This avoids loading sessions that are covered by TRT.
+  // Build ORT skip flags based on which TRT engines were loaded and whether
+  // pre-extracted binary tables are available. Create ORTModels afterwards.
   {
     ORTSkipFlags skip;
     skip.skip_vocoder = (trt_vocoder_ != nullptr);
     skip.skip_talker_prefill = trt_prefill_loaded;
     skip.lazy_speaker_encoder = true;   // load on first voice-clone use
     skip.lazy_tokenizer_encode = true;  // load on first voice-clone use
+    // Skip ORT sessions when pre-extracted binary files are present
+    skip.skip_cp_embed = std::ifstream(sherpa_dir + "/cp_embed_fp32.bin").good();
+    skip.skip_codec_embed = std::ifstream(sherpa_dir + "/codec_embed_fp32.bin").good();
     ort_ = std::make_unique<ORTModels>(model_dir, sherpa_dir, skip, device_id);
   }
 
@@ -327,12 +341,16 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
                  cfg_.codec_think_eos_id,
                  cfg_.codec_pad_id, cfg_.codec_bos_id};
   }
-  auto codec_prefix = ort_->CodecEmbed(codec_ids);
+  // Look up codec prefix embeddings from pre-loaded table (no ORT needed)
   int n_codec = (int)codec_ids.size();  // 6 (with lang) or 5 (without)
+  std::vector<float> codec_prefix(n_codec * D);
+  for (int i = 0; i < n_codec; ++i) {
+    const float* e = CodecEmbedLookup((int)codec_ids[i]);
+    VecCopy(codec_prefix.data() + i * D, e, D);
+  }
 
   // codec_pad for decode loop
-  auto codec_pad_v = ort_->CodecEmbed({cfg_.codec_pad_id});
-  const float* codec_pad_e = codec_pad_v.data();
+  const float* codec_pad_e = CodecEmbedLookup(cfg_.codec_pad_id);
 
   pf.tts_pad_e.assign(tts_pad_e, tts_pad_e + D);
   pf.codec_pad_e.assign(codec_pad_e, codec_pad_e + D);
@@ -667,12 +685,45 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
   int n_layers = cfg_.num_code_groups - 1;  // 15
   int vocab = cfg_.cp_vocab;                // 2048
   int D = cfg_.hidden_dim;                  // 1024
+  size_t table_size = (size_t)n_layers * vocab * D;
 
+  // --- Fast path: load pre-extracted binary (< 0.1s) ---
+  std::string bin_path = sherpa_dir + "/cp_embed_fp32.bin";
+  {
+    std::ifstream f(bin_path, std::ios::binary | std::ios::ate);
+    if (f.good()) {
+      size_t fsize = f.tellg();
+      size_t expected = table_size * sizeof(float);
+      if (fsize == expected) {
+        f.seekg(0);
+        cp_embed_table_.resize(table_size);
+        f.read(reinterpret_cast<char*>(cp_embed_table_.data()), expected);
+        cp_embed_n_layers_ = n_layers;
+        cp_embed_vocab_ = vocab;
+        std::cout << "  cp_embed loaded from binary: " << bin_path
+                  << " (" << expected / (1024*1024) << " MB)" << std::endl;
+        // Upload to GPU — only for the active CP engine
+        if (cp_kv_) {
+          cp_kv_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+        } else if (cp_) {
+          cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+        }
+        // Try INT8 quantized version (replaces FP32 CPU copy if available)
+        LoadCPEmbedTableINT8(sherpa_dir);
+        return;
+      } else {
+        std::cerr << "  cp_embed binary size mismatch: " << fsize
+                  << " vs expected " << expected << ", falling back to ORT" << std::endl;
+      }
+    }
+  }
+
+  // --- Slow path: compute via ORT (~15s) ---
   std::cout << "Pre-computing cp_embed table (" << n_layers << "×" << vocab
             << "×" << D << ")..." << std::endl;
 
   // Allocate flat table: [n_layers][vocab][D]
-  std::vector<float> table(n_layers * vocab * D);
+  std::vector<float> table(table_size);
 
   auto t0 = std::chrono::high_resolution_clock::now();
   for (int layer = 0; layer < n_layers; ++layer) {
@@ -693,12 +744,11 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
   cp_embed_n_layers_ = n_layers;
   cp_embed_vocab_ = vocab;
 
-  // Upload to GPU for fast context append (old CP engine)
-  cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
-
-  // Also upload to new KV CP engine if available
+  // Upload to GPU — only for the active CP engine
   if (cp_kv_) {
     cp_kv_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+  } else if (cp_) {
+    cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
   }
 
   // Try INT8 quantized version (replaces FP32 CPU copy if available)
@@ -782,7 +832,31 @@ void TTSPipeline::CPEmbedLookupINT8(int layer, int token_id, float* out) const {
 void TTSPipeline::LoadCodecEmbedTable(const std::string& sherpa_dir) {
   int vocab = cfg_.vocab_size;  // 3072
   int D = cfg_.hidden_dim;      // 1024
+  size_t table_size = (size_t)vocab * D;
 
+  // --- Fast path: load pre-extracted binary ---
+  std::string bin_path = sherpa_dir + "/codec_embed_fp32.bin";
+  {
+    std::ifstream f(bin_path, std::ios::binary | std::ios::ate);
+    if (f.good()) {
+      size_t fsize = f.tellg();
+      size_t expected = table_size * sizeof(float);
+      if (fsize == expected) {
+        f.seekg(0);
+        codec_embed_table_.resize(table_size);
+        f.read(reinterpret_cast<char*>(codec_embed_table_.data()), expected);
+        codec_embed_vocab_ = vocab;
+        std::cout << "  codec_embed loaded from binary: " << bin_path
+                  << " (" << expected / (1024*1024) << " MB)" << std::endl;
+        return;
+      } else {
+        std::cerr << "  codec_embed binary size mismatch: " << fsize
+                  << " vs expected " << expected << ", falling back to ORT" << std::endl;
+      }
+    }
+  }
+
+  // --- Slow path: single batch ORT call (fast enough, ~0.016s) ---
   std::cout << "Pre-computing codec_embed table (" << vocab << "x" << D
             << ")..." << std::endl;
 
