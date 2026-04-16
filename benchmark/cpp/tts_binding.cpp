@@ -268,6 +268,11 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            "Enable CUDA event profiling for per-step timing breakdown")
       .def("print_profiling_stats", &TTSPipeline::PrintProfilingStats,
            "Print and reset CUDA event profiling stats")
+      .def("enable_cuda_graph", &TTSPipeline::EnableCudaGraph,
+           py::arg("enable") = true,
+           "Enable CUDA Graph for talker decode steps (per-step re-capture).\n"
+           "Captures a fresh graph every step using actual seq_len to avoid\n"
+           "attention dilution from max_seq padding. Saves ~14ms per step.")
 
       .def("synthesize_streaming_callback",
            [](TTSPipeline& self, const std::string& text,

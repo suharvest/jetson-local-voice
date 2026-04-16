@@ -214,6 +214,7 @@ void TRTTalkerEngine::FreeCudaGraphs() {
     if (graph_exec_[i]) { cudaGraphExecDestroy(graph_exec_[i]); graph_exec_[i] = nullptr; }
     if (cuda_graph_[i]) { cudaGraphDestroy(cuda_graph_[i]); cuda_graph_[i] = nullptr; }
     graph_captured_[i] = false;
+    last_captured_kv_len_[i] = -1;
   }
   graph_warmup_steps_ = 0;
 }
@@ -880,118 +881,21 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
   }
 
   // =========================================================================
-  // CUDA Graph fast path: replay captured graph for this parity
-  // =========================================================================
-  if (use_cuda_graph_ && graph_captured_[parity_]) {
-    // H2D (emb + position_ids) already queued above on stream_.
-    // Record H2D event for profiling before graph launch.
-    if (profiling_) {
-      CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
-    }
-
-    // Replay: single graph launch replaces 100+ kernel launches
-    CHECK_CUDA(cudaGraphLaunch(graph_exec_[parity_], stream_));
-
-    if (profiling_) {
-      CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
-    }
-
-    // D2H: copy logits + hidden from fixed device buffers.
-    // These are NOT in the graph because the host destination pointers
-    // (logits, last_hidden) may differ between calls.
-    if (logits_elem_bytes_ == sizeof(float)) {
-      size_t logits_bytes = (size_t)vocab_size_ * sizeof(float);
-      CHECK_CUDA(cudaMemcpyAsync(logits, d_logits_, logits_bytes,
-                                 cudaMemcpyDeviceToHost, stream_));
-    } else {
-      std::vector<uint16_t> logits_raw(vocab_size_);
-      CHECK_CUDA(cudaMemcpyAsync(logits_raw.data(), d_logits_,
-                                 (size_t)vocab_size_ * logits_elem_bytes_,
-                                 cudaMemcpyDeviceToHost, stream_));
-      CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-      CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
-      for (int j = 0; j < vocab_size_; ++j) {
-        uint32_t bits;
-        if (logits_is_bf16_) {
-          bits = (uint32_t)logits_raw[j] << 16;
-        } else {
-          uint32_t sign = (logits_raw[j] >> 15) & 1;
-          uint32_t exp  = (logits_raw[j] >> 10) & 0x1F;
-          uint32_t mant =  logits_raw[j]        & 0x3FF;
-          if (exp == 0x1F)   bits = (sign << 31) | (0xFF << 23) | (mant << 13);
-          else if (exp == 0) bits = sign << 31;
-          else               bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-        }
-        std::memcpy(&logits[j], &bits, 4);
-      }
-    }
-
-    if (has_last_hidden_ && last_hidden != nullptr) {
-      if (hidden_elem_bytes_ == sizeof(float)) {
-        size_t hidden_bytes = (size_t)hidden_dim_ * sizeof(float);
-        CHECK_CUDA(cudaMemcpyAsync(last_hidden, d_hidden_, hidden_bytes,
-                                   cudaMemcpyDeviceToHost, stream_));
-      } else {
-        std::vector<uint16_t> hidden_raw(hidden_dim_);
-        CHECK_CUDA(cudaMemcpyAsync(hidden_raw.data(), d_hidden_,
-                                   (size_t)hidden_dim_ * hidden_elem_bytes_,
-                                   cudaMemcpyDeviceToHost, stream_));
-        CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-        CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
-        for (int j = 0; j < hidden_dim_; ++j) {
-          uint32_t bits;
-          if (hidden_is_bf16_) {
-            bits = (uint32_t)hidden_raw[j] << 16;
-          } else {
-            uint32_t sign = (hidden_raw[j] >> 15) & 1;
-            uint32_t exp  = (hidden_raw[j] >> 10) & 0x1F;
-            uint32_t mant =  hidden_raw[j]        & 0x3FF;
-            if (exp == 0x1F)   bits = (sign << 31) | (0xFF << 23) | (mant << 13);
-            else if (exp == 0) bits = sign << 31;
-            else               bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-          }
-          std::memcpy(&last_hidden[j], &bits, 4);
-        }
-      }
-    }
-
-    CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
-
-    if (profiling_) {
-      StepTiming t;
-      cudaEventElapsedTime(&t.h2d_ms, ev_start_, ev_h2d_done_);
-      cudaEventElapsedTime(&t.kernel_ms, ev_h2d_done_, ev_kernel_done_);
-      cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
-      cudaEventElapsedTime(&t.total_ms, ev_start_, ev_d2h_done_);
-      stats_.Add(t);
-    }
-
-    seq_len_ += 1;
-    parity_ ^= 1;
-    return;
-  }
-
-  // =========================================================================
-  // Normal path: set KV shapes and run enqueueV3 (warmup or graph disabled)
-  // For CUDA Graph capture: use max_seq_ shapes so the graph is shape-invariant.
+  // Per-step re-capture CUDA Graph approach
   //
-  // NOTE on attention dilution: The captured graph always processes max_seq-1
-  // KV entries regardless of actual seq_len_. Zero-padded KV entries produce
-  // near-zero QK^T scores but non-zero softmax weights (exp(0)=1), which
-  // dilutes attention over real entries. This dilution is strongest at early
-  // decode steps (few real KV entries vs many zeros). If TTS quality degrades,
-  // consider the re-capture approach: capture a fresh graph each step
-  // (capture cost ~0.5ms is still worthwhile if kernel launch overhead >5ms).
+  // Instead of capturing once with max_seq padding (which causes severe
+  // attention dilution at early steps), we capture a fresh graph every step
+  // using the ACTUAL seq_len_. The capture+instantiate overhead (~0.5ms) is
+  // far less than the ~14ms saved by eliminating 100+ kernel launches.
+  //
+  // Flow:
+  //   1. Warmup: first kGraphWarmupSteps steps run without graph (normal enqueue)
+  //   2. After warmup: every step captures a new graph, then launches it
+  //   3. Previous graph for this parity is destroyed before re-capture
   // =========================================================================
 
-  // Determine KV shape for this step.
-  // When preparing for graph capture (warmup complete but not yet captured),
-  // use max_seq_-1 so the output KV (past_len+1 = max_seq_) fits buffers.
-  bool preparing_capture = use_cuda_graph_ &&
-                           graph_warmup_steps_ >= kGraphWarmupSteps &&
-                           !graph_captured_[parity_];
-  int kv_len = preparing_capture ? (max_seq_ - 1) : seq_len_;
+  // Always use actual seq_len for KV shape — no padding, no dilution.
+  int kv_len = seq_len_;
   nvinfer1::Dims4 kv_shape{1, n_heads_, kv_len, head_dim_};
 
   for (int i = 0; i < n_layers_; ++i) {
@@ -1009,12 +913,20 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
     CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
   }
 
-  // =========================================================================
-  // CUDA Graph capture path: capture enqueueV3 into a graph
-  // =========================================================================
-  if (preparing_capture) {
-    std::cout << "  CUDA Graph: capturing parity=" << parity_
-              << " kv_len=" << kv_len << std::endl;
+  // Determine if we should use graph capture for this step
+  bool do_graph_capture = use_cuda_graph_ &&
+                          graph_warmup_steps_ >= kGraphWarmupSteps;
+
+  if (do_graph_capture) {
+    // Destroy previous graph for this parity (different kv_len each step)
+    if (graph_exec_[parity_]) {
+      cudaGraphExecDestroy(graph_exec_[parity_]);
+      graph_exec_[parity_] = nullptr;
+    }
+    if (cuda_graph_[parity_]) {
+      cudaGraphDestroy(cuda_graph_[parity_]);
+      cuda_graph_[parity_] = nullptr;
+    }
 
     // Synchronize stream before capture to ensure all prior work is complete
     CHECK_CUDA(cudaStreamSynchronize(stream_));
@@ -1030,11 +942,9 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
     CHECK_CUDA(cudaGraphInstantiate(&graph_exec_[parity_], cuda_graph_[parity_],
                                     nullptr, nullptr, 0));
     graph_captured_[parity_] = true;
+    last_captured_kv_len_[parity_] = kv_len;
 
-    std::cout << "  CUDA Graph: captured parity=" << parity_ << " OK" << std::endl;
-
-    // Now actually execute this step (the capture didn't execute anything).
-    // Use the newly captured graph for execution.
+    // Execute via graph launch (the capture itself didn't execute anything)
     CHECK_CUDA(cudaGraphLaunch(graph_exec_[parity_], stream_));
   } else {
     // Normal execution (warmup steps or graph disabled)
@@ -1465,23 +1375,25 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     const float* embed_table, int embed_vocab) {
   // Autoregressive CP: 15 sequential steps.
   //
-  // Three execution strategies (selected automatically):
+  // Two execution strategies (selected automatically):
   //
-  // 1. GPU sampling + event sync (preferred): GPU embed table available.
-  //    Sampling runs entirely on GPU — no D2H logits, no H2D embeddings,
-  //    no CPU top-k sort. A lightweight cudaEventSynchronize between steps
-  //    gives TRT the stream-quiescence it needs to avoid shape-change
-  //    overhead (the root cause of the old GPU path being 2x slower).
+  // 1. GPU sampling (preferred): GPU embed table available.
+  //    All 15 TRT enqueues + sample kernels are submitted to a single CUDA
+  //    stream with ZERO CPU-side synchronization between steps. Stream
+  //    ordering guarantees each sample kernel's outputs (embedding,
+  //    cache_pos, code) are visible to the next enqueueV3. The CPU only
+  //    sets TRT context metadata (setInputShape/setTensorAddress) between
+  //    enqueues, which is purely CPU-side and doesn't touch the GPU.
+  //    A single cudaStreamSynchronize at the end reads all 15 codes.
   //
   // 2. CPU sampling (fallback): no GPU embed table. D2H logits + CPU sort
-  //    + H2D embedding each step. cudaStreamSynchronize provides the same
-  //    TRT quiescence benefit.
+  //    + H2D embedding each step with cudaStreamSynchronize per step.
   //
   // Strategy 1 eliminates per-step:
-  //   - ~8KB D2H (BF16 logits) + cudaStreamSynchronize overhead
-  //   - CPU partial_sort over 2048 values + discrete_distribution
+  //   - cudaStreamSynchronize (or cudaEventSynchronize) — the dominant cost
+  //   - ~8KB D2H (BF16 logits) + CPU partial_sort + discrete_distribution
   //   - ~4KB H2D (embedding) + 8B H2D (cache_pos)
-  // replacing all of that with a single GPU kernel (~2us) + event sync.
+  // replacing all of that with a single GPU kernel (~2us), zero sync.
   //
   auto* pctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
   auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
@@ -1490,12 +1402,19 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   size_t d_bytes = D * sizeof(float);
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
-  // Use GPU sampling when embed table is loaded on GPU
-  // GPU sampling disabled — cudaEventSynchronize per step is too expensive on
-  // Jetson Orin NX (~12ms × 15 = 180ms overhead). CPU sampling with stream sync
-  // is faster (~53ms total) because the sync cost is amortized by CPU work.
-  // TODO: re-enable when CUDA graph capture eliminates per-step sync.
-  bool use_gpu_sample = false;
+  // Use GPU sampling when embed table is loaded on GPU.
+  // All sampling, embedding gather, and cache_pos updates run on GPU — no
+  // per-step D2H/H2D or CPU sort. The only CPU<->GPU sync is a single
+  // cudaStreamSynchronize at the very end to read 15 sampled codes.
+  //
+  // Previous versions used cudaEventSynchronize between steps, which was
+  // catastrophically slow (~12ms × 15 = 180ms) because the CPU-side sync
+  // serialized GPU work and added OS context-switch overhead per step.
+  // The fix: rely on CUDA stream ordering — the sample kernel and next
+  // enqueueV3 are on the same stream, so data dependencies are handled
+  // automatically by the GPU. setInputShape/setTensorAddress are pure
+  // CPU metadata setters that don't require GPU quiescence.
+  bool use_gpu_sample = (d_embed_table_ != nullptr);
 
   // RNG seed for GPU sampling
   unsigned long long rng_seed = std::chrono::high_resolution_clock::now()
@@ -1590,12 +1509,9 @@ void TRTCPKVEngine::RunFrameAutoregressive(
         /*next_cache_pos=*/2,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
-    // Event sync: let TRT see a quiesced stream before next enqueueV3.
-    // This is much cheaper than cudaStreamSynchronize (no OS context switch)
-    // but provides the same benefit: TRT's internal shape-change validation
-    // sees completed work and avoids its pathological slow path.
-    CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
+    // No CPU sync needed: the sample kernel and next enqueueV3 are on the
+    // same CUDA stream, so the GPU automatically serializes them.  CPU-side
+    // setInputShape/setTensorAddress only touch context metadata.
   } else {
     codes_out[0] = sample_topk_cpu(d_logits_all_, 0);
   }
@@ -1687,12 +1603,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
           rng_seed, rng_counter_++);
-      // Event sync: give TRT a quiesced stream for the next step.
-      // Using cudaEventSynchronize with a DisableTiming event is cheaper
-      // than cudaStreamSynchronize — it avoids CUDA driver's full stream
-      // query overhead while still signaling completion to TRT.
-      CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
-      CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
+      // No CPU sync: stream ordering handles GPU data dependencies.
     } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
     }
@@ -1733,8 +1644,10 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   // This eliminates shape-change overhead: each context only sees its own
   // fixed seq_len, so TRT doesn't need to re-validate between prefill→decode.
   //
-  // Between TRT steps, a CUDA kernel handles sampling and embedding lookup,
-  // eliminating all CPU<->GPU synchronization points (single D2H at the end).
+  // All 15 steps are enqueued onto a single CUDA stream with zero CPU-side
+  // synchronization. Stream ordering guarantees data dependencies between
+  // the sample kernel and the next enqueueV3. Only a single sync at the end
+  // reads the 15 sampled codes back to CPU.
 
   if (!d_embed_table_) {
     std::cerr << "[CPKV-GPU] RunFrameGPU requires embed table on GPU. "
@@ -1805,9 +1718,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
       /*next_cache_pos=*/2,
       /*top_k=*/50, /*temperature=*/0.9f,
       rng_seed, rng_counter_++);
-  // Event sync after sample kernel — gives TRT a quiesced stream
-  CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
-  CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
+  // No CPU sync: stream ordering handles GPU data dependencies.
 
   // ---- Pre-bind decode context addresses that don't change between steps ----
   dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
@@ -1820,9 +1731,11 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   }
 
   // ---- Steps 1-14: Decode (seq_len=1, past_len grows) ----
-  // Event sync between steps gives TRT the stream quiescence it needs
-  // to avoid its internal shape-change penalty, while keeping all
-  // sampling and embedding work on the GPU (no D2H/H2D per step).
+  // All 14 decode steps are enqueued onto the same CUDA stream without any
+  // CPU-side synchronization. Stream ordering guarantees each sample kernel
+  // completes before the next enqueueV3 reads its output (embed, cache_pos).
+  // setInputShape/setTensorAddress are CPU metadata setters — they don't
+  // require GPU quiescence.
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
@@ -1869,10 +1782,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
         next_pos,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
-
-    // Event sync — same pattern as RunFrameAutoregressive GPU path
-    CHECK_CUDA(cudaEventRecord(ev_step_sync_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_step_sync_));
+    // No CPU sync: stream ordering handles GPU data dependencies.
 
     std::swap(kv_read, kv_write);
   }

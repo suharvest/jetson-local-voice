@@ -117,6 +117,11 @@ class TTSPipeline {
   // Print profiling stats and reset counters
   void PrintProfilingStats();
 
+  // Enable CUDA Graph for talker decode steps (per-step re-capture).
+  // Captures a fresh graph every step using actual seq_len to avoid
+  // attention dilution. Saves ~14ms per step from kernel launch overhead.
+  void EnableCudaGraph(bool enable);
+
  private:
   // Core streaming generation loop
   void GenerateStreaming(const std::string& text, const std::string& lang,

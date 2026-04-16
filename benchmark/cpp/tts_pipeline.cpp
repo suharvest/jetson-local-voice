@@ -914,6 +914,10 @@ void TTSPipeline::EnableProfiling(bool enable) {
   if (cp_kv_) cp_kv_->EnableProfiling(enable);
 }
 
+void TTSPipeline::EnableCudaGraph(bool enable) {
+  if (talker_) talker_->EnableCudaGraph(enable);
+}
+
 void TTSPipeline::PrintProfilingStats() {
   if (talker_ && talker_->stats().n_samples > 0) {
     auto& s = talker_->stats();

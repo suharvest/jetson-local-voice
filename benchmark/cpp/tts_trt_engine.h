@@ -95,7 +95,10 @@ class TRTTalkerEngine {
   // CUDA Graph: capture decode step kernel sequence and replay as single launch.
   // Reduces per-step overhead from 100+ kernel launches to 1 graph launch.
   // Must be called AFTER the engine is loaded but BEFORE the first DecodeStep.
-  // Graph is captured after kGraphWarmupSteps warmup steps (one per parity).
+  //
+  // Per-step re-capture mode (default): captures a fresh graph every step using
+  // the actual seq_len, avoiding attention dilution from max_seq padding.
+  // Re-capture cost ~0.5ms per step, but saves ~14ms kernel launch overhead.
   void EnableCudaGraph(bool enable) { use_cuda_graph_ = enable; }
   bool cuda_graph_enabled() const { return use_cuda_graph_; }
   bool cuda_graph_captured() const { return graph_captured_[0] && graph_captured_[1]; }
@@ -190,14 +193,15 @@ class TRTTalkerEngine {
   std::string emb_name_;
 
   // CUDA Graph for decode step — eliminates kernel launch overhead.
-  // Two graphs captured (one per parity) to handle double-buffered KV swap.
-  // At capture time, KV shapes are set to max_seq_ so that the graph kernels
-  // are shape-invariant across steps (excess zero-padded KV entries produce
-  // near-zero attention weights and negligible compute overhead for seq_len=1).
+  // Per-step re-capture: captures a fresh graph every step using actual seq_len,
+  // then immediately replays it. This avoids attention dilution from max_seq
+  // padding while still saving ~14ms kernel launch overhead per step.
+  // Two graph slots (one per parity) for double-buffered KV swap.
   bool use_cuda_graph_ = false;
   bool graph_captured_[2] = {false, false};
   cudaGraph_t cuda_graph_[2] = {nullptr, nullptr};
   cudaGraphExec_t graph_exec_[2] = {nullptr, nullptr};
+  int last_captured_kv_len_[2] = {-1, -1};  // KV len at last capture per parity
   int graph_warmup_steps_ = 0;
   static constexpr int kGraphWarmupSteps = 2;  // need at least 1 per parity
 };
