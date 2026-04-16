@@ -1414,7 +1414,9 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   // enqueueV3 are on the same stream, so data dependencies are handled
   // automatically by the GPU. setInputShape/setTensorAddress are pure
   // CPU metadata setters that don't require GPU quiescence.
-  bool use_gpu_sample = (d_embed_table_ != nullptr);
+  // GPU sampling disabled: TRT enqueueV3 needs sync between calls when
+  // past_len shape changes. Zero-sync gives 180ms (vs 69ms CPU path).
+  bool use_gpu_sample = false;
 
   // RNG seed for GPU sampling
   unsigned long long rng_seed = std::chrono::high_resolution_clock::now()

@@ -93,6 +93,15 @@ class Qwen3TRTBackend(TTSBackend):
             QWEN3_TALKER_ENGINE, QWEN3_CP_ENGINE,
         )
         logger.info("Qwen3 TRT engine loaded in %.1fs", time.time() - t0)
+
+        # Enable CUDA Graph for talker decode: per-step re-capture eliminates
+        # 100+ kernel launch overhead (~26ms → ~12ms per decode step)
+        try:
+            self._engine.enable_cuda_graph(True)
+            logger.info("CUDA Graph enabled for talker decode")
+        except Exception as e:
+            logger.warning("CUDA Graph enable failed (non-fatal): %s", e)
+
         self._ready = True
 
     def _load_tokenizer(self):
