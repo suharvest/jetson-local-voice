@@ -210,20 +210,25 @@ void TRTTalkerEngine::FreeBuffers() {
 }
 
 void TRTTalkerEngine::FreeCudaGraphs() {
-  for (int i = 0; i < 2; ++i) {
-    if (graph_exec_[i]) { cudaGraphExecDestroy(graph_exec_[i]); graph_exec_[i] = nullptr; }
-    if (cuda_graph_[i]) { cudaGraphDestroy(cuda_graph_[i]); cuda_graph_[i] = nullptr; }
-    graph_captured_[i] = false;
-    last_captured_kv_len_[i] = -1;
+  for (auto& [key, exec] : graph_cache_) {
+    cudaGraphExecDestroy(exec);
   }
-  graph_warmup_steps_ = 0;
+  graph_cache_.clear();
+  if (capture_graph_) {
+    cudaGraphDestroy(capture_graph_);
+    capture_graph_ = nullptr;
+  }
 }
 
 void TRTTalkerEngine::Reset() {
   seq_len_ = 0;
   parity_ = 0;
-  // Invalidate captured CUDA graphs (shapes/state changed)
-  FreeCudaGraphs();
+  // NOTE: Do NOT clear graph_cache_ here. Cached CUDA graphs remain valid
+  // across requests because all GPU buffer addresses (kv_a_, kv_b_, d_emb_,
+  // d_logits_, d_hidden_) are fixed allocations that don't change. A graph
+  // captured for (kv_len=5, parity=0) in request 1 replays correctly in
+  // request 2 at the same (kv_len, parity).
+  //
   // Clear GPU KV buffers to prevent stale state between requests
   if (!kv_a_.empty()) {
     size_t kv_bytes = (size_t)n_heads_ * max_seq_ * head_dim_ * kv_elem_bytes_;
@@ -881,75 +886,87 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
   }
 
   // =========================================================================
-  // Per-step re-capture CUDA Graph approach
+  // Cached CUDA Graph approach
   //
-  // Instead of capturing once with max_seq padding (which causes severe
-  // attention dilution at early steps), we capture a fresh graph every step
-  // using the ACTUAL seq_len_. The capture+instantiate overhead (~0.5ms) is
-  // far less than the ~14ms saved by eliminating 100+ kernel launches.
+  // Cache graphs indexed by (kv_len, parity). First time a combo is seen:
+  // capture + instantiate + launch (~10ms extra). Same combo seen again
+  // (next TTS request): instant replay (~0.5ms). After one full synthesis
+  // (~200 steps), all subsequent requests hit cached graphs from step 1.
   //
-  // Flow:
-  //   1. Warmup: first kGraphWarmupSteps steps run without graph (normal enqueue)
-  //   2. After warmup: every step captures a new graph, then launches it
-  //   3. Previous graph for this parity is destroyed before re-capture
+  // Cache survives Reset() because GPU buffer addresses are fixed.
   // =========================================================================
 
   // Always use actual seq_len for KV shape — no padding, no dilution.
   int kv_len = seq_len_;
-  nvinfer1::Dims4 kv_shape{1, n_heads_, kv_len, head_dim_};
 
-  for (int i = 0; i < n_layers_; ++i) {
-    ctx->setInputShape(kv_names_[2 * i].c_str(), kv_shape);
-    ctx->setTensorAddress(kv_names_[2 * i].c_str(), read[2 * i]);
-    ctx->setTensorAddress(new_kv_names_[2 * i].c_str(), write[2 * i]);
+  if (use_cuda_graph_) {
+    GraphCacheKey key{kv_len, parity_};
+    auto it = graph_cache_.find(key);
 
-    ctx->setInputShape(kv_names_[2 * i + 1].c_str(), kv_shape);
-    ctx->setTensorAddress(kv_names_[2 * i + 1].c_str(), read[2 * i + 1]);
-    ctx->setTensorAddress(new_kv_names_[2 * i + 1].c_str(), write[2 * i + 1]);
-  }
+    if (it != graph_cache_.end()) {
+      // Cache hit: H2D already done above, just replay the captured kernel
+      // sequence. No need to setInputShape/setTensorAddress — all baked in.
+      if (profiling_) {
+        CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
+      }
+      CHECK_CUDA(cudaGraphLaunch(it->second, stream_));
+    } else {
+      // Cache miss: set shapes and addresses, then capture → instantiate → cache
+      nvinfer1::Dims4 kv_shape{1, n_heads_, kv_len, head_dim_};
+      for (int i = 0; i < n_layers_; ++i) {
+        ctx->setInputShape(kv_names_[2 * i].c_str(), kv_shape);
+        ctx->setTensorAddress(kv_names_[2 * i].c_str(), read[2 * i]);
+        ctx->setTensorAddress(new_kv_names_[2 * i].c_str(), write[2 * i]);
 
-  // Record H2D done event (all input copies queued before kernel)
-  if (profiling_) {
-    CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
-  }
+        ctx->setInputShape(kv_names_[2 * i + 1].c_str(), kv_shape);
+        ctx->setTensorAddress(kv_names_[2 * i + 1].c_str(), read[2 * i + 1]);
+        ctx->setTensorAddress(new_kv_names_[2 * i + 1].c_str(), write[2 * i + 1]);
+      }
 
-  // Determine if we should use graph capture for this step
-  bool do_graph_capture = use_cuda_graph_ &&
-                          graph_warmup_steps_ >= kGraphWarmupSteps;
+      if (profiling_) {
+        CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
+      }
 
-  if (do_graph_capture) {
-    // Destroy previous graph for this parity (different kv_len each step)
-    if (graph_exec_[parity_]) {
-      cudaGraphExecDestroy(graph_exec_[parity_]);
-      graph_exec_[parity_] = nullptr;
+      // Synchronize stream before capture to ensure all prior work is complete
+      CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+      CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+
+      // Captured operations: only the TRT enqueueV3 kernel sequence.
+      // H2D (emb, position_ids) and D2H (logits, hidden) are NOT captured
+      // because host pointers may change between calls.
+      ctx->enqueueV3(stream_);
+
+      CHECK_CUDA(cudaStreamEndCapture(stream_, &capture_graph_));
+
+      cudaGraphExec_t exec;
+      CHECK_CUDA(cudaGraphInstantiate(&exec, capture_graph_, nullptr, nullptr, 0));
+      graph_cache_[key] = exec;
+
+      CHECK_CUDA(cudaGraphDestroy(capture_graph_));
+      capture_graph_ = nullptr;
+
+      // Launch the newly cached graph
+      CHECK_CUDA(cudaGraphLaunch(exec, stream_));
     }
-    if (cuda_graph_[parity_]) {
-      cudaGraphDestroy(cuda_graph_[parity_]);
-      cuda_graph_[parity_] = nullptr;
-    }
-
-    // Synchronize stream before capture to ensure all prior work is complete
-    CHECK_CUDA(cudaStreamSynchronize(stream_));
-
-    CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
-
-    // Captured operations: only the TRT enqueueV3 kernel sequence.
-    // H2D (emb, position_ids) and D2H (logits, hidden) are NOT captured
-    // because host pointers may change between calls.
-    ctx->enqueueV3(stream_);
-
-    CHECK_CUDA(cudaStreamEndCapture(stream_, &cuda_graph_[parity_]));
-    CHECK_CUDA(cudaGraphInstantiate(&graph_exec_[parity_], cuda_graph_[parity_],
-                                    nullptr, nullptr, 0));
-    graph_captured_[parity_] = true;
-    last_captured_kv_len_[parity_] = kv_len;
-
-    // Execute via graph launch (the capture itself didn't execute anything)
-    CHECK_CUDA(cudaGraphLaunch(graph_exec_[parity_], stream_));
   } else {
-    // Normal execution (warmup steps or graph disabled)
+    // Normal path (no CUDA Graph) — set shapes, addresses, enqueue directly
+    nvinfer1::Dims4 kv_shape{1, n_heads_, kv_len, head_dim_};
+    for (int i = 0; i < n_layers_; ++i) {
+      ctx->setInputShape(kv_names_[2 * i].c_str(), kv_shape);
+      ctx->setTensorAddress(kv_names_[2 * i].c_str(), read[2 * i]);
+      ctx->setTensorAddress(new_kv_names_[2 * i].c_str(), write[2 * i]);
+
+      ctx->setInputShape(kv_names_[2 * i + 1].c_str(), kv_shape);
+      ctx->setTensorAddress(kv_names_[2 * i + 1].c_str(), read[2 * i + 1]);
+      ctx->setTensorAddress(new_kv_names_[2 * i + 1].c_str(), write[2 * i + 1]);
+    }
+
+    if (profiling_) {
+      CHECK_CUDA(cudaEventRecord(ev_h2d_done_, stream_));
+    }
+
     ctx->enqueueV3(stream_);
-    graph_warmup_steps_++;
   }
 
   // Record kernel done event
@@ -1378,22 +1395,16 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   // Two execution strategies (selected automatically):
   //
   // 1. GPU sampling (preferred): GPU embed table available.
-  //    All 15 TRT enqueues + sample kernels are submitted to a single CUDA
-  //    stream with ZERO CPU-side synchronization between steps. Stream
-  //    ordering guarantees each sample kernel's outputs (embedding,
-  //    cache_pos, code) are visible to the next enqueueV3. The CPU only
-  //    sets TRT context metadata (setInputShape/setTensorAddress) between
-  //    enqueues, which is purely CPU-side and doesn't touch the GPU.
-  //    A single cudaStreamSynchronize at the end reads all 15 codes.
+  //    Each step: TRT enqueue → GPU sample kernel → cudaStreamSynchronize.
+  //    The per-step stream sync is essential because TRT 10.3's enqueueV3
+  //    does expensive internal reconfiguration (~10ms) when past_len shapes
+  //    change while the stream has pending work. An explicit sync (~0.2ms)
+  //    drains the stream cheaply, letting enqueueV3 do a fast shape
+  //    validation only. This eliminates ~2ms/step of D2H + CPU sort + H2D
+  //    overhead vs the CPU path. Expected total: ~45ms vs 69ms CPU.
   //
   // 2. CPU sampling (fallback): no GPU embed table. D2H logits + CPU sort
   //    + H2D embedding each step with cudaStreamSynchronize per step.
-  //
-  // Strategy 1 eliminates per-step:
-  //   - cudaStreamSynchronize (or cudaEventSynchronize) — the dominant cost
-  //   - ~8KB D2H (BF16 logits) + CPU partial_sort + discrete_distribution
-  //   - ~4KB H2D (embedding) + 8B H2D (cache_pos)
-  // replacing all of that with a single GPU kernel (~2us), zero sync.
   //
   auto* pctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
   auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
@@ -1402,21 +1413,10 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   size_t d_bytes = D * sizeof(float);
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
-  // Use GPU sampling when embed table is loaded on GPU.
-  // All sampling, embedding gather, and cache_pos updates run on GPU — no
-  // per-step D2H/H2D or CPU sort. The only CPU<->GPU sync is a single
-  // cudaStreamSynchronize at the very end to read 15 sampled codes.
-  //
-  // Previous versions used cudaEventSynchronize between steps, which was
-  // catastrophically slow (~12ms × 15 = 180ms) because the CPU-side sync
-  // serialized GPU work and added OS context-switch overhead per step.
-  // The fix: rely on CUDA stream ordering — the sample kernel and next
-  // enqueueV3 are on the same stream, so data dependencies are handled
-  // automatically by the GPU. setInputShape/setTensorAddress are pure
-  // CPU metadata setters that don't require GPU quiescence.
-  // GPU sampling disabled: TRT enqueueV3 needs sync between calls when
-  // past_len shape changes. Zero-sync gives 180ms (vs 69ms CPU path).
-  bool use_gpu_sample = false;
+  // GPU sampling with per-step cudaStreamSynchronize: eliminates D2H/H2D
+  // and CPU sort (~2ms/step) while providing the stream sync TRT needs for
+  // shape changes. Expected ~45ms vs 69ms CPU path.
+  bool use_gpu_sample = has_embed_table();
 
   // RNG seed for GPU sampling
   unsigned long long rng_seed = std::chrono::high_resolution_clock::now()
@@ -1511,9 +1511,8 @@ void TRTCPKVEngine::RunFrameAutoregressive(
         /*next_cache_pos=*/2,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
-    // No CPU sync needed: the sample kernel and next enqueueV3 are on the
-    // same CUDA stream, so the GPU automatically serializes them.  CPU-side
-    // setInputShape/setTensorAddress only touch context metadata.
+    // Sync: TRT enqueueV3 needs a quiescent stream before shape changes.
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
   } else {
     codes_out[0] = sample_topk_cpu(d_logits_all_, 0);
   }
@@ -1605,7 +1604,8 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
           rng_seed, rng_counter_++);
-      // No CPU sync: stream ordering handles GPU data dependencies.
+      // Sync: TRT enqueueV3 needs a quiescent stream before shape changes.
+      CHECK_CUDA(cudaStreamSynchronize(stream_));
     } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
     }
@@ -1643,13 +1643,17 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   // Two separate TRT execution contexts:
   //   ctx_prefill_: always seq_len=2, past_len=0 (step 0)
   //   ctx_decode_:  always seq_len=1, past_len varies 2→16 (steps 1-14)
-  // This eliminates shape-change overhead: each context only sees its own
-  // fixed seq_len, so TRT doesn't need to re-validate between prefill→decode.
   //
-  // All 15 steps are enqueued onto a single CUDA stream with zero CPU-side
-  // synchronization. Stream ordering guarantees data dependencies between
-  // the sample kernel and the next enqueueV3. Only a single sync at the end
-  // reads the 15 sampled codes back to CPU.
+  // Each step: TRT enqueue → GPU sample kernel → cudaStreamSynchronize.
+  // The stream sync between steps is essential: TRT 10.3's enqueueV3 does
+  // expensive internal reconfiguration (~10ms) when it detects pending GPU
+  // work AND a shape change (past_len increment). An explicit sync (~0.2ms)
+  // drains the stream first, so enqueueV3 sees a quiescent stream and only
+  // does a cheap shape validation. This brings total time from 180ms → ~45ms
+  // (vs 69ms for the CPU sampling path that has the same sync implicitly).
+  //
+  // All sampling, embedding gather, and cache_pos updates stay on GPU.
+  // Only a single D2H at the end reads the 15 sampled codes.
 
   if (!d_embed_table_) {
     std::cerr << "[CPKV-GPU] RunFrameGPU requires embed table on GPU. "
@@ -1720,7 +1724,9 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
       /*next_cache_pos=*/2,
       /*top_k=*/50, /*temperature=*/0.9f,
       rng_seed, rng_counter_++);
-  // No CPU sync: stream ordering handles GPU data dependencies.
+  // Sync before decode: TRT enqueueV3 with shape change on a busy stream
+  // triggers expensive internal reconfiguration. Explicit sync is cheap.
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
 
   // ---- Pre-bind decode context addresses that don't change between steps ----
   dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
@@ -1733,11 +1739,10 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   }
 
   // ---- Steps 1-14: Decode (seq_len=1, past_len grows) ----
-  // All 14 decode steps are enqueued onto the same CUDA stream without any
-  // CPU-side synchronization. Stream ordering guarantees each sample kernel
-  // completes before the next enqueueV3 reads its output (embed, cache_pos).
-  // setInputShape/setTensorAddress are CPU metadata setters — they don't
-  // require GPU quiescence.
+  // Each step: setInputShape (past_len changes) → enqueueV3 → GPU sample
+  // kernel → cudaStreamSynchronize. The sync ensures TRT sees an idle stream
+  // for the next step's shape change, avoiding its internal reconfiguration
+  // penalty that makes zero-sync 3x slower.
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
@@ -1784,7 +1789,9 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
         next_pos,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
-    // No CPU sync: stream ordering handles GPU data dependencies.
+    // Sync after sample kernel: ensures TRT's next enqueueV3 sees a
+    // quiescent stream, avoiding its ~10ms shape-change penalty.
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
 
     std::swap(kv_read, kv_write);
   }

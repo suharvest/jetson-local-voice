@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Per-step timing breakdown (CUDA events)
@@ -92,16 +93,17 @@ class TRTTalkerEngine {
   const ProfilingStats& stats() const { return stats_; }
   void ResetStats() { stats_.Reset(); }
 
-  // CUDA Graph: capture decode step kernel sequence and replay as single launch.
-  // Reduces per-step overhead from 100+ kernel launches to 1 graph launch.
-  // Must be called AFTER the engine is loaded but BEFORE the first DecodeStep.
-  //
-  // Per-step re-capture mode (default): captures a fresh graph every step using
-  // the actual seq_len, avoiding attention dilution from max_seq padding.
-  // Re-capture cost ~0.5ms per step, but saves ~14ms kernel launch overhead.
-  void EnableCudaGraph(bool enable) { use_cuda_graph_ = enable; }
+  // CUDA Graph cache: captures decode kernel sequence per (kv_len, parity)
+  // and replays cached graphs on subsequent requests.
+  // First request: ~10ms capture overhead per step (cold).
+  // Subsequent requests: ~0.5ms replay per step (cache hit).
+  // Cache survives Reset() — addresses are fixed GPU allocations.
+  void EnableCudaGraph(bool enable) {
+    if (!enable && use_cuda_graph_) FreeCudaGraphs();
+    use_cuda_graph_ = enable;
+  }
   bool cuda_graph_enabled() const { return use_cuda_graph_; }
-  bool cuda_graph_captured() const { return graph_captured_[0] && graph_captured_[1]; }
+  bool cuda_graph_captured() const { return !graph_cache_.empty(); }
 
   // Returns true when the engine has dual optimization profiles (Profile 0 =
   // batch prefill, Profile 1 = autoregressive decode). When true, a separate
@@ -192,18 +194,27 @@ class TRTTalkerEngine {
   // Cached emb tensor name for binding (avoid re-detection)
   std::string emb_name_;
 
-  // CUDA Graph for decode step — eliminates kernel launch overhead.
-  // Per-step re-capture: captures a fresh graph every step using actual seq_len,
-  // then immediately replays it. This avoids attention dilution from max_seq
-  // padding while still saving ~14ms kernel launch overhead per step.
-  // Two graph slots (one per parity) for double-buffered KV swap.
+  // CUDA Graph cache: maps (kv_len, parity) to captured graph exec.
+  // First time a (kv_len, parity) combo is seen: capture + instantiate (~10ms).
+  // Same combo seen again (next TTS request): instant replay (~0.5ms).
+  // Max ~200 seq_lens x 2 parities = 400 cached graphs.
+  // Cache survives across Reset() calls since GPU buffer addresses are fixed.
   bool use_cuda_graph_ = false;
-  bool graph_captured_[2] = {false, false};
-  cudaGraph_t cuda_graph_[2] = {nullptr, nullptr};
-  cudaGraphExec_t graph_exec_[2] = {nullptr, nullptr};
-  int last_captured_kv_len_[2] = {-1, -1};  // KV len at last capture per parity
-  int graph_warmup_steps_ = 0;
-  static constexpr int kGraphWarmupSteps = 2;  // need at least 1 per parity
+  struct GraphCacheKey {
+    int kv_len;
+    int parity;
+    bool operator==(const GraphCacheKey& o) const {
+      return kv_len == o.kv_len && parity == o.parity;
+    }
+  };
+  struct GraphCacheHash {
+    size_t operator()(const GraphCacheKey& k) const {
+      return std::hash<int>()(k.kv_len * 2 + k.parity);
+    }
+  };
+  std::unordered_map<GraphCacheKey, cudaGraphExec_t, GraphCacheHash> graph_cache_;
+  // Temporary graph handle used during capture (freed after instantiate)
+  cudaGraph_t capture_graph_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
