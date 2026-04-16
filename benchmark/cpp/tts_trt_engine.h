@@ -330,6 +330,19 @@ class TRTCPKVEngine {
   void LoadEmbedTable(const float* table, int n_layers, int vocab, int dim);
   bool has_embed_table() const { return d_embed_table_ != nullptr; }
 
+  // CUDA Graph for CP decode: captures enqueueV3 (TRT kernels) per parity.
+  // Only 2 graphs needed (fixed shapes, fixed KV addresses per parity).
+  // First frame captures (with 2 warmup steps), all subsequent frames replay.
+  // Sample kernel runs outside the graph (per-step params change).
+  void EnableCPCudaGraph(bool enable) {
+    if (!enable && use_cuda_graph_cp_) FreeCPCudaGraphs();
+    use_cuda_graph_cp_ = enable;
+  }
+  bool cp_cuda_graph_enabled() const { return use_cuda_graph_cp_; }
+  bool cp_cuda_graph_captured() const {
+    return cp_graph_captured_[0] && cp_graph_captured_[1];
+  }
+
   // Profiling
   void EnableProfiling(bool enable) { profiling_ = enable; }
   bool profiling() const { return profiling_; }
@@ -414,6 +427,20 @@ class TRTCPKVEngine {
   // Lightweight event (kept for potential future use; currently unused
   // with fixed-shape decode that eliminates inter-step sync).
   cudaEvent_t ev_step_sync_ = nullptr;
+
+  // CUDA Graph for CP decode steps: 2 graphs (one per KV parity).
+  // CP shapes are FIXED (fixed_past = max_past_ - 1 = 19), so we only need
+  // 2 graphs (one per ping-pong parity), captured once and replayed forever.
+  // Each graph captures ONLY enqueueV3 (TRT kernels) for one decode step.
+  // Sample kernel runs outside the graph (per-step parameters change).
+  // H2D copies (gen_step, embed, cache_pos) happen OUTSIDE the graph.
+  // Graph addresses are baked at capture time — this works because each parity
+  // always reads/writes the same KV buffer pair (a_↔b_ or b_↔a_).
+  bool use_cuda_graph_cp_ = false;
+  cudaGraph_t cp_graph_[2] = {nullptr, nullptr};
+  cudaGraphExec_t cp_graph_exec_[2] = {nullptr, nullptr};
+  bool cp_graph_captured_[2] = {false, false};
+  void FreeCPCudaGraphs();
 
   // Profiling
   bool profiling_ = false;

@@ -270,9 +270,10 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            "Print and reset CUDA event profiling stats")
       .def("enable_cuda_graph", &TTSPipeline::EnableCudaGraph,
            py::arg("enable") = true,
-           "Enable CUDA Graph for talker decode steps (per-step re-capture).\n"
-           "Captures a fresh graph every step using actual seq_len to avoid\n"
-           "attention dilution from max_seq padding. Saves ~14ms per step.")
+           "Enable CUDA Graph for talker decode and CP decode steps.\n"
+           "Talker: per-step re-capture using actual seq_len.\n"
+           "CP: 2 persistent graphs (one per KV parity, fixed shapes),\n"
+           "captured on first frame and replayed forever.")
 
       .def("synthesize_streaming_callback",
            [](TTSPipeline& self, const std::string& text,

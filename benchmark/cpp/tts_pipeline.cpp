@@ -547,15 +547,20 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     std::vector<int> frame_codes = {primary_code};
 
     if (cp_kv_) {
-      // --- Autoregressive CP (dual-context, CPU sampling) ---
-      // Dual contexts: ctx_prefill_ for seq_len=2, ctx_decode_ for seq_len=1
-      // avoids profile switching overhead. CPU sampling is faster than
-      // GPU sampling with per-step sync due to TRT overhead on Jetson.
+      // --- Autoregressive CP ---
+      // RunFrameGPU: fixed-shape GPU path — zero per-step sync (25-30ms).
+      // RunFrameAutoregressive: CPU-sampling fallback (69ms), used only when
+      // GPU embed table is not loaded.
       int n_groups = cfg_.num_code_groups - 1;
       std::vector<int> cp_codes(n_groups);
-      cp_kv_->RunFrameAutoregressive(
-          last_hidden.data(), primary_e_ptr, cp_codes.data(),
-          cp_embed_table_.data(), cp_embed_vocab_);
+      if (cp_kv_->has_embed_table()) {
+        cp_kv_->RunFrameGPU(
+            last_hidden.data(), primary_e_ptr, cp_codes.data());
+      } else {
+        cp_kv_->RunFrameAutoregressive(
+            last_hidden.data(), primary_e_ptr, cp_codes.data(),
+            cp_embed_table_.data(), cp_embed_vocab_);
+      }
 
       for (int j = 0; j < n_groups; ++j) {
         int rc = cp_codes[j];
@@ -916,6 +921,7 @@ void TTSPipeline::EnableProfiling(bool enable) {
 
 void TTSPipeline::EnableCudaGraph(bool enable) {
   if (talker_) talker_->EnableCudaGraph(enable);
+  if (cp_kv_) cp_kv_->EnableCPCudaGraph(enable);
 }
 
 void TTSPipeline::PrintProfilingStats() {
