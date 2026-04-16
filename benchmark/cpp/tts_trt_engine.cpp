@@ -1413,9 +1413,12 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   size_t d_bytes = D * sizeof(float);
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
-  // GPU sampling enabled when embed table is loaded on GPU.
-  // Fixed-shape decode eliminates TRT shape-change reconfiguration overhead.
-  bool use_gpu_sample = (d_embed_table_ != nullptr);
+  // GPU sampling disabled: all GPU path attempts give 180ms vs CPU's 69ms.
+  // Root cause is NOT shape-change (fixed-shape still 180ms). Likely TRT
+  // enqueueV3 CPU-side overhead serializing when called rapidly without
+  // natural overlap from CPU work. Needs nsys profiling to confirm.
+  // Keep fixed-shape code (harmless, may help CPU path too).
+  bool use_gpu_sample = false;
 
   // Fixed past_len for decode context: max_past_ - 1 so output (past+1)
   // fits in [1, n_heads, max_past_, head_dim] buffers.
