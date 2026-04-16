@@ -547,20 +547,15 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     std::vector<int> frame_codes = {primary_code};
 
     if (cp_kv_) {
-      // --- Autoregressive CP ---
-      // RunFrameGPU: fixed-shape GPU path — zero per-step sync (25-30ms).
-      // RunFrameAutoregressive: CPU-sampling fallback (69ms), used only when
-      // GPU embed table is not loaded.
+      // --- Autoregressive CP (with optional CUDA Graph) ---
+      // Always use RunFrameAutoregressive: CPU sampling + CUDA Graph for
+      // enqueueV3 eliminates TRT dispatch overhead. RunFrameGPU (GPU sampling)
+      // is 180ms due to TRT dispatch serialization — do not use.
       int n_groups = cfg_.num_code_groups - 1;
       std::vector<int> cp_codes(n_groups);
-      if (cp_kv_->has_embed_table()) {
-        cp_kv_->RunFrameGPU(
-            last_hidden.data(), primary_e_ptr, cp_codes.data());
-      } else {
-        cp_kv_->RunFrameAutoregressive(
-            last_hidden.data(), primary_e_ptr, cp_codes.data(),
-            cp_embed_table_.data(), cp_embed_vocab_);
-      }
+      cp_kv_->RunFrameAutoregressive(
+          last_hidden.data(), primary_e_ptr, cp_codes.data(),
+          cp_embed_table_.data(), cp_embed_vocab_);
 
       for (int j = 0; j < n_groups; ++j) {
         int rc = cp_codes[j];
