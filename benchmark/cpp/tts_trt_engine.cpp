@@ -1366,18 +1366,16 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
 }
 
 void TRTCPKVEngine::FreeCPCudaGraphs() {
-  for (int j = 0; j < kMaxCPSteps; ++j) {
-    for (int p = 0; p < 2; ++p) {
-      if (cp_graph_exec_[j][p]) {
-        cudaGraphExecDestroy(cp_graph_exec_[j][p]);
-        cp_graph_exec_[j][p] = nullptr;
-      }
-      if (cp_graph_[j][p]) {
-        cudaGraphDestroy(cp_graph_[j][p]);
-        cp_graph_[j][p] = nullptr;
-      }
-      cp_graph_captured_[j][p] = false;
+  for (int p = 0; p < 2; ++p) {
+    if (cp_graph_exec_[p]) {
+      cudaGraphExecDestroy(cp_graph_exec_[p]);
+      cp_graph_exec_[p] = nullptr;
     }
+    if (cp_graph_[p]) {
+      cudaGraphDestroy(cp_graph_[p]);
+      cp_graph_[p] = nullptr;
+    }
+    cp_graph_captured_[p] = false;
   }
 }
 
@@ -1430,11 +1428,12 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   size_t d_bytes = D * sizeof(float);
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
-  // GPU sampling: requires embed table loaded on GPU.
-  // With CUDA Graph capturing both enqueueV3 and sample kernel, this eliminates
-  // ALL per-step CPU sync overhead (~21ms savings).
-  // Without GPU embed table, fall back to CPU sampling (D2H logits + CPU sort).
-  bool use_gpu_sample = d_embed_table_ != nullptr;
+  // GPU sampling disabled: all GPU path attempts give 180ms vs CPU's 69ms.
+  // Root cause is NOT shape-change (fixed-shape still 180ms). Likely TRT
+  // enqueueV3 CPU-side overhead serializing when called rapidly without
+  // natural overlap from CPU work. Needs nsys profiling to confirm.
+  // Keep fixed-shape code (harmless, may help CPU path too).
+  bool use_gpu_sample = false;
 
   // Fixed past_len for decode context: max_past_ - 1 so output (past+1)
   // fits in [1, n_heads, max_past_, head_dim] buffers.
@@ -1581,36 +1580,33 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
-  // CUDA Graph for CP decode: captures BOTH enqueueV3 AND sample kernel.
-  // Each graph captures the full pipeline for a specific (step_idx, parity):
-  //   - enqueueV3: TRT inference (KV attention + lm_head)
-  //   - launchCPSampleAndEmbed: GPU sampling + embedding gather
+  // CUDA Graph for CP decode: captures ONLY the enqueueV3 call per parity.
+  // With fixed shapes + fixed KV addresses per parity, we need only 2 graphs
+  // (one per KV ping-pong direction), captured once and replayed forever.
   //
-  // With 14 decode steps × 2 parities = 28 graphs.
-  // First frame: capture all 14 graphs (each step has unique (j, parity) pair)
-  // Subsequent frames: replay cached graphs — zero CPU overhead per step.
-  //
-  // Key insight: the sample kernel parameters (layer_idx=j, code_out offset,
-  // next_cache_pos) are baked into the graph at capture time. Different j
-  // values require different graphs even though parity may be the same.
+  // The sample kernel runs OUTSIDE the graph because its parameters (layer_idx,
+  // output offset, next_cache_pos) change per step. H2D copies (gen_step) also
+  // run outside the graph. Stream ordering ensures correct execution:
+  //   H2D gen_step → graph launch (enqueueV3 kernels) → sample kernel
   //
   // Parity 0: read=b_, write=a_ (odd j: 1, 3, 5, ...)
   // Parity 1: read=a_, write=b_ (even j: 2, 4, 6, ...)
   //
-  // H2D copies (gen_step for single-head engine) happen BEFORE graph launch
-  // since gen_step value changes per step. The graph reads from d_gen_step_
-  // device memory (already updated by H2D).
-  const bool use_cp_graph = use_cuda_graph_cp_ && use_gpu_sample;
+  // Capture schedule (first frame only):
+  //   j=1: normal enqueueV3 (warmup, parity 0)
+  //   j=2: normal enqueueV3 (warmup, parity 1)
+  //   j=3: capture parity 0 graph, then launch it
+  //   j=4: capture parity 1 graph, then launch it
+  //   j=5+: replay cached graphs
+  //
+  // We warmup 2 steps before capturing to ensure TRT's internal state is
+  // settled (first enqueueV3 after shape setup may trigger lazy init).
+  const bool use_cp_graph = use_cuda_graph_cp_;
 
   for (int j = 1; j < n_groups; ++j) {
-    int step_idx = j;  // 0-based decode step index (1-14)
     int actual_past = j + 1;  // for cache_pos and gen_step values
     int parity = (j - 1) % 2;  // 0 for odd j, 1 for even j
 
-    // ---- H2D copies (outside the graph) ----
-    // For GPU sampling: embed and cache_pos are written by previous step's
-    // sample kernel (inside graph), so no H2D needed.
-    // Only gen_step needs H2D since its value changes per step.
     if (!use_gpu_sample) {
       // CPU path: upload embed + cache_pos from host
       const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
@@ -1619,18 +1615,28 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       int64_t pos1 = actual_past;
       CHECK_CUDA(cudaMemcpyAsync(d_cache_pos_, &pos1, sizeof(int64_t),
                                  cudaMemcpyHostToDevice, stream_));
-    }
-    // gen_step H2D: must happen BEFORE graph launch (single-head engine only)
-    if (is_single_head_) {
-      int64_t gs = j;
-      CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
-                                 cudaMemcpyHostToDevice, stream_));
+      if (is_single_head_) {
+        int64_t gs = j;
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
+    } else {
+      // GPU path: embed and cache_pos already written by previous sample kernel.
+      if (is_single_head_) {
+        int64_t gs = j;
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
     }
 
-    // ---- KV buffer address updates ----
-    // Only needed when NOT using graphs, or during first capture.
-    // For captured graphs, addresses are baked in at capture time.
-    if (!(use_cp_graph && cp_graph_captured_[step_idx][parity])) {
+    // Only update ping-pong buffer ADDRESSES (no setInputShape — shapes are fixed).
+    // setTensorAddress is a cheap pointer update that does NOT trigger TRT
+    // reconfiguration, unlike setInputShape.
+    // For CUDA Graph replay, these calls are still needed on the first frame
+    // (before capture). On subsequent frames they're harmless no-ops since
+    // the addresses don't change — but we skip them for captured parities
+    // to save the ~0.1ms CPU cost per step.
+    if (!(use_cp_graph && cp_graph_captured_[parity])) {
       for (int i = 0; i < n_cp_layers_; ++i) {
         dctx->setTensorAddress(cp_kv_names_[2*i].c_str(), (*kv_read)[2*i]);
         dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
@@ -1639,37 +1645,18 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       }
     }
 
-    // ---- GPU execution: graph replay, capture, or normal enqueueV3 ----
-    if (use_cp_graph && cp_graph_captured_[step_idx][parity]) {
-      // Fast path: replay captured graph (enqueueV3 + sample kernel)
-      CHECK_CUDA(cudaGraphLaunch(cp_graph_exec_[step_idx][parity], stream_));
-      // Skip sampling — it's already in the graph
-    } else if (use_cp_graph) {
-      // Capture path: record enqueueV3 + sample kernel into graph
+    if (use_cp_graph && cp_graph_captured_[parity]) {
+      // ---- Fast path: replay captured CUDA Graph (enqueueV3 only) ----
+      CHECK_CUDA(cudaGraphLaunch(cp_graph_exec_[parity], stream_));
+    } else if (use_cp_graph && !cp_graph_captured_[parity] && j >= 3) {
+      // ---- Capture path: j=3 captures parity 0, j=4 captures parity 1 ----
+      // Drain stream before capture to ensure all prior work is complete.
       CHECK_CUDA(cudaStreamSynchronize(stream_));
       CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
 
+      // enqueueV3 inside capture — TRT GPU kernels are recorded into the graph.
+      // The sample kernel is NOT captured (its parameters change per step).
       bool cap_ok = dctx->enqueueV3(stream_);
-
-      // Include sample kernel in the graph
-      const void* logits_ptr;
-      if (is_single_head_) {
-        logits_ptr = d_logits_decode_;
-      } else {
-        logits_ptr = (const char*)d_logits_decode_ +
-                     (size_t)j * cp_vocab_ * logits_elem_bytes_;
-      }
-      int64_t next_pos = actual_past + 1;
-      launchCPSampleAndEmbed(
-          stream_, logits_ptr, logits_is_bf16_,
-          reinterpret_cast<const float*>(d_embed_table_),
-          reinterpret_cast<float*>(d_embeds_),
-          d_codes_out_ + j,
-          d_cache_pos_single_,
-          cp_vocab_, D, /*layer_idx=*/j,
-          next_pos,
-          /*top_k=*/50, /*temperature=*/0.9f,
-          rng_seed, rng_counter_++);
 
       cudaGraph_t graph = nullptr;
       CHECK_CUDA(cudaStreamEndCapture(stream_, &graph));
@@ -1677,35 +1664,27 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       if (!cap_ok || !graph) {
         std::cerr << "[CPKV-AR] CUDA Graph capture FAILED! step=" << j
                   << " parity=" << parity << std::endl;
+        // Fallback: run normal enqueueV3 for this step
         if (graph) cudaGraphDestroy(graph);
+        // Re-run the step without graph (capture consumed the enqueueV3)
         ok = dctx->enqueueV3(stream_);
         if (!ok) {
           std::cerr << "[CPKV-AR] decode enqueueV3 FAILED after graph fallback!"
                     << std::endl;
           std::abort();
         }
-        // Run sample kernel outside graph
-        launchCPSampleAndEmbed(
-            stream_, logits_ptr, logits_is_bf16_,
-            reinterpret_cast<const float*>(d_embed_table_),
-            reinterpret_cast<float*>(d_embeds_),
-            d_codes_out_ + j,
-            d_cache_pos_single_,
-            cp_vocab_, D, /*layer_idx=*/j,
-            next_pos,
-            /*top_k=*/50, /*temperature=*/0.9f,
-            rng_seed, rng_counter_++);
       } else {
-        cp_graph_[step_idx][parity] = graph;
-        CHECK_CUDA(cudaGraphInstantiate(&cp_graph_exec_[step_idx][parity],
-                                        cp_graph_[step_idx][parity], nullptr, nullptr, 0));
-        cp_graph_captured_[step_idx][parity] = true;
-        CHECK_CUDA(cudaGraphLaunch(cp_graph_exec_[step_idx][parity], stream_));
-        std::cout << "[CPKV-AR] Captured CUDA Graph for step " << j
-                  << " parity " << parity << std::endl;
+        cp_graph_[parity] = graph;
+        CHECK_CUDA(cudaGraphInstantiate(&cp_graph_exec_[parity],
+                                        cp_graph_[parity], nullptr, nullptr, 0));
+        cp_graph_captured_[parity] = true;
+        // Launch the just-captured graph to produce this step's results
+        CHECK_CUDA(cudaGraphLaunch(cp_graph_exec_[parity], stream_));
+        std::cout << "[CPKV-AR] Captured CUDA Graph for parity " << parity
+                  << " at step " << j << std::endl;
       }
     } else {
-      // Normal path (no graph or CPU sampling)
+      // ---- Normal path: enqueueV3 (warmup steps j=1,2, or graph disabled) ----
       ok = dctx->enqueueV3(stream_);
       if (!ok) {
         std::cerr << "[CPKV-AR] decode enqueueV3 FAILED! step=" << j
@@ -1715,10 +1694,11 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       }
     }
 
-    // ---- Post-enqueueV3 sampling (only for CPU path or fallback) ----
-    // GPU path with CUDA Graph: sampling already done in the graph
-    // GPU path without CUDA Graph: need to run sample kernel
-    if (use_gpu_sample && !use_cp_graph) {
+    // ---- Post-enqueueV3: sample and prepare next step's input ----
+    // This runs AFTER the graph launch (or normal enqueueV3) on the same stream,
+    // so CUDA ordering guarantees logits are ready.
+    if (use_gpu_sample) {
+      // GPU sample kernel: reads logits, writes embed + code + cache_pos
       const void* logits_ptr;
       if (is_single_head_) {
         logits_ptr = d_logits_decode_;
@@ -1737,7 +1717,11 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
           rng_seed, rng_counter_++);
-    } else if (!use_gpu_sample) {
+      // NO sync between steps: shapes are fixed, so TRT enqueueV3 (or graph
+      // replay) has zero reconfiguration overhead. CUDA stream ordering
+      // guarantees the sample kernel's output (embed, cache_pos) is visible
+      // to the next enqueueV3/graph launch.
+    } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
     }
 

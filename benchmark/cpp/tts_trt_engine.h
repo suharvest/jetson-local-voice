@@ -340,12 +340,7 @@ class TRTCPKVEngine {
   }
   bool cp_cuda_graph_enabled() const { return use_cuda_graph_cp_; }
   bool cp_cuda_graph_captured() const {
-    for (int j = 0; j < kMaxCPSteps; ++j) {
-      for (int p = 0; p < 2; ++p) {
-        if (!cp_graph_captured_[j][p]) return false;
-      }
-    }
-    return true;
+    return cp_graph_captured_[0] && cp_graph_captured_[1];
   }
 
   // Profiling
@@ -433,30 +428,18 @@ class TRTCPKVEngine {
   // with fixed-shape decode that eliminates inter-step sync).
   cudaEvent_t ev_step_sync_ = nullptr;
 
-  // CUDA Graph for CP decode steps: 14 steps × 2 parities = 28 graphs.
-  // Each graph captures enqueueV3 (TRT kernels) + GPU sample kernel for
-  // a specific (step_idx, parity) combination. This eliminates ALL per-step
-  // CPU sync overhead since both TRT execution AND sampling are on GPU.
-  //
-  // The sample kernel parameters (layer_idx, code_out offset, next_cache_pos)
-  // change per step and are baked into the graph at capture time.
-  // With fixed shapes, we need 14 separate graphs (vs 2 in the simpler scheme)
-  // because each step index j has different sample kernel parameters.
-  //
-  // Capture schedule:
-  //   First frame: capture all 14 graphs (j=1..14, each with unique parity)
-  //   Subsequent frames: replay cached graphs
-  //
-  // Note: parity = (j-1) % 2, so j=1,3,5... use parity 0, j=2,4,6... use parity 1.
-  // Within one frame, we see all 14 unique (j, parity) combinations.
-  //
-  // Graph addresses are baked at capture time — KV buffer addresses are fixed
-  // per parity (a_↔b_ or b_↔a_).
+  // CUDA Graph for CP decode steps: 2 graphs (one per KV parity).
+  // CP shapes are FIXED (fixed_past = max_past_ - 1 = 19), so we only need
+  // 2 graphs (one per ping-pong parity), captured once and replayed forever.
+  // Each graph captures ONLY enqueueV3 (TRT kernels) for one decode step.
+  // Sample kernel runs outside the graph (per-step parameters change).
+  // H2D copies (gen_step, embed, cache_pos) happen OUTSIDE the graph.
+  // Graph addresses are baked at capture time — this works because each parity
+  // always reads/writes the same KV buffer pair (a_↔b_ or b_↔a_).
   bool use_cuda_graph_cp_ = false;
-  static constexpr int kMaxCPSteps = 15;  // max decode steps (15 groups - 1 prefill)
-  cudaGraph_t cp_graph_[kMaxCPSteps][2] = {};  // [step_idx][parity]
-  cudaGraphExec_t cp_graph_exec_[kMaxCPSteps][2] = {};
-  bool cp_graph_captured_[kMaxCPSteps][2] = {};
+  cudaGraph_t cp_graph_[2] = {nullptr, nullptr};
+  cudaGraphExec_t cp_graph_exec_[2] = {nullptr, nullptr};
+  bool cp_graph_captured_[2] = {false, false};
   void FreeCPCudaGraphs();
 
   // Profiling
