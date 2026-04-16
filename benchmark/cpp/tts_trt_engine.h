@@ -334,6 +334,7 @@ class TRTCPKVEngine {
   // Only 2 graphs needed (fixed shapes, fixed KV addresses per parity).
   // First frame captures (with 2 warmup steps), all subsequent frames replay.
   // Sample kernel runs outside the graph (per-step params change).
+  // Single-graph mode: captures ALL 14 decode steps as ONE graph.
   void EnableCPCudaGraph(bool enable) {
     if (!enable && use_cuda_graph_cp_) FreeCPCudaGraphs();
     use_cuda_graph_cp_ = enable;
@@ -342,6 +343,7 @@ class TRTCPKVEngine {
   bool cp_cuda_graph_captured() const {
     return cp_graph_captured_[0] && cp_graph_captured_[1];
   }
+  bool cp_single_graph_captured() const { return cp_single_graph_captured_; }
 
   // Profiling
   void EnableProfiling(bool enable) { profiling_ = enable; }
@@ -419,6 +421,18 @@ class TRTCPKVEngine {
   int64_t* d_cache_pos_table_ = nullptr;   // [max_past] int64 pre-filled {0,1,2,...}
   int64_t* d_cache_pos_single_ = nullptr;  // [1] int64 written by kernel
   unsigned long long rng_counter_ = 0;     // monotonic counter for cuRAND sequence
+
+  // Per-step arrays for single-graph capture
+  static constexpr int kMaxCPSteps = 16;   // max decode steps (15 groups - 1 prefill)
+  int64_t* d_gen_steps_ = nullptr;         // [kMaxCPSteps] = {0,1,2,...,15}
+  int64_t* d_cache_positions_ = nullptr;   // [kMaxCPSteps+2] = {0,1,2,...,17}
+
+  // Single-graph capture for entire decode loop
+  // After prefill writes to kv_b_, decode reads kv_b_ first (parity always 0).
+  // cp_graph_single_ captures all 14 decode steps as ONE graph.
+  cudaGraph_t cp_graph_single_ = nullptr;
+  cudaGraphExec_t cp_graph_exec_single_ = nullptr;
+  bool cp_single_graph_captured_ = false;
 
   // Pre-cached tensor names for fast binding
   std::vector<std::string> cp_kv_names_;     // "past_key_0", "past_value_0", ...
