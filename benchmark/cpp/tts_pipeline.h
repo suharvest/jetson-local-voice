@@ -1,11 +1,16 @@
 // tts_pipeline.h — Complete Qwen3-TTS inference pipeline
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "tts_ort_models.h"
@@ -78,6 +83,7 @@ class TTSPipeline {
   TTSPipeline(const std::string& model_dir, const std::string& sherpa_dir,
               const std::string& talker_engine_path,
               const std::string& cp_engine_path, int device_id = 0);
+  ~TTSPipeline();
 
   // Load config.json from sherpa_dir
   void LoadConfig(const std::string& sherpa_dir);
@@ -209,4 +215,29 @@ class TTSPipeline {
 
   // RNG for sampling — seeded per request for reproducibility
   std::mt19937 rng_{42};
+
+  // ---------------------------------------------------------------------------
+  // Async vocoder worker (Scheme A overlap): offload vocoder Run + callback
+  // to a CPU worker thread so the talker+CP main loop is not blocked by the
+  // ~150ms vocoder call.
+  // ---------------------------------------------------------------------------
+  struct VocWork {
+    std::vector<int64_t> codes;  // [window_len * num_code_groups] row-major
+    int window_len = 0;
+    int num_code_groups = 0;
+    size_t skip_samples = 0;
+    int total_frames = 0;
+    bool is_final = false;
+    AudioChunkCallback callback;
+  };
+
+  std::thread vocoder_thread_;
+  std::queue<VocWork> voc_queue_;
+  std::mutex voc_mutex_;
+  std::condition_variable voc_cv_;
+  std::condition_variable voc_empty_cv_;
+  std::atomic<bool> voc_stop_{false};
+  std::atomic<int> voc_inflight_{0};
+
+  void VocoderWorkerLoop();
 };
