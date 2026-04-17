@@ -148,6 +148,13 @@ void TTSPipeline::LoadConfig(const std::string& sherpa_dir) {
   cfg_.n_heads = j.GetInt("num_key_value_heads", 8);  // GQA: KV uses fewer heads
   cfg_.head_dim = j.GetInt("head_dim", 128);
 
+  // Runtime CP codebook-count experiment knob.
+  // Default = num_code_groups - 1 (all 15 residuals = full quality).
+  cfg_.cp_active_groups = j.GetInt("cp_active_groups", cfg_.num_code_groups - 1);
+  if (cfg_.cp_active_groups < 1) cfg_.cp_active_groups = 1;
+  if (cfg_.cp_active_groups > cfg_.num_code_groups - 1)
+    cfg_.cp_active_groups = cfg_.num_code_groups - 1;
+
   cfg_.tts_bos_token_id = j.GetInt("tts_bos_token_id");
   cfg_.tts_eos_token_id = j.GetInt("tts_eos_token_id");
   cfg_.tts_pad_token_id = j.GetInt("tts_pad_token_id");
@@ -167,6 +174,7 @@ void TTSPipeline::LoadConfig(const std::string& sherpa_dir) {
 
   std::cout << "Config: D=" << cfg_.hidden_dim << ", layers=" << cfg_.num_hidden_layers
             << ", vocab=" << cfg_.vocab_size << ", groups=" << cfg_.num_code_groups
+            << ", cp_active_groups=" << cfg_.cp_active_groups
             << std::endl;
 }
 
@@ -551,15 +559,20 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       // Always use RunFrameAutoregressive: CPU sampling + CUDA Graph for
       // enqueueV3 eliminates TRT dispatch overhead. RunFrameGPU (GPU sampling)
       // is 180ms due to TRT dispatch serialization — do not use.
-      int n_groups = cfg_.num_code_groups - 1;
-      std::vector<int> cp_codes(n_groups);
+      int n_groups_full = cfg_.num_code_groups - 1;
+      int n_groups = cfg_.cp_active_groups;
+      // Allocate full-size buffer so engine can zero-fill inactive slots
+      std::vector<int> cp_codes(n_groups_full, 0);
       cp_kv_->RunFrameAutoregressive(
           last_hidden.data(), primary_e_ptr, cp_codes.data(),
-          cp_embed_table_.data(), cp_embed_vocab_);
+          cp_embed_table_.data(), cp_embed_vocab_, n_groups);
 
-      for (int j = 0; j < n_groups; ++j) {
+      // Accumulate codec_sum from active residuals only; inactive slots
+      // are zero (no embedding contribution, matching zero-fill semantics).
+      for (int j = 0; j < n_groups_full; ++j) {
         int rc = cp_codes[j];
         frame_codes.push_back(rc);
+        if (j >= n_groups) continue;  // inactive: code=0, skip embed add
         if (cp_embed_use_int8_) {
           float re_buf[1024];
           CPEmbedLookupINT8(j, rc, re_buf);
@@ -1105,15 +1118,17 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
 
     if (cp_kv_) {
       // --- GPU-resident autoregressive CP (dual-context, no CPU sync) ---
-      int n_groups = cfg_.num_code_groups - 1;
-      std::vector<int> cp_codes(n_groups);
+      int n_groups_full = cfg_.num_code_groups - 1;
+      int n_groups = cfg_.cp_active_groups;
+      std::vector<int> cp_codes(n_groups_full, 0);
       cp_kv_->RunFrameAutoregressive(
           last_hidden.data(), primary_e_ptr, cp_codes.data(),
-          cp_embed_table_.data(), cp_embed_vocab_);
+          cp_embed_table_.data(), cp_embed_vocab_, n_groups);
 
-      for (int j = 0; j < n_groups; ++j) {
+      for (int j = 0; j < n_groups_full; ++j) {
         int rc = cp_codes[j];
         frame_codes.push_back(rc);
+        if (j >= n_groups) continue;  // inactive: code=0, skip embed add
         if (cp_embed_use_int8_) {
           float re_buf[1024];
           CPEmbedLookupINT8(j, rc, re_buf);

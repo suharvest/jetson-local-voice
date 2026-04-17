@@ -20,6 +20,11 @@ struct TTSConfig {
   int n_heads = 8;
   int head_dim = 128;
   int cp_vocab = 2048;
+  // Number of CP residual codebooks to actually sample (1..num_code_groups-1).
+  // Primary code + `cp_active_groups` residuals are generated; remaining
+  // slots in the vocoder input (last dim fixed at num_code_groups=16) are
+  // zero-filled. Runtime experiment knob — does NOT change model shapes.
+  int cp_active_groups = 15;
 
   int tts_bos_token_id;
   int tts_eos_token_id;

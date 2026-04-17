@@ -311,9 +311,13 @@ class TRTCPKVEngine {
   //   Step 1-14: decode [embed(code[j-1])] (seq_len=1) → logits[j] → sample code[j]
   // codes_out: [cp_out_groups] int — sampled codes for each group
   // embed_table: CPU pointer to cp_embed table [n_layers][vocab][D]
+  // active_groups: number of output groups to actually run (<= cp_out_groups_).
+  //   -1 = use cp_out_groups_ (default, all 15). Remaining slots in codes_out
+  //   are zero-filled. Used for codebook-count experiments via cp_active_groups.
   void RunFrameAutoregressive(const float* hidden, const float* primary_emb,
                               int* codes_out,
-                              const float* embed_table, int embed_vocab);
+                              const float* embed_table, int embed_vocab,
+                              int active_groups = -1);
 
   // GPU-resident autoregressive CP: all 15 steps run async on GPU.
   // Only 1 H2D at start + 1 D2H sync at the end to read 15 sampled codes.

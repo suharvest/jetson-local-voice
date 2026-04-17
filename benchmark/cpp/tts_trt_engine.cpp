@@ -1404,7 +1404,8 @@ TRTCPKVEngine::~TRTCPKVEngine() {
 void TRTCPKVEngine::RunFrameAutoregressive(
     const float* hidden, const float* primary_emb,
     int* codes_out,
-    const float* embed_table, int embed_vocab) {
+    const float* embed_table, int embed_vocab,
+    int active_groups) {
   // Autoregressive CP: 15 sequential steps.
   //
   // Two execution strategies (selected automatically):
@@ -1424,7 +1425,12 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   auto* pctx = has_dual_ctx_ ? ctx_prefill_.get() : context_.get();
   auto* dctx = has_dual_ctx_ ? ctx_decode_.get()  : context_.get();
   int D = hidden_dim_;
-  int n_groups = cp_out_groups_;  // 15
+  // active_groups bounds the actual decode steps; remaining slots in codes_out
+  // are zero-filled. cp_out_groups_ (=15) stays fixed for engine shapes.
+  int n_groups_full = cp_out_groups_;  // 15
+  int n_groups = (active_groups > 0 && active_groups <= n_groups_full)
+                     ? active_groups
+                     : n_groups_full;
   size_t d_bytes = D * sizeof(float);
   const char* logits_out_name = is_single_head_ ? "logits" : "logits_all";
 
@@ -1732,12 +1738,18 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     CHECK_CUDA(cudaEventRecord(ev_kernel_done_, stream_));
   }
 
-  // GPU path: single D2H for all 15 codes + single sync
+  // GPU path: single D2H for all codes + single sync
   if (use_gpu_sample) {
     CHECK_CUDA(cudaMemcpyAsync(codes_out, d_codes_out_,
                                n_groups * sizeof(int),
                                cudaMemcpyDeviceToHost, stream_));
     CHECK_CUDA(cudaStreamSynchronize(stream_));
+  }
+
+  // Zero-fill inactive codebook slots so caller can safely forward them
+  // to vocoder (vocoder last-dim is hardcoded 16 in the engine).
+  for (int j = n_groups; j < n_groups_full; ++j) {
+    codes_out[j] = 0;
   }
 
   if (profiling_) {
