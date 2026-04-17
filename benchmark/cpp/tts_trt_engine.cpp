@@ -1559,11 +1559,15 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     codes_out[0] = sample_topk_cpu(d_logits_all_, 0);
   }
 
-  // ---- Set up decode context: FIXED shapes for all decode steps ----
-  // Set KV input shapes to fixed_past ONCE. TRT sees the same shapes every
-  // step, so enqueueV3 skips internal reconfiguration entirely.
-  // The actual KV data is written incrementally by the model; zero-padded
-  // entries beyond the real past_len are harmless for attention.
+  // ---- Set up decode context (non-KV bindings only) ----
+  // NOTE: fixed-shape KV (set ONCE here) was tried in a531f68 and BROKE
+  // correctness. The exported ONNX mask is
+  //   triu(seq_len=1, total=past_key.shape[2], diag=past_len+1),
+  // where past_len comes from past_key.shape[2]. With fixed past=19 and
+  // seq_len=1, triu(diag=20) of a (1,20) matrix is all zeros, i.e. NO mask.
+  // Attention then averages over ALL 19 past slots, including ~17 zero-padded
+  // ones, diluting the real signal and producing grammatically-fluent but
+  // semantically-random output. Must update past_len shapes per step below.
   dctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, D});
   dctx->setTensorAddress("inputs_embeds", d_embeds_);
   dctx->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
@@ -1573,16 +1577,10 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     dctx->setTensorAddress("gen_step", d_gen_step_);
   }
 
-  // Set FIXED KV shapes — this is the key optimization.
-  // All decode steps will use these same shapes, no setInputShape in the loop.
-  for (int i = 0; i < n_cp_layers_; ++i) {
-    dctx->setInputShape(cp_kv_names_[2*i].c_str(),
-                        nvinfer1::Dims4{1, n_heads_, fixed_past, head_dim_});
-    dctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
-                        nvinfer1::Dims4{1, n_heads_, fixed_past, head_dim_});
-  }
-
-  // ---- Steps 1-14: Decode (fixed shapes, no sync between steps) ----
+  // (Per-step setInputShape for KV happens inside the decode loop below,
+  // since past_key.shape[2] == actual past_len is an invariant the exported
+  // attention mask relies on.)
+  // ---- Steps 1-14: Decode (dynamic past_len per step) ----
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
@@ -1635,20 +1633,21 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       }
     }
 
-    // Only update ping-pong buffer ADDRESSES (no setInputShape — shapes are fixed).
-    // setTensorAddress is a cheap pointer update that does NOT trigger TRT
-    // reconfiguration, unlike setInputShape.
-    // For CUDA Graph replay, these calls are still needed on the first frame
-    // (before capture). On subsequent frames they're harmless no-ops since
-    // the addresses don't change — but we skip them for captured parities
-    // to save the ~0.1ms CPU cost per step.
-    if (!(use_cp_graph && cp_graph_captured_[parity])) {
-      for (int i = 0; i < n_cp_layers_; ++i) {
-        dctx->setTensorAddress(cp_kv_names_[2*i].c_str(), (*kv_read)[2*i]);
-        dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
-        dctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), (*kv_write)[2*i]);
-        dctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), (*kv_write)[2*i+1]);
-      }
+    // Update past_len shapes AND ping-pong buffer addresses per step.
+    // Dynamic shapes are required: the exported attention mask derives
+    // past_len from past_key.shape[2], so shape MUST match actual past.
+    // (Tried fixed-shape in a531f68 => semantically-random output.)
+    // CUDA Graph capture is disabled with dynamic shapes (setInputShape
+    // is not capturable); keep the capture branch below inert.
+    for (int i = 0; i < n_cp_layers_; ++i) {
+      dctx->setInputShape(cp_kv_names_[2*i].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, actual_past, head_dim_});
+      dctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, actual_past, head_dim_});
+      dctx->setTensorAddress(cp_kv_names_[2*i].c_str(), (*kv_read)[2*i]);
+      dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
+      dctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), (*kv_write)[2*i]);
+      dctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), (*kv_write)[2*i+1]);
     }
 
     if (use_cp_graph && cp_graph_captured_[parity]) {
@@ -1723,10 +1722,9 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
           rng_seed, rng_counter_++);
-      // NO sync between steps: shapes are fixed, so TRT enqueueV3 (or graph
-      // replay) has zero reconfiguration overhead. CUDA stream ordering
-      // guarantees the sample kernel's output (embed, cache_pos) is visible
-      // to the next enqueueV3/graph launch.
+      // Sync after sample: dynamic past_len changes on next step, TRT
+      // enqueueV3 needs a quiescent stream.
+      CHECK_CUDA(cudaStreamSynchronize(stream_));
     } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
     }
@@ -1879,24 +1877,23 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
     dctx->setTensorAddress("gen_step", d_gen_step_);
   }
 
-  // Set FIXED KV shapes — the key optimization. All decode steps reuse these.
-  for (int i = 0; i < n_cp_layers_; ++i) {
-    dctx->setInputShape(cp_kv_names_[2*i].c_str(),
-                        nvinfer1::Dims4{1, n_heads_, fixed_past, head_dim_});
-    dctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
-                        nvinfer1::Dims4{1, n_heads_, fixed_past, head_dim_});
-  }
-
-  // ---- Steps 1-14: Decode (fixed shapes, zero sync between steps) ----
+  // (Per-step setInputShape for KV happens inside the decode loop below,
+  // since past_key.shape[2] == actual past_len is an invariant the exported
+  // attention mask relies on.)
+  // ---- Steps 1-14: Decode (dynamic past_len, sync per step) ----
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
 
   for (int j = 1; j < n_groups; ++j) {
     int actual_past = j + 1;  // for cache_pos value (step 0 produced 2 entries)
 
-    // Only update ping-pong buffer ADDRESSES (no setInputShape).
-    // setTensorAddress does NOT trigger TRT reconfiguration.
+    // Update past_len shapes AND ping-pong addresses per step.
+    // Dynamic past_len required for correct attention masking.
     for (int i = 0; i < n_cp_layers_; ++i) {
+      dctx->setInputShape(cp_kv_names_[2*i].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, actual_past, head_dim_});
+      dctx->setInputShape(cp_kv_names_[2*i+1].c_str(),
+                          nvinfer1::Dims4{1, n_heads_, actual_past, head_dim_});
       dctx->setTensorAddress(cp_kv_names_[2*i].c_str(), (*kv_read)[2*i]);
       dctx->setTensorAddress(cp_kv_names_[2*i+1].c_str(), (*kv_read)[2*i+1]);
       dctx->setTensorAddress(cp_new_kv_names_[2*i].c_str(), (*kv_write)[2*i]);
@@ -1937,7 +1934,9 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
         next_pos,
         /*top_k=*/50, /*temperature=*/0.9f,
         rng_seed, rng_counter_++);
-    // NO sync between steps: shapes are fixed, CUDA stream ordering suffices.
+    // Sync after sample: dynamic shape change on next step needs a quiescent
+    // stream, else TRT enqueueV3 triggers ~10ms internal reconfiguration.
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
 
     std::swap(kv_read, kv_write);
   }
