@@ -377,6 +377,10 @@ class TRTCPKVEngine {
   // instead of "logits_all" [15, vocab]. Only computes 1 lm_head per step.
   bool is_single_head_ = false;
 
+  // Mask-input engine: has "past_length" scalar input (int64).
+  // When present, binds past_length=0 for prefill, past_length=actual_past for decode.
+  bool has_past_length_input_ = false;
+
   int n_cp_layers_;   // 5
   int hidden_dim_;    // 1024
   int n_heads_;       // 8
@@ -388,6 +392,7 @@ class TRTCPKVEngine {
   void* d_embeds_ = nullptr;
   void* d_cache_pos_ = nullptr;  // [2] int64 = {0, 1}
   void* d_gen_step_ = nullptr;   // scalar int64 for single-head engine
+  void* d_past_length_ = nullptr;  // scalar int64 for mask-input engine
 
   // Small dummy buffer for zero-size past KV inputs (TRT needs non-null ptr)
   void* d_kv_dummy_ = nullptr;  // 16 bytes — just needs to be a valid GPU address
