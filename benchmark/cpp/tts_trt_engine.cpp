@@ -1263,17 +1263,14 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
   }
 
   // Detect single-head engine (has "gen_step" input, "logits" output)
-  // vs unified engine (has "logits_all" output).
-  // Also detect new mask-input engine (has "past_length" scalar input).
+  // vs unified engine (has "logits_all" output)
   {
     int n_io = engine_->getNbIOTensors();
     for (int i = 0; i < n_io; ++i) {
       const char* name = engine_->getIOTensorName(i);
-      std::string nm(name);
-      if (nm == "gen_step") {
+      if (std::string(name) == "gen_step") {
         is_single_head_ = true;
-      } else if (nm == "past_length") {
-        has_past_length_input_ = true;
+        break;
       }
     }
   }
@@ -1306,11 +1303,6 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
                         cudaMemcpyHostToDevice));
   // Small dummy buffer for zero-size past KV inputs (TRT needs non-null ptr)
   CHECK_CUDA(cudaMalloc(&d_kv_dummy_, 16));
-
-  // past_length scalar (only for new mask-input engine)
-  if (has_past_length_input_) {
-    CHECK_CUDA(cudaMalloc(&d_past_length_, sizeof(int64_t)));
-  }
 
   // KV output buffers for legacy parallel RunFrame
   size_t kv_out_size = (size_t)n_heads * 2 * head_dim * kv_elem_bytes_;
@@ -1370,7 +1362,6 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
             << " logits=" << (logits_is_bf16_ ? "bf16" : "fp32")
             << " single_head=" << is_single_head_
             << " dual_ctx=" << has_dual_ctx_
-            << " past_length_input=" << has_past_length_input_
             << std::endl;
 }
 
@@ -1403,7 +1394,6 @@ TRTCPKVEngine::~TRTCPKVEngine() {
   if (d_codes_out_) cudaFree(d_codes_out_);
   if (d_cache_pos_table_) cudaFree(d_cache_pos_table_);
   if (d_cache_pos_single_) cudaFree(d_cache_pos_single_);
-  if (d_past_length_) cudaFree(d_past_length_);
   if (ev_step_sync_) cudaEventDestroy(ev_step_sync_);
   if (ev_start_) cudaEventDestroy(ev_start_);
   if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
@@ -1542,13 +1532,6 @@ void TRTCPKVEngine::RunFrameAutoregressive(
                                cudaMemcpyHostToDevice, stream_));
     pctx->setTensorAddress("gen_step", d_gen_step_);
   }
-  if (has_past_length_input_) {
-    // Prefill: past_length = 0 (no past yet).
-    int64_t pl = 0;
-    CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
-                               cudaMemcpyHostToDevice, stream_));
-    pctx->setTensorAddress("past_length", d_past_length_);
-  }
 
   bool ok = pctx->enqueueV3(stream_);
   if (!ok) {
@@ -1593,13 +1576,10 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   if (is_single_head_) {
     dctx->setTensorAddress("gen_step", d_gen_step_);
   }
-  if (has_past_length_input_) {
-    dctx->setTensorAddress("past_length", d_past_length_);
-  }
 
-  // (For legacy engines without past_length input, per-step setInputShape
-  // for KV happens inside the decode loop below — the exported attention
-  // mask derives past_len from past_key.shape[2] which must match actual.)
+  // (Per-step setInputShape for KV happens inside the decode loop below,
+  // since past_key.shape[2] == actual past_len is an invariant the exported
+  // attention mask relies on.)
   // ---- Steps 1-14: Decode (dynamic past_len per step) ----
   auto* kv_read = &d_kv_b_;
   auto* kv_write = &d_kv_a_;
@@ -1653,16 +1633,12 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       }
     }
 
-    // Update past_key/past_value shape AND ping-pong addresses per step.
-    // Engines with dynamic past_key dim require per-step setInputShape
-    // regardless of whether past_length scalar is also present.
-    // (Fixed-shape KV tried in a531f68 — output shape past+1 misaligns ping-pong
-    // buffer reads, garbage output. See memory feedback_fixed_shape_kv_mask_bug.)
-    if (has_past_length_input_) {
-      int64_t pl = (int64_t)actual_past;
-      CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
-                                 cudaMemcpyHostToDevice, stream_));
-    }
+    // Update past_len shapes AND ping-pong buffer addresses per step.
+    // Dynamic shapes are required: the exported attention mask derives
+    // past_len from past_key.shape[2], so shape MUST match actual past.
+    // (Tried fixed-shape in a531f68 => semantically-random output.)
+    // CUDA Graph capture is disabled with dynamic shapes (setInputShape
+    // is not capturable); keep the capture branch below inert.
     for (int i = 0; i < n_cp_layers_; ++i) {
       dctx->setInputShape(cp_kv_names_[2*i].c_str(),
                           nvinfer1::Dims4{1, n_heads_, actual_past, head_dim_});

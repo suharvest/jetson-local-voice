@@ -134,59 +134,7 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
   // Pre-compute codec_embed table for O(1) lookup in decode loop
   LoadCodecEmbedTable(sherpa_dir);
 
-  // Start async vocoder worker thread (Scheme A overlap)
-  voc_stop_ = false;
-  vocoder_thread_ = std::thread(&TTSPipeline::VocoderWorkerLoop, this);
-
   std::cout << "Pipeline ready." << std::endl;
-}
-
-TTSPipeline::~TTSPipeline() {
-  if (vocoder_thread_.joinable()) {
-    {
-      std::lock_guard<std::mutex> lk(voc_mutex_);
-      voc_stop_ = true;
-    }
-    voc_cv_.notify_all();
-    vocoder_thread_.join();
-  }
-}
-
-void TTSPipeline::VocoderWorkerLoop() {
-  while (true) {
-    VocWork w;
-    {
-      std::unique_lock<std::mutex> lk(voc_mutex_);
-      voc_cv_.wait(lk, [&] { return !voc_queue_.empty() || voc_stop_; });
-      if (voc_stop_ && voc_queue_.empty()) return;
-      w = std::move(voc_queue_.front());
-      voc_queue_.pop();
-    }
-    std::vector<float> audio;
-    try {
-      if (trt_vocoder_) {
-        audio =
-            trt_vocoder_->Run(w.codes.data(), w.window_len, w.num_code_groups);
-      } else {
-        audio = ort_->Vocoder(w.codes.data(), w.window_len, w.num_code_groups);
-      }
-    } catch (const std::exception& ex) {
-      std::cerr << "[voc-worker] ERROR: " << ex.what() << std::endl;
-    }
-    StreamChunk chunk;
-    if (audio.size() > w.skip_samples) {
-      chunk.audio.assign(audio.begin() + w.skip_samples, audio.end());
-    }
-    chunk.total_frames = w.total_frames;
-    chunk.is_final = w.is_final;
-    if (w.callback) w.callback(chunk);
-
-    int rem = --voc_inflight_;
-    if (rem == 0) {
-      std::lock_guard<std::mutex> lk(voc_mutex_);
-      voc_empty_cv_.notify_all();
-    }
-  }
 }
 
 void TTSPipeline::LoadConfig(const std::string& sherpa_dir) {
@@ -1236,37 +1184,43 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     if (n >= next_chunk_at) {
       // Sliding-window vocoder: pass [window_start..n] where window_start
       // is at most kVocContextFrames before the new frames in this chunk.
-      // Scheme A: enqueue to async worker instead of running synchronously.
       int prev_boundary = last_emitted_frames;  // start of new frames
       int window_start = std::max(0, prev_boundary - kVocContextFrames);
       int window_len = n - window_start;
 
-      VocWork w;
-      w.codes.resize((size_t)window_len * cfg_.num_code_groups);
+      std::vector<int64_t> codes_t(window_len * cfg_.num_code_groups);
       for (int f = 0; f < window_len; ++f) {
         for (int g = 0; g < cfg_.num_code_groups; ++g) {
-          w.codes[(size_t)f * cfg_.num_code_groups + g] =
+          codes_t[f * cfg_.num_code_groups + g] =
               all_codes[window_start + f][g];
         }
       }
-      w.window_len = window_len;
-      w.num_code_groups = cfg_.num_code_groups;
-      w.skip_samples =
-          (size_t)(prev_boundary - window_start) * kSamplesPerFrame;
-      w.total_frames = n;
-      w.is_final = false;
-      w.callback = callback;
 
-      ++voc_inflight_;
-      {
-        std::lock_guard<std::mutex> lk(voc_mutex_);
-        voc_queue_.push(std::move(w));
+      std::vector<float> window_audio;
+      if (trt_vocoder_) {
+        window_audio =
+            trt_vocoder_->Run(codes_t.data(), window_len, cfg_.num_code_groups);
+      } else {
+        window_audio =
+            ort_->Vocoder(codes_t.data(), window_len, cfg_.num_code_groups);
       }
-      voc_cv_.notify_one();
 
+      // Skip the context portion, yield only new frames' audio
+      size_t skip_samples =
+          (size_t)(prev_boundary - window_start) * kSamplesPerFrame;
+      StreamChunk chunk;
+      if (window_audio.size() > skip_samples) {
+        chunk.audio.assign(window_audio.begin() + skip_samples,
+                           window_audio.end());
+      }
+      chunk.total_frames = n;
+      chunk.is_final = false;
       last_emitted_frames = n;
-      std::cout << "  Chunk enqueued: window=[" << window_start << ".." << n
-                << "] for async vocode" << std::endl;
+
+      std::cout << "  Chunk: window=[" << window_start << ".." << n
+                << "] skip=" << skip_samples
+                << " yield=" << chunk.audio.size() << " samples" << std::endl;
+      callback(chunk);
 
       // After first chunk, use regular chunk size
       next_chunk_at = n + config.chunk_frames;
@@ -1278,49 +1232,49 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
   }
 
   // Final chunk: sliding-window vocoder for remaining codes
-  // Scheme A: enqueue final chunk to async worker, then wait for queue drain.
   int n = (int)all_codes.size();
   if (n > 0) {
     int prev_boundary = last_emitted_frames;
     int window_start = std::max(0, prev_boundary - kVocContextFrames);
     int window_len = n - window_start;
 
-    VocWork w;
-    w.codes.resize((size_t)window_len * cfg_.num_code_groups);
+    std::vector<int64_t> codes_t(window_len * cfg_.num_code_groups);
     for (int f = 0; f < window_len; ++f) {
       for (int g = 0; g < cfg_.num_code_groups; ++g) {
-        w.codes[(size_t)f * cfg_.num_code_groups + g] =
+        codes_t[f * cfg_.num_code_groups + g] =
             all_codes[window_start + f][g];
       }
     }
-    w.window_len = window_len;
-    w.num_code_groups = cfg_.num_code_groups;
-    w.skip_samples =
-        (size_t)(prev_boundary - window_start) * kSamplesPerFrame;
-    w.total_frames = n;
-    w.is_final = true;
-    w.callback = callback;
 
-    ++voc_inflight_;
-    {
-      std::lock_guard<std::mutex> lk(voc_mutex_);
-      voc_queue_.push(std::move(w));
+    std::vector<float> window_audio;
+    if (trt_vocoder_) {
+      window_audio =
+          trt_vocoder_->Run(codes_t.data(), window_len, cfg_.num_code_groups);
+    } else {
+      window_audio =
+          ort_->Vocoder(codes_t.data(), window_len, cfg_.num_code_groups);
     }
-    voc_cv_.notify_one();
-    std::cout << "  Final chunk enqueued: window=[" << window_start << ".."
-              << n << "] for async vocode" << std::endl;
+
+    size_t skip_samples =
+        (size_t)(prev_boundary - window_start) * kSamplesPerFrame;
+    StreamChunk chunk;
+    if (window_audio.size() > skip_samples) {
+      chunk.audio.assign(window_audio.begin() + skip_samples,
+                         window_audio.end());
+    }
+    chunk.total_frames = n;
+    chunk.is_final = true;
+
+    std::cout << "  Final chunk: window=[" << window_start << ".." << n
+              << "] skip=" << skip_samples
+              << " yield=" << chunk.audio.size() << " samples" << std::endl;
+    callback(chunk);
   } else {
-    // No frames at all — emit empty final chunk synchronously
+    // No frames at all — emit empty final chunk
     StreamChunk chunk;
     chunk.total_frames = 0;
     chunk.is_final = true;
     callback(chunk);
-  }
-
-  // Wait for vocoder worker to drain all outstanding work before returning.
-  {
-    std::unique_lock<std::mutex> lk(voc_mutex_);
-    voc_empty_cv_.wait(lk, [&] { return voc_inflight_.load() == 0; });
   }
 
   std::cout << "  Streaming complete: " << n << " total frames" << std::endl;
