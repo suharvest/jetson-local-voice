@@ -45,6 +45,113 @@ ROLLBACK_TOKENS = 3
 EOS_CONFIRM_COUNT = 2
 STREAMING_MAX_TOKENS = 4
 
+# Long-audio VAD split parameters (Qwen3-ASR emits premature '。'+EOS after
+# ~6.5s of continuous speech; split longer audio at silence to stay under
+# the safe boundary and avoid deterministic truncation.)
+LONG_AUDIO_THRESHOLD_SEC = 6.0
+VAD_MAX_SEG_SEC = 4.5        # conservative — leaves margin below Bug A boundary
+VAD_MIN_SEG_SEC = 0.5        # allow finer splits when silence is available
+VAD_FRAME_MS = 20           # webrtcvad frame size (10/20/30 supported)
+VAD_AGGRESSIVENESS = 2      # 0-3; 2 = balanced for mixed noise conditions
+VAD_MIN_SILENCE_MS = 150    # minimum silence run to count as a cut candidate
+
+
+def _split_at_silence_vad(audio: np.ndarray, sr: int = 16000) -> list[np.ndarray]:
+    """Split a long audio into segments at natural silence points via webrtcvad.
+
+    Greedy: walk forward, try to cut at the silence point closest to
+    VAD_MAX_SEG_SEC from the last cut, within [MIN_SEG, MAX_SEG] window. Falls
+    back to a hard cut at MAX_SEG if no silence is found (e.g. continuous
+    speech in noisy environments).
+    """
+    import webrtcvad
+
+    max_seg = int(VAD_MAX_SEG_SEC * sr)
+    min_seg = int(VAD_MIN_SEG_SEC * sr)
+
+    if len(audio) <= max_seg:
+        return [audio]
+
+    frame_len = int(VAD_FRAME_MS * sr / 1000)
+    n_frames = len(audio) // frame_len
+    if n_frames == 0:
+        return [audio]
+
+    pcm16 = (np.clip(audio[:n_frames * frame_len], -1.0, 1.0) * 32767).astype(np.int16)
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    is_speech = np.zeros(n_frames, dtype=bool)
+    frame_bytes = frame_len * 2
+    raw = pcm16.tobytes()
+    for i in range(n_frames):
+        is_speech[i] = vad.is_speech(raw[i * frame_bytes:(i + 1) * frame_bytes], sr)
+
+    # Silence-run start indices (sample offset at run center) where run length
+    # >= VAD_MIN_SILENCE_MS.
+    min_run = max(1, VAD_MIN_SILENCE_MS // VAD_FRAME_MS)
+    cut_candidates = []
+    run_start = None
+    for i in range(n_frames):
+        if not is_speech[i]:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and i - run_start >= min_run:
+                mid = (run_start + i) // 2
+                cut_candidates.append(mid * frame_len)
+            run_start = None
+    if run_start is not None and n_frames - run_start >= min_run:
+        mid = (run_start + n_frames) // 2
+        cut_candidates.append(mid * frame_len)
+    cut_candidates = np.array(cut_candidates, dtype=np.int64)
+
+    cuts = [0]
+    while len(audio) - cuts[-1] > max_seg:
+        target = cuts[-1] + max_seg
+        lo = cuts[-1] + min_seg
+        hi = target
+        mask = (cut_candidates >= lo) & (cut_candidates <= hi)
+        if mask.any():
+            # Cut at candidate closest to target (prefer later cuts for max chunk usage)
+            pick = int(cut_candidates[mask][np.argmax(cut_candidates[mask])])
+        else:
+            # Fallback: hard cut at max boundary
+            pick = int(target)
+        cuts.append(pick)
+    cuts.append(len(audio))
+
+    # Post-process: merge short fragments into neighbors. Tiny chunks produce
+    # hallucinations ("当前。") because the model misbehaves on incomplete
+    # audio context. Merged segment may slightly exceed max_seg but stays
+    # under the 6s Bug A boundary (max_seg + min_frag < 6.0s).
+    min_frag = int(1.0 * sr)    # drop any mid segment <1.0s
+    min_tail = int(2.0 * sr)    # tail must be >=2.0s, else merge into previous
+    # 1. Merge mid fragments <min_frag into the preceding segment
+    i = 1
+    while i < len(cuts) - 1:
+        if (cuts[i + 1] - cuts[i]) < min_frag:
+            cuts.pop(i)  # drop cut point, merge into prev
+        else:
+            i += 1
+    # 2. Tail merge if last segment too short
+    while len(cuts) >= 3 and (cuts[-1] - cuts[-2]) < min_tail:
+        cuts.pop(-2)
+    return [audio[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
+
+
+def _join_segments(parts: list[str]) -> str:
+    """Concatenate segment transcripts, stripping duplicate trailing
+    punctuation that each segment's decoder may have added.
+    """
+    if not parts:
+        return ""
+    out = [parts[0].rstrip()]
+    for p in parts[1:]:
+        prev = out[-1]
+        # If previous ended with '。'/'!'/'?' and next starts without one,
+        # keep the period; otherwise just concat with no extra separator.
+        out.append(p.strip())
+    return "".join(out)
+
 
 @dataclass
 class SegmentInfo:
@@ -553,10 +660,54 @@ class Qwen3ASRBackend(ASRBackend):
         return self.transcribe_audio(audio, language=language)
 
     def transcribe_audio(self, audio: np.ndarray, language: str = "auto") -> TranscriptionResult:
-        """Transcribe float32 audio array (16kHz, [-1,1])."""
+        """Transcribe float32 audio array (16kHz, [-1,1]).
+
+        Audio longer than LONG_AUDIO_THRESHOLD_SEC is split at silence via
+        webrtcvad before transcription: Qwen3-ASR emits a premature '。' then
+        EOS after ~6.5s of continuous speech, causing deterministic mid-audio
+        truncation. Each segment stays under VAD_MAX_SEG_SEC and is
+        transcribed independently; results are concatenated.
+        """
         t_total = time.perf_counter()
-        mel = self._compute_mel(audio)
-        return self._transcribe_python(mel, audio, language, t_total)
+        if len(audio) / 16000 <= LONG_AUDIO_THRESHOLD_SEC:
+            mel = self._compute_mel(audio)
+            return self._transcribe_python(mel, audio, language, t_total)
+        return self._transcribe_segmented(audio, language, t_total)
+
+    def _transcribe_segmented(self, audio, language, t_total):
+        """Split long audio at silence, transcribe each segment, concatenate."""
+        try:
+            segments = _split_at_silence_vad(audio)
+        except Exception as e:
+            logger.warning("VAD split failed (%s); falling back to single-pass", e)
+            mel = self._compute_mel(audio)
+            return self._transcribe_python(mel, audio, language, t_total)
+
+        logger.info("Long audio %.2fs split into %d segments: %s",
+                    len(audio) / 16000, len(segments),
+                    [round(len(s) / 16000, 2) for s in segments])
+
+        parts, total_tokens = [], 0
+        for seg in segments:
+            if len(seg) < 800:  # skip too-short segments (<50ms)
+                continue
+            mel = self._compute_mel(seg)
+            sub = self._transcribe_python(mel, seg, language, time.perf_counter())
+            if sub.text:
+                parts.append(sub.text)
+            total_tokens += sub.meta.get("n_tokens", 0)
+
+        audio_dur = len(audio) / 16000
+        total_ms = (time.perf_counter() - t_total) * 1000
+        return TranscriptionResult(
+            text=_join_segments(parts),
+            duration=round(audio_dur, 3),
+            inference_time=round(total_ms / 1000, 3),
+            rtf=round(total_ms / 1000 / audio_dur, 3) if audio_dur > 0 else 0,
+            n_tokens=total_tokens,
+            per_token_ms=round(total_ms / max(total_tokens, 1), 1),
+            backend="TRT" if self._decoder else "ORT",
+        )
 
     def _transcribe_python(self, mel, audio, language, t_total):
         """Python ORT encoder + TRT/ORT prefill + decode."""

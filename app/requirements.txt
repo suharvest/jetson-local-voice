@@ -3,4 +3,5 @@ uvicorn[standard]>=0.32.0
 soundfile>=0.12.0
 numpy>=1.24.0
 python-multipart>=0.0.9
+webrtcvad-wheels>=2.0.14  # VAD for long-audio segmentation (qwen3_asr bug A workaround)
 # sherpa-onnx: installed from CUDA wheel in Dockerfile
