@@ -206,6 +206,7 @@ class Qwen3TRTBackend(TTSBackend):
             max_frames: Maximum total frames (default 200)
         """
         import queue as queue_mod
+        import threading
 
         language = kwargs.get("language") or _detect_language(text)
         speaker_embedding = kwargs.get("speaker_embedding")
@@ -216,6 +217,7 @@ class Qwen3TRTBackend(TTSBackend):
         token_ids = self._tokenize(text)
 
         chunk_queue: queue_mod.Queue = queue_mod.Queue()
+        SENTINEL = object()
 
         def _on_chunk(chunk_dict):
             """Called from C++ thread per audio chunk."""
@@ -223,31 +225,39 @@ class Qwen3TRTBackend(TTSBackend):
             if len(wav_bytes) > 44:
                 chunk_queue.put(wav_bytes[44:])  # Strip WAV header -> raw PCM
 
-        if speaker_embedding:
-            self._engine.synthesize_streaming_clone_callback(
-                text=text,
-                lang=language,
-                token_ids=token_ids,
-                speaker_emb_bytes=speaker_embedding,
-                callback=_on_chunk,
-                first_chunk_frames=first_chunk_frames,
-                chunk_frames=chunk_frames,
-                max_frames=max_frames,
-            )
-        else:
-            self._engine.synthesize_streaming_callback(
-                text=text,
-                lang=language,
-                token_ids=token_ids,
-                callback=_on_chunk,
-                first_chunk_frames=first_chunk_frames,
-                chunk_frames=chunk_frames,
-                max_frames=max_frames,
-            )
+        def _run_engine():
+            try:
+                if speaker_embedding:
+                    self._engine.synthesize_streaming_clone_callback(
+                        text=text,
+                        lang=language,
+                        token_ids=token_ids,
+                        speaker_emb_bytes=speaker_embedding,
+                        callback=_on_chunk,
+                        first_chunk_frames=first_chunk_frames,
+                        chunk_frames=chunk_frames,
+                        max_frames=max_frames,
+                    )
+                else:
+                    self._engine.synthesize_streaming_callback(
+                        text=text,
+                        lang=language,
+                        token_ids=token_ids,
+                        callback=_on_chunk,
+                        first_chunk_frames=first_chunk_frames,
+                        chunk_frames=chunk_frames,
+                        max_frames=max_frames,
+                    )
+            finally:
+                chunk_queue.put(SENTINEL)
 
-        # Drain the queue (all chunks were pushed synchronously by C++)
-        while not chunk_queue.empty():
-            yield chunk_queue.get_nowait()
+        threading.Thread(target=_run_engine, daemon=True).start()
+
+        while True:
+            item = chunk_queue.get()
+            if item is SENTINEL:
+                break
+            yield item
 
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
         """Extract speaker embedding using Python mel computation + ORT."""
