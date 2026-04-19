@@ -377,6 +377,10 @@ class TRTCPKVEngine {
   // instead of "logits_all" [15, vocab]. Only computes 1 lm_head per step.
   bool is_single_head_ = false;
 
+  // Mask-input engine: has "past_length" scalar input (int64).
+  // When present, binds past_length=0 for prefill, past_length=actual_past for decode.
+  bool has_past_length_input_ = false;
+
   int n_cp_layers_;   // 5
   int hidden_dim_;    // 1024
   int n_heads_;       // 8
@@ -388,6 +392,7 @@ class TRTCPKVEngine {
   void* d_embeds_ = nullptr;
   void* d_cache_pos_ = nullptr;  // [2] int64 = {0, 1}
   void* d_gen_step_ = nullptr;   // scalar int64 for single-head engine
+  void* d_past_length_ = nullptr;  // scalar int64 for mask-input engine
 
   // Small dummy buffer for zero-size past KV inputs (TRT needs non-null ptr)
   void* d_kv_dummy_ = nullptr;  // 16 bytes — just needs to be a valid GPU address
@@ -427,13 +432,6 @@ class TRTCPKVEngine {
   // Pre-cached tensor names for fast binding
   std::vector<std::string> cp_kv_names_;     // "past_key_0", "past_value_0", ...
   std::vector<std::string> cp_new_kv_names_; // "new_past_key_0", ...
-
-  // Fixed-shape KV path (new cp_unified_mask.onnx with explicit past_length input).
-  // When the engine has a "past_length" scalar input, the decode profile expects
-  // FIXED past_key/value shape (1, H, max_past, D). We bind past_length per step
-  // instead of calling setInputShape — saves ~9ms/step CPU dispatch overhead.
-  bool has_past_length_input_ = false;
-  int64_t* d_past_length_ = nullptr;  // scalar int64 on GPU
 
   // Lightweight event (kept for potential future use; currently unused
   // with fixed-shape decode that eliminates inter-step sync).
