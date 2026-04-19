@@ -234,6 +234,7 @@ void TRTTalkerEngine::FreeCudaGraphs() {
 void TRTTalkerEngine::Reset() {
   seq_len_ = 0;
   parity_ = 0;
+  ForceEndCapture(stream_, "Talker.Reset");
   // NOTE: Do NOT clear graph_cache_ here. Cached CUDA graphs remain valid
   // across requests because all GPU buffer addresses (kv_a_, kv_b_, d_emb_,
   // d_logits_, d_hidden_) are fixed allocations that don't change. A graph
@@ -956,7 +957,9 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       // Synchronize stream before capture to ensure all prior work is complete
       CHECK_CUDA(cudaStreamSynchronize(stream_));
 
+      CaptureGuard capture_guard(stream_);
       CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+      capture_guard.mark_active(nullptr);
 
       // Captured operations: only the TRT enqueueV3 kernel sequence.
       // H2D (emb, position_ids) and D2H (logits, hidden) are NOT captured
@@ -964,6 +967,7 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       ctx->enqueueV3(stream_);
 
       CHECK_CUDA(cudaStreamEndCapture(stream_, &capture_graph_));
+      capture_guard.mark_done();
 
       cudaGraphExec_t exec;
       CHECK_CUDA(cudaGraphInstantiate(&exec, capture_graph_, nullptr, nullptr, 0));
@@ -1490,6 +1494,7 @@ void TRTCPKVEngine::ResetInputShapes() {
   // state on Jetson (known buggy: "already loaded binary graph" on request 2+).
   // Flush stream first — setOptimizationProfileAsync requires all prior
   // enqueue work done on the target context.
+  ForceEndCapture(stream_, "CP.ResetInputShapes");
   CHECK_CUDA(cudaStreamSynchronize(stream_));
   if (has_dual_ctx_) {
     if (ctx_prefill_) ctx_prefill_->setOptimizationProfileAsync(0, stream_);
@@ -1826,7 +1831,9 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       CHECK_CUDA(cudaGraphLaunch(it->second.exec, stream_));
     } else if (use_cp_graph) {
       CHECK_CUDA(cudaStreamSynchronize(stream_));
+      CaptureGuard capture_guard(stream_);
       CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+      capture_guard.mark_active(nullptr);
 
       if (is_single_head_) {
         CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &d_gen_step_table_[idx],
@@ -1841,6 +1848,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
 
       cudaGraph_t graph = nullptr;
       cudaError_t cap_err = cudaStreamEndCapture(stream_, &graph);
+      capture_guard.mark_done();
 
       if (!cap_ok || cap_err != cudaSuccess || !graph) {
         std::cerr << "[CPKV-AR] CUDA Graph capture FAILED! actual_past=" << actual_past

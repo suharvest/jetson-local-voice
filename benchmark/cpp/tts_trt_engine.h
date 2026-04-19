@@ -13,6 +13,60 @@
 #include <unordered_map>
 #include <vector>
 
+// RAII guard for CUDA stream capture. Ensures EndCapture is called on unwind.
+// If stream is still capturing when guard dies (exception / early return),
+// forces EndCapture + discards the graph to prevent stale capture state.
+class CaptureGuard {
+ public:
+  explicit CaptureGuard(cudaStream_t stream)
+      : stream_(stream), active_(false), graph_(nullptr) {}
+
+  ~CaptureGuard() {
+    if (!active_) return;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    cudaError_t err = cudaStreamIsCapturing(stream_, &status);
+    if (err != cudaSuccess || status != cudaStreamCaptureStatusActive) {
+      return;
+    }
+    cudaGraph_t discard_graph = nullptr;
+    err = cudaStreamEndCapture(stream_, &discard_graph);
+    if (err == cudaSuccess && discard_graph) {
+      cudaGraphDestroy(discard_graph);
+    }
+    std::cerr << "[CaptureGuard] WARN: forced end-capture on unwind" << std::endl;
+  }
+
+  void mark_active(cudaGraph_t graph) {
+    active_ = true;
+    graph_ = graph;
+  }
+
+  void mark_done() {
+    active_ = false;
+    graph_ = nullptr;
+  }
+
+ private:
+  cudaStream_t stream_;
+  bool active_;
+  cudaGraph_t graph_;
+};
+
+// Force-end stale capture state on a stream. Returns true if capture was active.
+inline bool ForceEndCapture(cudaStream_t stream, const char* caller) {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  cudaError_t err = cudaStreamIsCapturing(stream, &status);
+  if (err != cudaSuccess) return false;
+  if (status != cudaStreamCaptureStatusActive) return false;
+  cudaGraph_t discard_graph = nullptr;
+  err = cudaStreamEndCapture(stream, &discard_graph);
+  if (err == cudaSuccess && discard_graph) {
+    cudaGraphDestroy(discard_graph);
+  }
+  std::cerr << "[" << caller << "] WARN: forced end-capture on stale stream" << std::endl;
+  return true;
+}
+
 // Per-step timing breakdown (CUDA events)
 struct StepTiming {
   float h2d_ms = 0;      // Host-to-device copy
