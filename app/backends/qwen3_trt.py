@@ -75,7 +75,8 @@ class Qwen3TRTBackend(TTSBackend):
         for path, desc in [
             (QWEN3_TALKER_ENGINE, "talker engine"),
             (QWEN3_CP_ENGINE, "CP engine"),
-            (os.path.join(_BASE, "config.json"), "config.json"),
+            (os.path.join(_BASE, "engines", "vocoder_fp16.engine"), "vocoder engine"),
+            (os.path.join(QWEN3_SHERPA_DIR, "config.json"), "config.json (authoritative)"),
         ]:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Missing {desc}: {path}")

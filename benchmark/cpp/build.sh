@@ -1,23 +1,13 @@
 #!/bin/bash
-# Canonical build script for Qwen3 Speech TRT engine
-# Usage: ./build.sh [target]
-
-set -e
-
-ORT_ROOT=/opt/onnxruntime
-BUILD_TYPE=Release
-BUILD_DIR=build_cmake
-
-# Create build directory
-mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
-
-# Configure
-cmake .. \
-    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-    -DORT_ROOT="$ORT_ROOT"
-
-# Build
-make -j$(nproc) qwen3_speech_engine
-
-echo "Build complete: $BUILD_DIR/qwen3_speech_engine.cpython-*-linux-gnu.so"
+# Canonical in-host Release build. Run on Jetson.
+set -euo pipefail
+cd "$(dirname "$0")"
+rm -rf build_cmake && mkdir build_cmake && cd build_cmake
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+         -DORT_ROOT=/home/recomputer/ort-from-container
+make -j"$(nproc)" qwen3_speech_engine
+md5sum qwen3_speech_engine.cpython-*.so
+echo ''
+echo 'Deploy: cp qwen3_speech_engine.cpython-*.so /home/recomputer/jetson-voice/app_overlay/'
+echo 'Restart: cd /home/recomputer/jetson-voice/reachy_speech && docker compose restart speech'

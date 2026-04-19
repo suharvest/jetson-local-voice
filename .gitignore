@@ -28,3 +28,12 @@ wheels/
 # MTE binary weights and reference data (too large for git)
 rk3576/mte/weights/
 rk3576/mte/reference/
+
+# Synced models (large files)
+models/qwen3-tts/
+models/qwen3-asr-v2/
+
+# Benchmark build artifacts (deployed separately to Jetson)
+benchmark/cpp/*.so
+benchmark/cpp/build*/
+benchmark/cpp/prebuilt/
