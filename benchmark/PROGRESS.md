@@ -72,6 +72,15 @@ FastAPI (:8621)
 
 不支持的端点返回 501 + `{"required_capability": "..."}`
 
+### Backend 能力差异
+
+| Backend | Speed | Pitch | Voice Clone | Languages | Streaming |
+|---------|-------|-------|-------------|-----------|-----------|
+| Sherpa (zh_en/en) | ✅ | ✅ | ❌ | 2 (zh+en) | ✅ |
+| Qwen3 (multilanguage) | ❌ | ❌ | ✅ (x-vector) | 52 | ✅ |
+
+**Speed/Pitch 说明**：Sherpa 通过 vocoder 内置支持速度控制，Python 后处理支持 pitch shift。Qwen3-TTS 基于 codec 的声码器架构，不支持 speed/pitch 调节。
+
 ---
 
 ## 关键技术决策

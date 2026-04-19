@@ -21,6 +21,10 @@ RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
     python-multipart \
     numpy
 
+# Qwen3-TTS/ASR TensorRT backend for multilanguage mode
+# Install from GitHub release (includes prebuilt .so for Jetson Orin)
+RUN pip3 install --no-cache-dir git+https://github.com/suharvest/jetson-qwen3-speech.git@v0.1.0
+
 # sherpa-onnx for aarch64 (installed from PyPI)
 # The +cuda wheel (if available) bundles onnxruntime 1.11.0 (CUDA 10/11).
 # We patch it below to use the system's onnxruntime 1.20.0 (CUDA 12.6).

@@ -100,15 +100,31 @@ def create_backend(backend_name: Optional[str] = None) -> TTSBackend:
 
     Args:
         backend_name: 'sherpa', 'qwen3_trt', or None for auto-detect.
+
+    Auto-detect logic:
+        - If LANGUAGE_MODE=multilanguage → qwen3_trt (52 languages)
+        - Otherwise, use TTS_BACKEND env var (default: sherpa)
     """
     if backend_name is None:
-        backend_name = os.environ.get("TTS_BACKEND", "sherpa")
+        # Check LANGUAGE_MODE for automatic backend selection
+        language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
+        if language_mode == "multilanguage":
+            backend_name = "qwen3_trt"
+            logger.info("LANGUAGE_MODE=multilanguage → using qwen3_trt backend")
+        else:
+            backend_name = os.environ.get("TTS_BACKEND", "sherpa")
 
     if backend_name == "sherpa":
         from backends.sherpa import SherpaBackend
         return SherpaBackend()
     elif backend_name == "qwen3_trt":
-        from backends.qwen3_trt import Qwen3TRTBackend
+        # Try importing from standalone package first, fallback to local
+        try:
+            from jetson_qwen3_speech import Qwen3TRTBackend
+            logger.info("Using Qwen3TRTBackend from jetson-qwen3-speech package")
+        except ImportError:
+            from backends.qwen3_trt import Qwen3TRTBackend
+            logger.info("Using Qwen3TRTBackend from local backends/")
         return Qwen3TRTBackend()
     else:
         raise ValueError(f"Unknown TTS backend: {backend_name}")
