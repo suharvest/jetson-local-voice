@@ -29,8 +29,17 @@
 // Logger
 // ---------------------------------------------------------------------------
 void TRTLogger::log(Severity severity, const char* msg) noexcept {
-  if (severity <= Severity::kWARNING) {
-    std::cerr << "[TRT] " << msg << std::endl;
+  // VERBOSE temporarily enabled to trace Myelin "already loaded binary graph" bug.
+  if (severity <= Severity::kVERBOSE) {
+    const char* prefix = "[TRT]";
+    switch (severity) {
+      case Severity::kINTERNAL_ERROR: prefix = "[TRT-IERR]"; break;
+      case Severity::kERROR:          prefix = "[TRT-ERR]";  break;
+      case Severity::kWARNING:        prefix = "[TRT-WARN]"; break;
+      case Severity::kINFO:           prefix = "[TRT-INFO]"; break;
+      case Severity::kVERBOSE:        prefix = "[TRT-VERB]"; break;
+    }
+    std::cerr << prefix << " " << msg << std::endl;
   }
 }
 
@@ -238,6 +247,21 @@ void TRTTalkerEngine::Reset() {
   }
 }
 
+void TRTTalkerEngine::ResetCapturedEvents() {
+  if (ev_start_) cudaEventDestroy(ev_start_);
+  if (ev_h2d_done_) cudaEventDestroy(ev_h2d_done_);
+  if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
+  if (ev_d2h_done_) cudaEventDestroy(ev_d2h_done_);
+  ev_start_ = nullptr;
+  ev_h2d_done_ = nullptr;
+  ev_kernel_done_ = nullptr;
+  ev_d2h_done_ = nullptr;
+  CHECK_CUDA(cudaEventCreate(&ev_start_));
+  CHECK_CUDA(cudaEventCreate(&ev_h2d_done_));
+  CHECK_CUDA(cudaEventCreate(&ev_kernel_done_));
+  CHECK_CUDA(cudaEventCreate(&ev_d2h_done_));
+}
+
 // ---------------------------------------------------------------------------
 // LoadPrefillEngine: load separate batch-prefill engine.
 // Allocates GPU output buffers for its KV cache (56 tensors for 28 layers).
@@ -384,7 +408,7 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::RunPrefillEngine(
                                cudaMemcpyDeviceToHost, stream_));
     // Will convert after sync below
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
     // FP16 -> FP32 conversion
     for (size_t j = 0; j < (size_t)logits_n_tokens * vocab_size_; ++j) {
       uint32_t sign = (logits_fp16[j] >> 15) & 1;
@@ -461,7 +485,7 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::RunPrefillEngine(
   }
 
   CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
 
   // Update state
   seq_len_ = seq_len;
@@ -724,7 +748,7 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
                                (size_t)seq_len * vocab_size_ * logits_elem_bytes,
                                cudaMemcpyDeviceToHost, stream_));
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
 
     bool is_bf16 = (logits_dtype == nvinfer1::DataType::kBF16);
     for (size_t j = 0; j < (size_t)seq_len * vocab_size_; ++j) {
@@ -755,7 +779,7 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
                                  (size_t)seq_len * hidden_dim_ * hidden_elem_bytes,
                                  cudaMemcpyDeviceToHost, stream_));
       CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-      CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+      CHECK_CUDA(cudaStreamSynchronize(stream_));
       bool is_bf16 = (hidden_dtype == nvinfer1::DataType::kBF16);
       for (size_t j = 0; j < (size_t)seq_len * hidden_dim_; ++j) {
         if (is_bf16) {
@@ -778,7 +802,7 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
   if (logits_elem_bytes == sizeof(float)) {
     // Need to sync after the async copies above
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
   }
 
   seq_len_ = seq_len;
@@ -987,7 +1011,7 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
                                (size_t)vocab_size_ * logits_elem_bytes_,
                                cudaMemcpyDeviceToHost, stream_));
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
     for (int j = 0; j < vocab_size_; ++j) {
       uint32_t bits;
       if (logits_is_bf16_) {
@@ -1017,7 +1041,7 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
                                  (size_t)hidden_dim_ * hidden_elem_bytes_,
                                  cudaMemcpyDeviceToHost, stream_));
       CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-      CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+      CHECK_CUDA(cudaStreamSynchronize(stream_));
       for (int j = 0; j < hidden_dim_; ++j) {
         uint32_t bits;
         if (hidden_is_bf16_) {
@@ -1035,10 +1059,10 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
     }
   }
 
-  // Use event sync instead of full stream sync — avoids driver-level
-  // bookkeeping overhead in cudaStreamSynchronize.
+  // Record D2H completion for profiling, then wait on the stream. The stream
+  // wait avoids synchronizing on an event that may have graph-capture state.
   CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
 
   // Collect profiling data
   if (profiling_) {
@@ -1118,9 +1142,9 @@ void TRTCPEngine::Predict(const float* context, int ctx_len, int step,
   size_t out_bytes = 1 * 1 * cp_vocab_ * sizeof(float);
   CHECK_CUDA(cudaMemcpyAsync(logits_out, d_out_, out_bytes,
                              cudaMemcpyDeviceToHost, stream_));
-  // Event-based sync
+  // Record D2H completion for profiling, then wait on the stream.
   CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
 }
 
 // --- GPU-resident context methods ---
@@ -1170,9 +1194,9 @@ void TRTCPEngine::PredictGPU(int step, float* logits_out) {
   CHECK_CUDA(cudaMemcpyAsync(logits_out, d_out_, out_bytes,
                              cudaMemcpyDeviceToHost, stream_));
 
-  // Event-based sync instead of full stream sync
+  // Record D2H completion for profiling, then wait on the stream.
   CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
 
 
   // Collect profiling data
@@ -1255,11 +1279,14 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
     // Each context independently tracks shapes, so prefill (seq_len=2) and
     // decode (seq_len=1) don't interfere with each other's shape validation.
     has_dual_profiles_ = false;
-    ctx_prefill_.reset(engine_->createExecutionContext());
-    ctx_decode_.reset(engine_->createExecutionContext());
-    has_dual_ctx_ = true;
-    context_.reset(engine_->createExecutionContext());  // legacy fallback
-    std::cout << "  [CPKV] Single-profile engine, dual-context mode" << std::endl;
+    ctx_prefill_.reset();
+    ctx_decode_.reset();
+    has_dual_ctx_ = false;  // S1 experiment: force single context to bypass
+                            // TRT 10.3 Myelin "already loaded binary graph" bug
+                            // on request #2 with identical shape (dual-context on
+                            // single engine triggers Myelin state-machine violation).
+    context_.reset(engine_->createExecutionContext());
+    std::cout << "  [CPKV] Single-profile engine, SINGLE-context mode (S1)" << std::endl;
   }
 
   // Detect single-head engine (has "gen_step" input, "logits" output)
@@ -1409,6 +1436,80 @@ TRTCPKVEngine::~TRTCPKVEngine() {
   if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
   if (ev_d2h_done_) cudaEventDestroy(ev_d2h_done_);
   if (stream_) cudaStreamDestroy(stream_);
+}
+
+void TRTCPKVEngine::ResetInputShapes() {
+  // P1: force re-bind optimization profile per request to reset TRT 10.3 Myelin
+  // state on Jetson (known buggy: "already loaded binary graph" on request 2+).
+  // Flush stream first — setOptimizationProfileAsync requires all prior
+  // enqueue work done on the target context.
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
+  if (has_dual_ctx_) {
+    if (ctx_prefill_) ctx_prefill_->setOptimizationProfileAsync(0, stream_);
+    if (ctx_decode_)  ctx_decode_->setOptimizationProfileAsync(1, stream_);
+  } else if (context_) {
+    context_->setOptimizationProfileAsync(0, stream_);
+  }
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+  int64_t zero = 0;
+  if (is_single_head_ && d_gen_step_) {
+    CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &zero, sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+  }
+  if (has_past_length_input_ && d_past_length_) {
+    CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &zero, sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+  }
+
+  auto reset_ctx = [&](nvinfer1::IExecutionContext* ctx, void* cache_pos) {
+    if (!ctx) return;
+
+    static bool logged_profile_shapes = false;
+    bool log_profile_shapes = !logged_profile_shapes;
+    auto set_profile_min_shape = [&](const char* name) {
+      auto dims = engine_->getProfileShape(
+          name, 0, nvinfer1::OptProfileSelector::kMIN);
+      if (log_profile_shapes) {
+        auto expected = engine_->getTensorShape(name);
+        std::cerr << "[CPKV] ResetInputShapes: name=" << name
+                  << " expected_nbDims=" << expected.nbDims
+                  << " set_nbDims=" << dims.nbDims << std::endl;
+      }
+      ctx->setInputShape(name, dims);
+    };
+
+    set_profile_min_shape("inputs_embeds");
+    ctx->setTensorAddress("inputs_embeds", d_embeds_);
+    set_profile_min_shape("cache_position");
+    ctx->setTensorAddress("cache_position", cache_pos);
+
+    for (int i = 0; i < n_cp_layers_; ++i) {
+      set_profile_min_shape(cp_kv_names_[2 * i].c_str());
+      set_profile_min_shape(cp_kv_names_[2 * i + 1].c_str());
+      ctx->setTensorAddress(cp_kv_names_[2 * i].c_str(), d_kv_dummy_);
+      ctx->setTensorAddress(cp_kv_names_[2 * i + 1].c_str(), d_kv_dummy_);
+    }
+
+    if (is_single_head_) {
+      set_profile_min_shape("gen_step");
+      ctx->setTensorAddress("gen_step", d_gen_step_);
+    }
+    if (has_past_length_input_) {
+      set_profile_min_shape("past_length");
+      ctx->setTensorAddress("past_length", d_past_length_);
+    }
+    if (log_profile_shapes) {
+      logged_profile_shapes = true;
+    }
+  };
+
+  if (has_dual_ctx_) {
+    reset_ctx(ctx_prefill_.get(), d_cache_pos_table_);
+    reset_ctx(ctx_decode_.get(), d_cache_pos_);
+  } else {
+    reset_ctx(context_.get(), d_cache_pos_);
+  }
 }
 
 void TRTCPKVEngine::RunFrameAutoregressive(
@@ -1792,7 +1893,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
 
   if (profiling_) {
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
     StepTiming t;
     cudaEventElapsedTime(&t.kernel_ms, ev_start_, ev_kernel_done_);
     cudaEventElapsedTime(&t.d2h_ms, ev_kernel_done_, ev_d2h_done_);
@@ -1991,7 +2092,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
                              cudaMemcpyDeviceToHost, stream_));
 
   CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-  CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
 
   if (profiling_) {
     StepTiming t;
@@ -2070,7 +2171,7 @@ void TRTCPKVEngine::RunFrame(const float* hidden, const float* primary_emb,
     CHECK_CUDA(cudaMemcpyAsync(raw.data(), d_logits_all_,
                                total_logits * 2, cudaMemcpyDeviceToHost, stream_));
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
     for (size_t j = 0; j < total_logits; ++j) {
       uint32_t bits = (uint32_t)raw[j] << 16;
       std::memcpy(&logits_out[j], &bits, 4);
@@ -2080,7 +2181,7 @@ void TRTCPKVEngine::RunFrame(const float* hidden, const float* primary_emb,
                                total_logits * sizeof(float),
                                cudaMemcpyDeviceToHost, stream_));
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
+    CHECK_CUDA(cudaStreamSynchronize(stream_));
   }
 
   if (profiling_) {
@@ -2102,6 +2203,81 @@ void TRTCPKVEngine::LoadEmbedTable(const float* table, int n_layers, int vocab,
   CHECK_CUDA(cudaMemcpy(d_embed_table_, table, bytes, cudaMemcpyHostToDevice));
   std::cout << "  CPKV embed table loaded on GPU: " << n_layers << "×" << vocab
             << "×" << dim << " (" << bytes / 1024 / 1024 << " MB)" << std::endl;
+}
+
+// ===========================================================================
+// TRTCPKVEnginePool
+// ===========================================================================
+TRTCPKVEnginePool::TRTCPKVEnginePool(const std::string& engine_path, int n_cp_layers,
+                                      int hidden_dim, int n_heads, int head_dim,
+                                      int cp_vocab, int cp_out_groups, int max_past) {
+  const char* env_pool_size = std::getenv("CP_POOL_SIZE");
+  pool_size_ = env_pool_size ? std::atoi(env_pool_size) : 2;
+  if (pool_size_ < 1) pool_size_ = 1;
+
+  std::cout << "  TRTCPKVEnginePool: creating " << pool_size_ << " slots (CP_POOL_SIZE="
+            << (env_pool_size ? env_pool_size : "default") << ")" << std::endl;
+
+  slots_.reserve(pool_size_);
+  for (size_t i = 0; i < pool_size_; ++i) {
+    CPKVSlot slot;
+    slot.engine = std::make_unique<TRTCPKVEngine>(
+        engine_path, n_cp_layers, hidden_dim, n_heads, head_dim,
+        cp_vocab, cp_out_groups, max_past);
+    slot.mtx = std::make_unique<std::mutex>();
+    slots_.push_back(std::move(slot));
+    std::cout << "  Slot " << i << " created" << std::endl;
+  }
+}
+
+TRTCPKVEnginePool::~TRTCPKVEnginePool() {
+  std::cout << "  TRTCPKVEnginePool destroyed" << std::endl;
+}
+
+TRTCPKVEnginePool::SlotLease TRTCPKVEnginePool::AcquireSlot() {
+  size_t slot_idx = next_slot_.fetch_add(1) % pool_size_;
+  auto& slot = slots_[slot_idx];
+  return SlotLease(slot.engine.get(), slot.mtx.get());
+}
+
+void TRTCPKVEnginePool::LoadEmbedTable(const float* table, int n_layers, int vocab, int dim) {
+  for (auto& slot : slots_) {
+    slot.engine->LoadEmbedTable(table, n_layers, vocab, dim);
+  }
+  std::cout << "  CPKVPool: embed table loaded on all " << pool_size_ << " slots" << std::endl;
+}
+
+void TRTCPKVEnginePool::Warmup() {
+  std::cout << "  CPKVPool: warming up " << pool_size_ << " slots..." << std::endl;
+  for (size_t i = 0; i < pool_size_; ++i) {
+    auto lease = AcquireSlot();
+    auto* eng = lease.get();
+    eng->ResetInputShapes();
+
+    std::vector<float> hidden(1024, 0.0f);
+    std::vector<float> primary_emb(1024, 0.0f);
+    std::vector<int> codes_out(15, 0);
+
+    eng->RunFrameAutoregressive(
+        hidden.data(), primary_emb.data(), codes_out.data(),
+        nullptr, 0, 1);
+
+    std::cout << "  Slot " << i << " warmup done" << std::endl;
+  }
+  std::cout << "  CPKVPool: warmup complete" << std::endl;
+}
+
+void TRTCPKVEnginePool::EnableCPCudaGraph(bool enable) {
+  cp_cuda_graph_enabled_ = enable;
+  for (auto& slot : slots_) {
+    slot.engine->EnableCPCudaGraph(enable);
+  }
+}
+
+void TRTCPKVEnginePool::EnableProfiling(bool enable) {
+  for (auto& slot : slots_) {
+    slot.engine->EnableProfiling(enable);
+  }
 }
 
 // ===========================================================================

@@ -6,7 +6,9 @@
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +88,7 @@ class TRTTalkerEngine {
                   float* last_hidden);         // [1, 1, hidden_dim]
 
   void Reset();
+  void ResetCapturedEvents();
 
   // Profiling control
   void EnableProfiling(bool enable) { profiling_ = enable; }
@@ -306,6 +309,8 @@ class TRTCPKVEngine {
                 int cp_vocab = 2048, int cp_out_groups = 15, int max_past = 20);
   ~TRTCPKVEngine();
 
+  void ResetInputShapes();
+
   // Run CP for one codec frame (autoregressive):
   //   Step 0: prefill [hidden, primary_emb] (seq_len=2) → logits[0] → sample code[0]
   //   Step 1-14: decode [embed(code[j-1])] (seq_len=1) → logits[j] → sample code[j]
@@ -457,6 +462,73 @@ class TRTCPKVEngine {
   cudaEvent_t ev_start_ = nullptr;
   cudaEvent_t ev_kernel_done_ = nullptr;
   cudaEvent_t ev_d2h_done_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// TRT Code Predictor Engine Pool — multiple TRTCPKVEngine instances
+// Round-robin dispatch with per-slot mutex to mitigate TRT 10.3 Myelin bug.
+// ---------------------------------------------------------------------------
+class TRTCPKVEnginePool {
+ public:
+  struct CPKVSlot {
+    std::unique_ptr<TRTCPKVEngine> engine;
+    std::unique_ptr<std::mutex> mtx;
+  };
+
+  class SlotLease {
+   public:
+    SlotLease() : engine_(nullptr), mtx_(nullptr) {}
+    SlotLease(TRTCPKVEngine* engine, std::mutex* mtx)
+        : engine_(engine), mtx_(mtx) {
+      if (mtx_) mtx_->lock();
+    }
+    ~SlotLease() {
+      if (mtx_) mtx_->unlock();
+    }
+    TRTCPKVEngine* get() const { return engine_; }
+    TRTCPKVEngine* operator->() const { return engine_; }
+    SlotLease(const SlotLease&) = delete;
+    SlotLease& operator=(const SlotLease&) = delete;
+    SlotLease(SlotLease&& other) noexcept
+        : engine_(other.engine_), mtx_(other.mtx_) {
+      other.engine_ = nullptr;
+      other.mtx_ = nullptr;
+    }
+    SlotLease& operator=(SlotLease&& other) noexcept {
+      if (this != &other) {
+        if (mtx_) mtx_->unlock();
+        engine_ = other.engine_;
+        mtx_ = other.mtx_;
+        other.engine_ = nullptr;
+        other.mtx_ = nullptr;
+      }
+      return *this;
+    }
+   private:
+    TRTCPKVEngine* engine_;
+    std::mutex* mtx_;
+  };
+
+  TRTCPKVEnginePool(const std::string& engine_path, int n_cp_layers = 5,
+                    int hidden_dim = 1024, int n_heads = 8, int head_dim = 128,
+                    int cp_vocab = 2048, int cp_out_groups = 15, int max_past = 20);
+  ~TRTCPKVEnginePool();
+
+  SlotLease AcquireSlot();
+
+  void LoadEmbedTable(const float* table, int n_layers, int vocab, int dim);
+  void Warmup();
+
+  size_t pool_size() const { return pool_size_; }
+  bool cp_cuda_graph_enabled() const { return cp_cuda_graph_enabled_; }
+  void EnableCPCudaGraph(bool enable);
+  void EnableProfiling(bool enable);
+
+ private:
+  std::vector<CPKVSlot> slots_;
+  std::atomic<size_t> next_slot_{0};
+  size_t pool_size_;
+  bool cp_cuda_graph_enabled_ = false;
 };
 
 // ---------------------------------------------------------------------------

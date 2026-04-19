@@ -56,7 +56,7 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     if (cp_kv_test.good()) {
       cp_kv_test.close();
       std::cout << "  Found CP KV engine: " << cp_kv_path << std::endl;
-      cp_kv_ = std::make_unique<TRTCPKVEngine>(
+      cp_kv_pool_ = std::make_unique<TRTCPKVEnginePool>(
           cp_kv_path,
           5,                      // n_cp_layers
           cfg_.hidden_dim,        // 1024
@@ -67,8 +67,8 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
       );
     }
 
-    // Load old CP engine only when no CP KV engine is available.
-    if (!cp_kv_) {
+    // Load old CP engine only when no CP KV pool is available.
+    if (!cp_kv_pool_) {
       cp_ = std::make_unique<TRTCPEngine>(cp_engine_path, cfg_.hidden_dim,
                                           cfg_.cp_vocab);
       std::cout << "  No CP KV engine — loaded old context-copy CP" << std::endl;
@@ -439,6 +439,14 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
   using Clock = std::chrono::high_resolution_clock;
   SynthResult result;
 
+  TRTCPKVEnginePool::SlotLease cp_lease;
+  if (cp_kv_pool_) {
+    cp_lease = cp_kv_pool_->AcquireSlot();
+    cp_lease->ResetInputShapes();
+  }
+  TRTCPKVEngine* cp_kv = cp_lease.get();
+  if (talker_) talker_->ResetCapturedEvents();
+
   // Seed RNG: 0 = random (time-based), >0 = fixed seed
   if (seed == 0) {
     rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -554,7 +562,7 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
     std::vector<int> frame_codes = {primary_code};
 
-    if (cp_kv_) {
+    if (cp_kv) {
       // --- Autoregressive CP (with optional CUDA Graph) ---
       // Always use RunFrameAutoregressive: CPU sampling + CUDA Graph for
       // enqueueV3 eliminates TRT dispatch overhead. RunFrameGPU (GPU sampling)
@@ -563,7 +571,7 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       int n_groups = cfg_.cp_active_groups;
       // Allocate full-size buffer so engine can zero-fill inactive slots
       std::vector<int> cp_codes(n_groups_full, 0);
-      cp_kv_->RunFrameAutoregressive(
+      cp_kv->RunFrameAutoregressive(
           last_hidden.data(), primary_e_ptr, cp_codes.data(),
           cp_embed_table_.data(), cp_embed_vocab_, n_groups);
 
@@ -715,9 +723,9 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
         cp_embed_vocab_ = vocab;
         std::cout << "  cp_embed loaded from binary: " << bin_path
                   << " (" << expected / (1024*1024) << " MB)" << std::endl;
-        // Upload to GPU — only for the active CP engine
-        if (cp_kv_) {
-          cp_kv_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+        // Upload to GPU — only for the active CP engine/pool
+        if (cp_kv_pool_) {
+          cp_kv_pool_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
         } else if (cp_) {
           cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
         }
@@ -757,9 +765,9 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
   cp_embed_n_layers_ = n_layers;
   cp_embed_vocab_ = vocab;
 
-  // Upload to GPU — only for the active CP engine
-  if (cp_kv_) {
-    cp_kv_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+  // Upload to GPU — only for the active CP engine/pool
+  if (cp_kv_pool_) {
+    cp_kv_pool_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
   } else if (cp_) {
     cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
   }
@@ -818,10 +826,10 @@ void TTSPipeline::LoadCPEmbedTableINT8(const std::string& sherpa_dir) {
 
   cp_embed_use_int8_ = true;
 
-  // Only free FP32 table if cp_kv_ is NOT in use.
-  // cp_kv_->RunFrameAutoregressive takes cp_embed_table_.data() as a CPU pointer;
-  // if cp_kv_ exists, we keep FP32 for its use. INT8 is used for direct lookups only.
-  if (!cp_kv_) {
+  // Only free FP32 table if cp_kv_pool_ is NOT in use.
+  // cp_kv_pool_ RunFrameAutoregressive takes cp_embed_table_.data() as a CPU pointer;
+  // if cp_kv_pool_ exists, we keep FP32 for its use. INT8 is used for direct lookups only.
+  if (!cp_kv_pool_) {
     cp_embed_table_.clear();
     cp_embed_table_.shrink_to_fit();
   }
@@ -924,12 +932,12 @@ std::vector<float> TTSPipeline::ExtractSpeakerEmbedding(const float* mel,
 void TTSPipeline::EnableProfiling(bool enable) {
   if (talker_) talker_->EnableProfiling(enable);
   if (cp_) cp_->EnableProfiling(enable);
-  if (cp_kv_) cp_kv_->EnableProfiling(enable);
+  if (cp_kv_pool_) cp_kv_pool_->EnableProfiling(enable);
 }
 
 void TTSPipeline::EnableCudaGraph(bool enable) {
   if (talker_) talker_->EnableCudaGraph(enable);
-  if (cp_kv_) cp_kv_->EnableCPCudaGraph(enable);
+  if (cp_kv_pool_) cp_kv_pool_->EnableCPCudaGraph(enable);
 }
 
 void TTSPipeline::PrintProfilingStats() {
@@ -965,17 +973,21 @@ void TTSPipeline::PrintProfilingStats() {
               << std::endl;
     cp_->ResetStats();
   }
-  if (cp_kv_ && cp_kv_->stats().n_samples > 0) {
-    auto& s = cp_kv_->stats();
-    std::cout << "\n  === CP-KV PROFILING (" << s.n_samples << " frames) ==="
-              << std::endl;
-    std::cout << "  Kernel: avg=" << s.AvgKernel()
-              << " ms, max=" << s.max_kernel << " ms" << std::endl;
-    std::cout << "  D2H:    avg=" << s.AvgD2H() << " ms, max=" << s.max_d2h
-              << " ms" << std::endl;
-    std::cout << "  Total:  avg=" << s.AvgTotal()
-              << " ms, max=" << s.max_total << " ms" << std::endl;
-    cp_kv_->ResetStats();
+  // CP-KV pool stats: use slot 0 as representative (profiling typically disabled in prod)
+  if (cp_kv_pool_) {
+    auto lease = cp_kv_pool_->AcquireSlot();
+    auto& s = lease->stats();
+    if (s.n_samples > 0) {
+      std::cout << "\n  === CP-KV PROFILING (" << s.n_samples << " frames, slot 0) ==="
+                << std::endl;
+      std::cout << "  Kernel: avg=" << s.AvgKernel()
+                << " ms, max=" << s.max_kernel << " ms" << std::endl;
+      std::cout << "  D2H:    avg=" << s.AvgD2H() << " ms, max=" << s.max_d2h
+                << " ms" << std::endl;
+      std::cout << "  Total:  avg=" << s.AvgTotal()
+                << " ms, max=" << s.max_total << " ms" << std::endl;
+      lease->ResetStats();
+    }
   }
 }
 
@@ -1011,6 +1023,14 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
                                      const StreamConfig& config,
                                      AudioChunkCallback callback) {
   using Clock = std::chrono::high_resolution_clock;
+
+  TRTCPKVEnginePool::SlotLease cp_lease;
+  if (cp_kv_pool_) {
+    cp_lease = cp_kv_pool_->AcquireSlot();
+    cp_lease->ResetInputShapes();
+  }
+  TRTCPKVEngine* cp_kv = cp_lease.get();
+  if (talker_) talker_->ResetCapturedEvents();
 
   if (config.seed == 0) {
     rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -1116,12 +1136,12 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
 
     std::vector<int> frame_codes = {primary_code};
 
-    if (cp_kv_) {
+    if (cp_kv) {
       // --- GPU-resident autoregressive CP (dual-context, no CPU sync) ---
       int n_groups_full = cfg_.num_code_groups - 1;
       int n_groups = cfg_.cp_active_groups;
       std::vector<int> cp_codes(n_groups_full, 0);
-      cp_kv_->RunFrameAutoregressive(
+      cp_kv->RunFrameAutoregressive(
           last_hidden.data(), primary_e_ptr, cp_codes.data(),
           cp_embed_table_.data(), cp_embed_vocab_, n_groups);
 

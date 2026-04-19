@@ -184,7 +184,7 @@ class TTSPipeline {
   std::unique_ptr<ORTModels> ort_;
   std::unique_ptr<TRTTalkerEngine> talker_;
   std::unique_ptr<TRTCPEngine> cp_;
-  std::unique_ptr<TRTCPKVEngine> cp_kv_;           // optional KV-cache CP engine
+  std::unique_ptr<TRTCPKVEnginePool> cp_kv_pool_;   // CP engine pool for Myelin bug mitigation
   std::unique_ptr<TRTVocoderEngine> trt_vocoder_;  // optional TRT vocoder
 
   // CPU copy of cp_embed table: [n_layers][vocab][D]
