@@ -475,6 +475,13 @@ class TRTVocoderEngine {
   // Returns only the valid samples (trimmed using lengths output).
   std::vector<float> Run(const int64_t* codes, int n_frames, int n_groups);
 
+  // Warm up TRT tactic selection for common shapes at init time.
+  // For each n_frames, runs the vocoder once with zero-filled codes so TRT
+  // can pre-compile kernels for that shape. Eliminates ~150-350ms of
+  // first-request latency on streaming TTFT. Per-shape failures are caught
+  // and logged as warnings; constructor still succeeds.
+  void WarmupShapes(const std::vector<int>& frame_sizes, int n_groups = 16);
+
  private:
   TRTLogger logger_;
   std::unique_ptr<nvinfer1::IRuntime> runtime_;

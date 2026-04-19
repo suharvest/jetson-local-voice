@@ -1625,7 +1625,16 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   //
   // We warmup 2 steps before capturing to ensure TRT's internal state is
   // settled (first enqueueV3 after shape setup may trigger lazy init).
-  const bool use_cp_graph = use_cuda_graph_cp_;
+  //
+  // HOWEVER: single-head (and similar) engines have *per-step dynamic shape*:
+  // past_key.shape[2] grows from 2 to 14 across the decode loop, and
+  // shape-input scalars (past_length, gen_step) change every step too. TRT
+  // specializes kernels based on shape at capture time; replaying the same
+  // captured graph at a later j with a different shape silently runs the
+  // wrong kernels → causes output drift starting ~5 tokens in. Disable CP
+  // graph for now. (The unified single-profile engine with fixed shapes was
+  // the original target; dynamic-shape engines need graph-per-shape or none.)
+  const bool use_cp_graph = use_cuda_graph_cp_ && !has_past_length_input_;
 
   for (int j = 1; j < n_groups; ++j) {
     int actual_past = j + 1;  // for cache_pos and gen_step values
@@ -1659,6 +1668,13 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     // (Fixed-shape KV tried in a531f68 — output shape past+1 misaligns ping-pong
     // buffer reads, garbage output. See memory feedback_fixed_shape_kv_mask_bug.)
     if (has_past_length_input_) {
+      // Match ORT contract (export_cp_unified.py line 483-488 verify test):
+      // past_length = number of valid past KV entries BEFORE current query.
+      // At decode step j (1-indexed), there are actual_past valid entries in
+      // past_key; current query token lives at position actual_past. The
+      // exported mask does [0, past_length) padding + (past_kv_len+q, ...)
+      // future masking — with past_kv_len == past_length, padding window is
+      // empty, pure causal. See single-head CP codex analysis round 2.
       int64_t pl = (int64_t)actual_past;
       CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
                                  cudaMemcpyHostToDevice, stream_));
@@ -2131,6 +2147,37 @@ TRTVocoderEngine::TRTVocoderEngine(const std::string& engine_path,
             << " max_samples=" << max_samples
             << " out=[" << audio_values_name_ << "," << lengths_name_ << "]"
             << std::endl;
+
+  // Warm up common streaming shapes (first_chunk=5, chunk=25) so TRT tactic
+  // selection happens at init time instead of on first request.
+  WarmupShapes({5, 25}, 16);
+}
+
+void TRTVocoderEngine::WarmupShapes(const std::vector<int>& frame_sizes,
+                                    int n_groups) {
+  for (int n : frame_sizes) {
+    if (n <= 0 || n > max_frames_) {
+      std::cerr << "  Vocoder warmup skip n_frames=" << n
+                << " (out of range, max=" << max_frames_ << ")" << std::endl;
+      continue;
+    }
+    try {
+      std::vector<int64_t> codes((size_t)n * n_groups, 0);
+      auto t0 = std::chrono::high_resolution_clock::now();
+      (void)this->Run(codes.data(), n, n_groups);
+      auto t1 = std::chrono::high_resolution_clock::now();
+      double elapsed_ms =
+          std::chrono::duration<double, std::milli>(t1 - t0).count();
+      std::cout << "  Vocoder warmup n_frames=" << n << " took "
+                << elapsed_ms << " ms" << std::endl;
+    } catch (const std::exception& e) {
+      std::cerr << "  Vocoder warmup n_frames=" << n
+                << " failed (non-fatal): " << e.what() << std::endl;
+    } catch (...) {
+      std::cerr << "  Vocoder warmup n_frames=" << n
+                << " failed (non-fatal, unknown exception)" << std::endl;
+    }
+  }
 }
 
 TRTVocoderEngine::~TRTVocoderEngine() {
