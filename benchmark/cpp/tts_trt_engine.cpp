@@ -29,8 +29,10 @@
 // Logger
 // ---------------------------------------------------------------------------
 void TRTLogger::log(Severity severity, const char* msg) noexcept {
-  // VERBOSE temporarily enabled to trace Myelin "already loaded binary graph" bug.
-  if (severity <= Severity::kVERBOSE) {
+  // Gate VERBOSE behind TRT_VERBOSE=1 env var (default: WARNING level only)
+  const char* trt_verbose = std::getenv("TRT_VERBOSE");
+  bool allow_verbose = (trt_verbose && std::strcmp(trt_verbose, "1") == 0);
+  if (severity <= Severity::kWARNING || (allow_verbose && severity <= Severity::kVERBOSE)) {
     const char* prefix = "[TRT]";
     switch (severity) {
       case Severity::kINTERNAL_ERROR: prefix = "[TRT-IERR]"; break;
@@ -1462,17 +1464,18 @@ void TRTCPKVEngine::ResetInputShapes() {
                                cudaMemcpyHostToDevice, stream_));
   }
 
-  auto reset_ctx = [&](nvinfer1::IExecutionContext* ctx, void* cache_pos) {
+  auto reset_ctx = [&](nvinfer1::IExecutionContext* ctx, void* cache_pos, int profile_idx) {
     if (!ctx) return;
 
     static bool logged_profile_shapes = false;
     bool log_profile_shapes = !logged_profile_shapes;
     auto set_profile_min_shape = [&](const char* name) {
       auto dims = engine_->getProfileShape(
-          name, 0, nvinfer1::OptProfileSelector::kMIN);
+          name, profile_idx, nvinfer1::OptProfileSelector::kMIN);
       if (log_profile_shapes) {
         auto expected = engine_->getTensorShape(name);
         std::cerr << "[CPKV] ResetInputShapes: name=" << name
+                  << " profile=" << profile_idx
                   << " expected_nbDims=" << expected.nbDims
                   << " set_nbDims=" << dims.nbDims << std::endl;
       }
@@ -1505,10 +1508,10 @@ void TRTCPKVEngine::ResetInputShapes() {
   };
 
   if (has_dual_ctx_) {
-    reset_ctx(ctx_prefill_.get(), d_cache_pos_table_);
-    reset_ctx(ctx_decode_.get(), d_cache_pos_);
+    reset_ctx(ctx_prefill_.get(), d_cache_pos_table_, 0);
+    reset_ctx(ctx_decode_.get(), d_cache_pos_, 1);
   } else {
-    reset_ctx(context_.get(), d_cache_pos_);
+    reset_ctx(context_.get(), d_cache_pos_, 0);
   }
 }
 
@@ -2212,9 +2215,22 @@ TRTCPKVEnginePool::TRTCPKVEnginePool(const std::string& engine_path, int n_cp_la
                                       int hidden_dim, int n_heads, int head_dim,
                                       int cp_vocab, int cp_out_groups, int max_past) {
   const char* env_pool_size = std::getenv("CP_POOL_SIZE");
-  pool_size_ = env_pool_size ? std::atoi(env_pool_size) : 2;
-  if (pool_size_ < 1) pool_size_ = 1;
-
+  pool_size_ = 2;  // default
+  if (env_pool_size) {
+    try {
+      int parsed = std::stoi(env_pool_size);
+      if (parsed < 1 || parsed > 8) {
+        std::cerr << "  WARNING: CP_POOL_SIZE=" << parsed << " out of range [1,8], clamping to "
+                  << (parsed < 1 ? 1 : 8) << std::endl;
+        parsed = std::max(1, std::min(8, parsed));
+      }
+      pool_size_ = parsed;
+    } catch (const std::exception& e) {
+      std::cerr << "  WARNING: CP_POOL_SIZE='" << env_pool_size << "' invalid (" << e.what()
+                << "), using default 2" << std::endl;
+      pool_size_ = 2;
+    }
+  }
   std::cout << "  TRTCPKVEnginePool: creating " << pool_size_ << " slots (CP_POOL_SIZE="
             << (env_pool_size ? env_pool_size : "default") << ")" << std::endl;
 
@@ -2267,6 +2283,7 @@ void TRTCPKVEnginePool::Warmup() {
   std::cout << "  CPKVPool: warmup complete" << std::endl;
 }
 
+// NOTE: startup-only; not thread-safe against in-flight requests
 void TRTCPKVEnginePool::EnableCPCudaGraph(bool enable) {
   cp_cuda_graph_enabled_ = enable;
   for (auto& slot : slots_) {
@@ -2274,6 +2291,7 @@ void TRTCPKVEnginePool::EnableCPCudaGraph(bool enable) {
   }
 }
 
+// NOTE: startup-only; not thread-safe against in-flight requests
 void TRTCPKVEnginePool::EnableProfiling(bool enable) {
   for (auto& slot : slots_) {
     slot.engine->EnableProfiling(enable);

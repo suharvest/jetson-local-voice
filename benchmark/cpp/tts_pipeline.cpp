@@ -726,6 +726,7 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
         // Upload to GPU — only for the active CP engine/pool
         if (cp_kv_pool_) {
           cp_kv_pool_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+          cp_kv_pool_->Warmup();
         } else if (cp_) {
           cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
         }
@@ -768,6 +769,7 @@ void TTSPipeline::LoadCPEmbedTable(const std::string& sherpa_dir) {
   // Upload to GPU — only for the active CP engine/pool
   if (cp_kv_pool_) {
     cp_kv_pool_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
+    cp_kv_pool_->Warmup();
   } else if (cp_) {
     cp_->LoadEmbedTable(cp_embed_table_.data(), n_layers, vocab, D);
   }
@@ -974,6 +976,7 @@ void TTSPipeline::PrintProfilingStats() {
     cp_->ResetStats();
   }
   // CP-KV pool stats: use slot 0 as representative (profiling typically disabled in prod)
+  // TODO(cp-pool): aggregate stats across all slots
   if (cp_kv_pool_) {
     auto lease = cp_kv_pool_->AcquireSlot();
     auto& s = lease->stats();

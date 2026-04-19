@@ -309,7 +309,7 @@ class TRTCPKVEngine {
                 int cp_vocab = 2048, int cp_out_groups = 15, int max_past = 20);
   ~TRTCPKVEngine();
 
-  void ResetInputShapes();
+  void ResetInputShapes();  // NOTE: startup-only; not thread-safe against in-flight requests
 
   // Run CP for one codec frame (autoregressive):
   //   Step 0: prefill [hidden, primary_emb] (seq_len=2) → logits[0] → sample code[0]
@@ -343,6 +343,7 @@ class TRTCPKVEngine {
   // Only 2 graphs needed (fixed shapes, fixed KV addresses per parity).
   // First frame captures (with 2 warmup steps), all subsequent frames replay.
   // Sample kernel runs outside the graph (per-step params change).
+  // NOTE: startup-only; not thread-safe against in-flight requests
   void EnableCPCudaGraph(bool enable) {
     if (!enable && use_cuda_graph_cp_) FreeCPCudaGraphs();
     use_cuda_graph_cp_ = enable;
@@ -353,6 +354,7 @@ class TRTCPKVEngine {
   }
 
   // Profiling
+  // NOTE: startup-only; not thread-safe against in-flight requests
   void EnableProfiling(bool enable) { profiling_ = enable; }
   bool profiling() const { return profiling_; }
   const ProfilingStats& stats() const { return stats_; }
