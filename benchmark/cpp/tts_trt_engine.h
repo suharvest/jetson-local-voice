@@ -338,6 +338,8 @@ class TRTCPKVEngine {
   // but kept for potential future streaming use)
   void LoadEmbedTable(const float* table, int n_layers, int vocab, int dim);
   bool has_embed_table() const { return d_embed_table_ != nullptr; }
+  int cp_out_groups() const { return cp_out_groups_; }
+  int embed_vocab() const { return embed_vocab_; }
 
   // CUDA Graph for CP decode: per-(actual_past, parity) cache with 28 entries.
   // T1: Scalar inputs copied D2D from constant tables inside capture.
@@ -443,7 +445,8 @@ class TRTCPKVEngine {
 
   // CUDA Graph cache for CP decode steps: keyed by (actual_past, parity).
   // T1: Per-(actual_past, parity) graph cache with per-slot isolation.
-  // actual_past ranges from 2..15 (14 decode steps), parity 0..1 → 28 entries.
+  // actual_past ranges from 2..15 (14 decode steps), parity 0..1 → 14 entries per slot
+  // (parity deterministic per j, so only one per actual_past is ever used).
   // Scalar inputs (gen_step, past_length) copied D2D from constant tables
   // inside captured graph to avoid H2D inside capture.
   // Default true so pool Warmup() captures graphs at startup, before
@@ -468,8 +471,8 @@ class TRTCPKVEngine {
     cudaGraphExec_t exec = nullptr;
   };
   std::unordered_map<CPGraphKey, CPGraphEntry, CPGraphKeyHash> cp_graph_cache_;
-  int32_t* d_gen_step_table_ = nullptr;    // 28 entries: gen_step values
-  int32_t* d_past_length_table_ = nullptr; // 28 entries: past_length values
+  int64_t* d_gen_step_table_ = nullptr;    // 28 entries: gen_step values (int64 to match TRT binding)
+  int64_t* d_past_length_table_ = nullptr; // 28 entries: past_length values (int64 to match TRT binding)
   void FreeCPCudaGraphs();
 
   // Profiling
@@ -544,7 +547,7 @@ class TRTCPKVEnginePool {
   std::vector<CPKVSlot> slots_;
   std::atomic<size_t> next_slot_{0};
   size_t pool_size_;
-  bool cp_cuda_graph_enabled_ = false;
+  bool cp_cuda_graph_enabled_ = true;
 };
 
 // ---------------------------------------------------------------------------

@@ -1389,22 +1389,39 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
   // gen_step_table_[idx] = j (decode loop index, 1..14)
   // past_length_table_[idx] = actual_past = j+1 (2..15)
   // idx = (actual_past - 2) * 2 + parity, 28 entries total.
+  // Tables use int64_t to match TRT scalar binding dtype (INT64).
   {
-    CHECK_CUDA(cudaMalloc(&d_gen_step_table_, 28 * sizeof(int32_t)));
-    CHECK_CUDA(cudaMalloc(&d_past_length_table_, 28 * sizeof(int32_t)));
-    std::vector<int32_t> gen_step_vals(28);
-    std::vector<int32_t> past_len_vals(28);
+    if (is_single_head_) {
+      auto dtype = engine_->getTensorDataType("gen_step");
+      if (dtype != nvinfer1::DataType::kINT64) {
+        std::cerr << "[CPKV] ERROR: gen_step binding dtype is " << (int)dtype
+                  << ", expected INT64 (kINT64=8)" << std::endl;
+        std::abort();
+      }
+    }
+    if (has_past_length_input_) {
+      auto dtype = engine_->getTensorDataType("past_length");
+      if (dtype != nvinfer1::DataType::kINT64) {
+        std::cerr << "[CPKV] ERROR: past_length binding dtype is " << (int)dtype
+                  << ", expected INT64 (kINT64=8)" << std::endl;
+        std::abort();
+      }
+    }
+    CHECK_CUDA(cudaMalloc(&d_gen_step_table_, 28 * sizeof(int64_t)));
+    CHECK_CUDA(cudaMalloc(&d_past_length_table_, 28 * sizeof(int64_t)));
+    std::vector<int64_t> gen_step_vals(28);
+    std::vector<int64_t> past_len_vals(28);
     for (int j = 1; j <= 14; ++j) {
-      int actual_past = j + 1;  // 2..15
-      int parity = (j - 1) % 2; // 0..1
-      int idx = (actual_past - 2) * 2 + parity;  // 0..27
+      int actual_past = j + 1;
+      int parity = (j - 1) % 2;
+      int idx = (actual_past - 2) * 2 + parity;
       gen_step_vals[idx] = j;
       past_len_vals[idx] = actual_past;
     }
     CHECK_CUDA(cudaMemcpy(d_gen_step_table_, gen_step_vals.data(),
-                          28 * sizeof(int32_t), cudaMemcpyHostToDevice));
+                          28 * sizeof(int64_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_past_length_table_, past_len_vals.data(),
-                          28 * sizeof(int32_t), cudaMemcpyHostToDevice));
+                          28 * sizeof(int64_t), cudaMemcpyHostToDevice));
   }
 
   // T1: Check env var for CP graph enable/disable (default enabled)
@@ -1777,9 +1794,13 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     int idx = (actual_past - 2) * 2 + parity;
 
     if (!use_gpu_sample) {
-      const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
-      CHECK_CUDA(cudaMemcpyAsync(d_embeds_, emb, d_bytes,
-                                 cudaMemcpyHostToDevice, stream_));
+      if (embed_table) {
+        const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
+        CHECK_CUDA(cudaMemcpyAsync(d_embeds_, emb, d_bytes,
+                                   cudaMemcpyHostToDevice, stream_));
+      } else {
+        CHECK_CUDA(cudaMemsetAsync(d_embeds_, 0, d_bytes, stream_));
+      }
       int64_t pos1 = actual_past;
       CHECK_CUDA(cudaMemcpyAsync(d_cache_pos_, &pos1, sizeof(int64_t),
                                  cudaMemcpyHostToDevice, stream_));
@@ -1805,11 +1826,11 @@ void TRTCPKVEngine::RunFrameAutoregressive(
 
       if (is_single_head_) {
         CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &d_gen_step_table_[idx],
-                                   sizeof(int32_t), cudaMemcpyDeviceToDevice, stream_));
+                                   sizeof(int64_t), cudaMemcpyDeviceToDevice, stream_));
       }
       if (has_past_length_input_) {
         CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &d_past_length_table_[idx],
-                                   sizeof(int32_t), cudaMemcpyDeviceToDevice, stream_));
+                                   sizeof(int64_t), cudaMemcpyDeviceToDevice, stream_));
       }
 
       bool cap_ok = dctx->enqueueV3(stream_);
@@ -1821,6 +1842,17 @@ void TRTCPKVEngine::RunFrameAutoregressive(
         std::cerr << "[CPKV-AR] CUDA Graph capture FAILED! actual_past=" << actual_past
                   << " parity=" << parity << " cap_err=" << cap_err << std::endl;
         if (graph) cudaGraphDestroy(graph);
+        // Fallback: update scalars via H2D (outside capture) before plain enqueue
+        if (is_single_head_) {
+          int64_t gs = j;
+          CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                     cudaMemcpyHostToDevice, stream_));
+        }
+        if (has_past_length_input_) {
+          int64_t pl = (int64_t)actual_past;
+          CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
+                                     cudaMemcpyHostToDevice, stream_));
+        }
         ok = dctx->enqueueV3(stream_);
         if (!ok) {
           std::cerr << "[CPKV-AR] decode enqueueV3 FAILED after graph fallback!"
@@ -1836,6 +1868,17 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           std::cerr << "[CPKV-AR] CUDA Graph instantiate FAILED! actual_past=" << actual_past
                     << " parity=" << parity << " inst_err=" << inst_err << std::endl;
           cudaGraphDestroy(graph);
+          // Fallback: update scalars via H2D (outside capture) before plain enqueue
+          if (is_single_head_) {
+            int64_t gs = j;
+            CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                       cudaMemcpyHostToDevice, stream_));
+          }
+          if (has_past_length_input_) {
+            int64_t pl = (int64_t)actual_past;
+            CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
+                                       cudaMemcpyHostToDevice, stream_));
+          }
           ok = dctx->enqueueV3(stream_);
           if (!ok) {
             std::cerr << "[CPKV-AR] decode enqueueV3 FAILED after instantiate fallback!"
@@ -2235,6 +2278,12 @@ void TRTCPKVEngine::LoadEmbedTable(const float* table, int n_layers, int vocab,
 TRTCPKVEnginePool::TRTCPKVEnginePool(const std::string& engine_path, int n_cp_layers,
                                       int hidden_dim, int n_heads, int head_dim,
                                       int cp_vocab, int cp_out_groups, int max_past) {
+  // Check CP_GRAPH env var to disable CUDA Graph at pool level
+  const char* cp_graph_env = std::getenv("CP_GRAPH");
+  if (cp_graph_env && std::string(cp_graph_env) == "0") {
+    cp_cuda_graph_enabled_ = false;
+  }
+
   const char* env_pool_size = std::getenv("CP_POOL_SIZE");
   pool_size_ = 2;  // default
   if (env_pool_size) {
@@ -2303,13 +2352,14 @@ void TRTCPKVEnginePool::Warmup() {
     std::vector<int> codes_out(15, 0);
 
     if (full_warmup && cp_cuda_graph_enabled_) {
-      // T1: Full warmup — run all 14 decode steps to capture all 28 graphs.
-      // RunFrameAutoregressive with n_groups=15 will capture graphs for
-      // actual_past 2..15 with parity 0..1 (28 entries total).
+      // T1: Full warmup — run all 14 decode steps to capture all 14 graphs per slot.
+      // Pass cp_out_groups_ (15) as active_groups to trigger all decode steps.
+      // The embed table is already loaded via LoadEmbedTable() before Warmup().
+      // For GPU sampling path, d_embed_table_ is used; for CPU path, nullptr is fine.
       eng->RunFrameAutoregressive(
           hidden.data(), primary_emb.data(), codes_out.data(),
-          nullptr, 0, 1);
-      std::cout << "  Slot " << i << " full warmup done (28 graphs captured)" << std::endl;
+          nullptr, 0, eng->cp_out_groups());
+      std::cout << "  Slot " << i << " full warmup done (14 graphs captured)" << std::endl;
     } else {
       // Lazy warmup — single run (graphs captured on first use)
       eng->RunFrameAutoregressive(
