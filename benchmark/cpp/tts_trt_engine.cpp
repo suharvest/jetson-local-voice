@@ -1385,6 +1385,34 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
                           max_past_ * sizeof(int64_t), cudaMemcpyHostToDevice));
   }
 
+  // T1: Allocate constant tables for D2D copy inside CUDA Graph capture.
+  // gen_step_table_[idx] = j (decode loop index, 1..14)
+  // past_length_table_[idx] = actual_past = j+1 (2..15)
+  // idx = (actual_past - 2) * 2 + parity, 28 entries total.
+  {
+    CHECK_CUDA(cudaMalloc(&d_gen_step_table_, 28 * sizeof(int32_t)));
+    CHECK_CUDA(cudaMalloc(&d_past_length_table_, 28 * sizeof(int32_t)));
+    std::vector<int32_t> gen_step_vals(28);
+    std::vector<int32_t> past_len_vals(28);
+    for (int j = 1; j <= 14; ++j) {
+      int actual_past = j + 1;  // 2..15
+      int parity = (j - 1) % 2; // 0..1
+      int idx = (actual_past - 2) * 2 + parity;  // 0..27
+      gen_step_vals[idx] = j;
+      past_len_vals[idx] = actual_past;
+    }
+    CHECK_CUDA(cudaMemcpy(d_gen_step_table_, gen_step_vals.data(),
+                          28 * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_past_length_table_, past_len_vals.data(),
+                          28 * sizeof(int32_t), cudaMemcpyHostToDevice));
+  }
+
+  // T1: Check env var for CP graph enable/disable (default enabled)
+  const char* cp_graph_env = std::getenv("CP_GRAPH");
+  if (cp_graph_env && std::string(cp_graph_env) == "0") {
+    cp_graph_enabled_ = false;
+  }
+
   // Step-sync event for GPU sampling path (lightweight, no timing overhead)
   CHECK_CUDA(cudaEventCreateWithFlags(&ev_step_sync_, cudaEventDisableTiming));
 
@@ -1404,17 +1432,15 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
 }
 
 void TRTCPKVEngine::FreeCPCudaGraphs() {
-  for (int p = 0; p < 2; ++p) {
-    if (cp_graph_exec_[p]) {
-      cudaGraphExecDestroy(cp_graph_exec_[p]);
-      cp_graph_exec_[p] = nullptr;
+  for (auto& [key, entry] : cp_graph_cache_) {
+    if (entry.exec) {
+      cudaGraphExecDestroy(entry.exec);
     }
-    if (cp_graph_[p]) {
-      cudaGraphDestroy(cp_graph_[p]);
-      cp_graph_[p] = nullptr;
+    if (entry.graph) {
+      cudaGraphDestroy(entry.graph);
     }
-    cp_graph_captured_[p] = false;
   }
+  cp_graph_cache_.clear();
 }
 
 TRTCPKVEngine::~TRTCPKVEngine() {
@@ -1433,6 +1459,8 @@ TRTCPKVEngine::~TRTCPKVEngine() {
   if (d_cache_pos_table_) cudaFree(d_cache_pos_table_);
   if (d_cache_pos_single_) cudaFree(d_cache_pos_single_);
   if (d_past_length_) cudaFree(d_past_length_);
+  if (d_gen_step_table_) cudaFree(d_gen_step_table_);
+  if (d_past_length_table_) cudaFree(d_past_length_table_);
   if (ev_step_sync_) cudaEventDestroy(ev_step_sync_);
   if (ev_start_) cudaEventDestroy(ev_start_);
   if (ev_kernel_done_) cudaEventDestroy(ev_kernel_done_);
@@ -1735,54 +1763,28 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   // shape-input scalars (past_length, gen_step) change every step too. TRT
   // specializes kernels based on shape at capture time; replaying the same
   // captured graph at a later j with a different shape silently runs the
-  // wrong kernels → causes output drift starting ~5 tokens in. Disable CP
-  // graph for now. (The unified single-profile engine with fixed shapes was
-  // the original target; dynamic-shape engines need graph-per-shape or none.)
-  const bool use_cp_graph = use_cuda_graph_cp_ && !has_past_length_input_;
+  // wrong kernels → causes output drift starting ~5 tokens in.
+  //
+  // T1 SOLUTION: Cache graphs per-(actual_past, parity) with 28 entries.
+  // Scalar inputs (gen_step, past_length) copied D2D from constant tables
+  // inside captured graph to avoid H2D inside capture.
+  const bool use_cp_graph = use_cuda_graph_cp_ && cp_graph_enabled_;
 
   for (int j = 1; j < n_groups; ++j) {
-    int actual_past = j + 1;  // for cache_pos and gen_step values
-    int parity = (j - 1) % 2;  // 0 for odd j, 1 for even j
+    int actual_past = j + 1;
+    int parity = (j - 1) % 2;
+    CPGraphKey key{actual_past, parity};
+    int idx = (actual_past - 2) * 2 + parity;
 
     if (!use_gpu_sample) {
-      // CPU path: upload embed + cache_pos from host
       const float* emb = embed_table + ((size_t)(j - 1) * embed_vocab + codes_out[j - 1]) * D;
       CHECK_CUDA(cudaMemcpyAsync(d_embeds_, emb, d_bytes,
                                  cudaMemcpyHostToDevice, stream_));
       int64_t pos1 = actual_past;
       CHECK_CUDA(cudaMemcpyAsync(d_cache_pos_, &pos1, sizeof(int64_t),
                                  cudaMemcpyHostToDevice, stream_));
-      if (is_single_head_) {
-        int64_t gs = j;
-        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
-                                   cudaMemcpyHostToDevice, stream_));
-      }
-    } else {
-      // GPU path: embed and cache_pos already written by previous sample kernel.
-      if (is_single_head_) {
-        int64_t gs = j;
-        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
-                                   cudaMemcpyHostToDevice, stream_));
-      }
     }
 
-    // Update past_key/past_value shape AND ping-pong addresses per step.
-    // Engines with dynamic past_key dim require per-step setInputShape
-    // regardless of whether past_length scalar is also present.
-    // (Fixed-shape KV tried in a531f68 — output shape past+1 misaligns ping-pong
-    // buffer reads, garbage output. See memory feedback_fixed_shape_kv_mask_bug.)
-    if (has_past_length_input_) {
-      // Match ORT contract (export_cp_unified.py line 483-488 verify test):
-      // past_length = number of valid past KV entries BEFORE current query.
-      // At decode step j (1-indexed), there are actual_past valid entries in
-      // past_key; current query token lives at position actual_past. The
-      // exported mask does [0, past_length) padding + (past_kv_len+q, ...)
-      // future masking — with past_kv_len == past_length, padding window is
-      // empty, pure causal. See single-head CP codex analysis round 2.
-      int64_t pl = (int64_t)actual_past;
-      CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
-                                 cudaMemcpyHostToDevice, stream_));
-    }
     for (int i = 0; i < n_cp_layers_; ++i) {
       dctx->setInputShape(cp_kv_names_[2*i].c_str(),
                           nvinfer1::Dims4{1, n_heads_, actual_past, head_dim_});
@@ -1794,28 +1796,31 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       dctx->setTensorAddress(cp_new_kv_names_[2*i+1].c_str(), (*kv_write)[2*i+1]);
     }
 
-    if (use_cp_graph && cp_graph_captured_[parity]) {
-      // ---- Fast path: replay captured CUDA Graph (enqueueV3 only) ----
-      CHECK_CUDA(cudaGraphLaunch(cp_graph_exec_[parity], stream_));
-    } else if (use_cp_graph && !cp_graph_captured_[parity] && j >= 3) {
-      // ---- Capture path: j=3 captures parity 0, j=4 captures parity 1 ----
-      // Drain stream before capture to ensure all prior work is complete.
+    auto it = cp_graph_cache_.find(key);
+    if (use_cp_graph && it != cp_graph_cache_.end() && it->second.exec) {
+      CHECK_CUDA(cudaGraphLaunch(it->second.exec, stream_));
+    } else if (use_cp_graph) {
       CHECK_CUDA(cudaStreamSynchronize(stream_));
       CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
 
-      // enqueueV3 inside capture — TRT GPU kernels are recorded into the graph.
-      // The sample kernel is NOT captured (its parameters change per step).
+      if (is_single_head_) {
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &d_gen_step_table_[idx],
+                                   sizeof(int32_t), cudaMemcpyDeviceToDevice, stream_));
+      }
+      if (has_past_length_input_) {
+        CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &d_past_length_table_[idx],
+                                   sizeof(int32_t), cudaMemcpyDeviceToDevice, stream_));
+      }
+
       bool cap_ok = dctx->enqueueV3(stream_);
 
       cudaGraph_t graph = nullptr;
-      CHECK_CUDA(cudaStreamEndCapture(stream_, &graph));
+      cudaError_t cap_err = cudaStreamEndCapture(stream_, &graph);
 
-      if (!cap_ok || !graph) {
-        std::cerr << "[CPKV-AR] CUDA Graph capture FAILED! step=" << j
-                  << " parity=" << parity << std::endl;
-        // Fallback: run normal enqueueV3 for this step
+      if (!cap_ok || cap_err != cudaSuccess || !graph) {
+        std::cerr << "[CPKV-AR] CUDA Graph capture FAILED! actual_past=" << actual_past
+                  << " parity=" << parity << " cap_err=" << cap_err << std::endl;
         if (graph) cudaGraphDestroy(graph);
-        // Re-run the step without graph (capture consumed the enqueueV3)
         ok = dctx->enqueueV3(stream_);
         if (!ok) {
           std::cerr << "[CPKV-AR] decode enqueueV3 FAILED after graph fallback!"
@@ -1823,17 +1828,39 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           std::abort();
         }
       } else {
-        cp_graph_[parity] = graph;
-        CHECK_CUDA(cudaGraphInstantiate(&cp_graph_exec_[parity],
-                                        cp_graph_[parity], nullptr, nullptr, 0));
-        cp_graph_captured_[parity] = true;
-        // Launch the just-captured graph to produce this step's results
-        CHECK_CUDA(cudaGraphLaunch(cp_graph_exec_[parity], stream_));
-        std::cout << "[CPKV-AR] Captured CUDA Graph for parity " << parity
-                  << " at step " << j << std::endl;
+        CPGraphEntry entry;
+        entry.graph = graph;
+        cudaGraphExec_t exec = nullptr;
+        cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+        if (inst_err != cudaSuccess || !exec) {
+          std::cerr << "[CPKV-AR] CUDA Graph instantiate FAILED! actual_past=" << actual_past
+                    << " parity=" << parity << " inst_err=" << inst_err << std::endl;
+          cudaGraphDestroy(graph);
+          ok = dctx->enqueueV3(stream_);
+          if (!ok) {
+            std::cerr << "[CPKV-AR] decode enqueueV3 FAILED after instantiate fallback!"
+                      << std::endl;
+            std::abort();
+          }
+        } else {
+          entry.exec = exec;
+          cp_graph_cache_[key] = entry;
+          CHECK_CUDA(cudaGraphLaunch(exec, stream_));
+          std::cout << "[CPKV-AR] Captured CUDA Graph for (actual_past=" << actual_past
+                    << ", parity=" << parity << ") idx=" << idx << std::endl;
+        }
       }
     } else {
-      // ---- Normal path: enqueueV3 (warmup steps j=1,2, or graph disabled) ----
+      if (is_single_head_) {
+        int64_t gs = j;
+        CHECK_CUDA(cudaMemcpyAsync(d_gen_step_, &gs, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
+      if (has_past_length_input_) {
+        int64_t pl = (int64_t)actual_past;
+        CHECK_CUDA(cudaMemcpyAsync(d_past_length_, &pl, sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream_));
+      }
       ok = dctx->enqueueV3(stream_);
       if (!ok) {
         std::cerr << "[CPKV-AR] decode enqueueV3 FAILED! step=" << j
@@ -1843,11 +1870,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       }
     }
 
-    // ---- Post-enqueueV3: sample and prepare next step's input ----
-    // This runs AFTER the graph launch (or normal enqueueV3) on the same stream,
-    // so CUDA ordering guarantees logits are ready.
     if (use_gpu_sample) {
-      // GPU sample kernel: reads logits, writes embed + code + cache_pos
       const void* logits_ptr;
       if (is_single_head_) {
         logits_ptr = d_logits_decode_;
@@ -1866,8 +1889,6 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
           rng_seed, rng_counter_++);
-      // Sync after sample: dynamic past_len changes on next step, TRT
-      // enqueueV3 needs a quiescent stream.
       CHECK_CUDA(cudaStreamSynchronize(stream_));
     } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
@@ -2265,6 +2286,13 @@ void TRTCPKVEnginePool::LoadEmbedTable(const float* table, int n_layers, int voc
 
 void TRTCPKVEnginePool::Warmup() {
   std::cout << "  CPKVPool: warming up " << pool_size_ << " slots..." << std::endl;
+
+  const char* warmup_env = std::getenv("CP_GRAPH_WARMUP");
+  bool full_warmup = true;
+  if (warmup_env && std::string(warmup_env) == "lazy") {
+    full_warmup = false;
+  }
+
   for (size_t i = 0; i < pool_size_; ++i) {
     auto lease = AcquireSlot();
     auto* eng = lease.get();
@@ -2274,13 +2302,23 @@ void TRTCPKVEnginePool::Warmup() {
     std::vector<float> primary_emb(1024, 0.0f);
     std::vector<int> codes_out(15, 0);
 
-    eng->RunFrameAutoregressive(
-        hidden.data(), primary_emb.data(), codes_out.data(),
-        nullptr, 0, 1);
-
-    std::cout << "  Slot " << i << " warmup done" << std::endl;
+    if (full_warmup && cp_cuda_graph_enabled_) {
+      // T1: Full warmup — run all 14 decode steps to capture all 28 graphs.
+      // RunFrameAutoregressive with n_groups=15 will capture graphs for
+      // actual_past 2..15 with parity 0..1 (28 entries total).
+      eng->RunFrameAutoregressive(
+          hidden.data(), primary_emb.data(), codes_out.data(),
+          nullptr, 0, 1);
+      std::cout << "  Slot " << i << " full warmup done (28 graphs captured)" << std::endl;
+    } else {
+      // Lazy warmup — single run (graphs captured on first use)
+      eng->RunFrameAutoregressive(
+          hidden.data(), primary_emb.data(), codes_out.data(),
+          nullptr, 0, 1);
+      std::cout << "  Slot " << i << " lazy warmup done" << std::endl;
+    }
   }
-  std::cout << "  CPKVPool: warmup complete" << std::endl;
+  std::cout << "  CPKVPool: warmup complete (mode=" << (full_warmup ? "full" : "lazy") << ")" << std::endl;
 }
 
 // NOTE: startup-only; not thread-safe against in-flight requests

@@ -339,19 +339,16 @@ class TRTCPKVEngine {
   void LoadEmbedTable(const float* table, int n_layers, int vocab, int dim);
   bool has_embed_table() const { return d_embed_table_ != nullptr; }
 
-  // CUDA Graph for CP decode: captures enqueueV3 (TRT kernels) per parity.
-  // Only 2 graphs needed (fixed shapes, fixed KV addresses per parity).
-  // First frame captures (with 2 warmup steps), all subsequent frames replay.
-  // Sample kernel runs outside the graph (per-step params change).
+  // CUDA Graph for CP decode: per-(actual_past, parity) cache with 28 entries.
+  // T1: Scalar inputs copied D2D from constant tables inside capture.
   // NOTE: startup-only; not thread-safe against in-flight requests
   void EnableCPCudaGraph(bool enable) {
-    if (!enable && use_cuda_graph_cp_) FreeCPCudaGraphs();
+    if (!enable) FreeCPCudaGraphs();
     use_cuda_graph_cp_ = enable;
+    cp_graph_enabled_ = enable;
   }
-  bool cp_cuda_graph_enabled() const { return use_cuda_graph_cp_; }
-  bool cp_cuda_graph_captured() const {
-    return cp_graph_captured_[0] && cp_graph_captured_[1];
-  }
+  bool cp_cuda_graph_enabled() const { return use_cuda_graph_cp_ && cp_graph_enabled_; }
+  size_t cp_graph_cache_size() const { return cp_graph_cache_.size(); }
 
   // Profiling
   // NOTE: startup-only; not thread-safe against in-flight requests
@@ -444,18 +441,32 @@ class TRTCPKVEngine {
   // with fixed-shape decode that eliminates inter-step sync).
   cudaEvent_t ev_step_sync_ = nullptr;
 
-  // CUDA Graph for CP decode steps: 2 graphs (one per KV parity).
-  // CP shapes are FIXED (fixed_past = max_past_ - 1 = 19), so we only need
-  // 2 graphs (one per ping-pong parity), captured once and replayed forever.
-  // Each graph captures ONLY enqueueV3 (TRT kernels) for one decode step.
-  // Sample kernel runs outside the graph (per-step parameters change).
-  // H2D copies (gen_step, embed, cache_pos) happen OUTSIDE the graph.
-  // Graph addresses are baked at capture time — this works because each parity
-  // always reads/writes the same KV buffer pair (a_↔b_ or b_↔a_).
+  // CUDA Graph cache for CP decode steps: keyed by (actual_past, parity).
+  // T1: Per-(actual_past, parity) graph cache with per-slot isolation.
+  // actual_past ranges from 2..15 (14 decode steps), parity 0..1 → 28 entries.
+  // Scalar inputs (gen_step, past_length) copied D2D from constant tables
+  // inside captured graph to avoid H2D inside capture.
   bool use_cuda_graph_cp_ = false;
-  cudaGraph_t cp_graph_[2] = {nullptr, nullptr};
-  cudaGraphExec_t cp_graph_exec_[2] = {nullptr, nullptr};
-  bool cp_graph_captured_[2] = {false, false};
+  std::atomic<bool> cp_graph_enabled_{true};
+  struct CPGraphKey {
+    int actual_past;
+    int parity;
+    bool operator==(const CPGraphKey& o) const {
+      return actual_past == o.actual_past && parity == o.parity;
+    }
+  };
+  struct CPGraphKeyHash {
+    size_t operator()(const CPGraphKey& k) const {
+      return std::hash<int>()(k.actual_past * 4 + k.parity);
+    }
+  };
+  struct CPGraphEntry {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+  };
+  std::unordered_map<CPGraphKey, CPGraphEntry, CPGraphKeyHash> cp_graph_cache_;
+  int32_t* d_gen_step_table_ = nullptr;    // 28 entries: gen_step values
+  int32_t* d_past_length_table_ = nullptr; // 28 entries: past_length values
   void FreeCPCudaGraphs();
 
   // Profiling
