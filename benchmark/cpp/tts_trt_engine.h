@@ -446,7 +446,10 @@ class TRTCPKVEngine {
   // actual_past ranges from 2..15 (14 decode steps), parity 0..1 → 28 entries.
   // Scalar inputs (gen_step, past_length) copied D2D from constant tables
   // inside captured graph to avoid H2D inside capture.
-  bool use_cuda_graph_cp_ = false;
+  // Default true so pool Warmup() captures graphs at startup, before
+  // Python EnableCPCudaGraph(True) would flip it. Python toggles still work;
+  // CP_GRAPH=0 env var gates cp_graph_enabled_ as kill switch.
+  bool use_cuda_graph_cp_ = true;
   std::atomic<bool> cp_graph_enabled_{true};
   struct CPGraphKey {
     int actual_past;
