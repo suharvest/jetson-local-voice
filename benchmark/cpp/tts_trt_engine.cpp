@@ -1650,16 +1650,20 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
   }
 
-  // ---- Zero KV buffers to prevent stale data from affecting attention ----
-  // With fixed-shape decode, attention processes all fixed_past entries.
-  // Entries beyond actual past_len must be zero so they don't contribute
-  // meaningful attention weights (zero KV → exp(0) softmax, mild dilution
-  // that's acceptable for this 5-layer model).
-  {
-    size_t kv_buf_size = (size_t)n_heads_ * max_past_ * head_dim_ * kv_elem_bytes_;
-    for (int i = 0; i < 2 * n_cp_layers_; ++i) {
-      CHECK_CUDA(cudaMemsetAsync(d_kv_a_[i], 0, kv_buf_size, stream_));
-      CHECK_CUDA(cudaMemsetAsync(d_kv_b_[i], 0, kv_buf_size, stream_));
+  // T6: Skip KV zero for dynamic past_length engines — each decode step sets
+  // past_key.shape[2] = actual_past, so padding region is never indexed.
+  if (!has_past_length_input_) {
+    // ---- Zero KV buffers to prevent stale data from affecting attention ----
+    // With fixed-shape decode, attention processes all fixed_past entries.
+    // Entries beyond actual past_len must be zero so they don't contribute
+    // meaningful attention weights (zero KV → exp(0) softmax, mild dilution
+    // that's acceptable for this 5-layer model).
+    {
+      size_t kv_buf_size = (size_t)n_heads_ * max_past_ * head_dim_ * kv_elem_bytes_;
+      for (int i = 0; i < 2 * n_cp_layers_; ++i) {
+        CHECK_CUDA(cudaMemsetAsync(d_kv_a_[i], 0, kv_buf_size, stream_));
+        CHECK_CUDA(cudaMemsetAsync(d_kv_b_[i], 0, kv_buf_size, stream_));
+      }
     }
   }
 
