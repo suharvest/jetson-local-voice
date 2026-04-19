@@ -750,7 +750,10 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
                                (size_t)seq_len * vocab_size_ * logits_elem_bytes,
                                cudaMemcpyDeviceToHost, stream_));
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-    CHECK_CUDA(cudaStreamSynchronize(stream_));
+    // Event sync (not stream sync): stream sync drains unrelated trailing
+    // stream work → +27ms on Talker prefill. See commit history around
+    // Myelin-bug investigation where this was inadvertently left flipped.
+    CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
 
     bool is_bf16 = (logits_dtype == nvinfer1::DataType::kBF16);
     for (size_t j = 0; j < (size_t)seq_len * vocab_size_; ++j) {
@@ -781,7 +784,8 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
                                  (size_t)seq_len * hidden_dim_ * hidden_elem_bytes,
                                  cudaMemcpyDeviceToHost, stream_));
       CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
-      CHECK_CUDA(cudaStreamSynchronize(stream_));
+      // Event sync (see note above on the logits path).
+      CHECK_CUDA(cudaEventSynchronize(ev_d2h_done_));
       bool is_bf16 = (hidden_dtype == nvinfer1::DataType::kBF16);
       for (size_t j = 0; j < (size_t)seq_len * hidden_dim_; ++j) {
         if (is_bf16) {
