@@ -45,6 +45,11 @@ ROLLBACK_TOKENS = 3
 EOS_CONFIRM_COUNT = 2
 STREAMING_MAX_TOKENS = 4
 
+# Left-context parameters (P4 streaming)
+LEFT_CONTEXT_SEC = 1.0
+LEFT_CONTEXT_SAMPLES = int(LEFT_CONTEXT_SEC * 16000)
+ENCODER_DOWNSAMPLE_RATIO = 0.13  # enc_time = mel_time * 0.13 (measured)
+
 # Long-audio VAD split parameters (Qwen3-ASR emits premature '。'+EOS after
 # ~6.5s of continuous speech; split longer audio at silence to stay under
 # the safe boundary and avoid deterministic truncation.)
@@ -221,6 +226,9 @@ class Qwen3StreamingASRStream(ASRStream):
         # Audio buffer (accumulates until chunk_size)
         self._sample_buf = np.array([], dtype=np.float32)
 
+        # Left-context ring buffer (last 1.0s of raw samples for chunk boundary)
+        self._left_context = np.array([], dtype=np.float32)
+
         # Encoder embeddings buffer. No maxlen — sliding window is enforced
         # by explicit popleft() in _process_chunk (only when not is_final),
         # so finalize() sees all chunks. maxlen= would silently auto-evict
@@ -242,6 +250,7 @@ class Qwen3StreamingASRStream(ASRStream):
         # Speculative encoding
         self._spec_embd = None
         self._spec_audio_len = 0
+        self._spec_left_context = None
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if samples.dtype != np.float32:
@@ -259,11 +268,14 @@ class Qwen3StreamingASRStream(ASRStream):
 
         # Speculative encoding: pre-encode if buffer >= 50% chunk but not yet full
         min_spec = self._chunk_size_samples // 2
+        use_left_context = len(self._left_context) >= LEFT_CONTEXT_SAMPLES // 2
         if (len(self._sample_buf) >= min_spec
                 and len(self._sample_buf) != self._spec_audio_len
                 and len(self._sample_buf) < self._chunk_size_samples):
-            self._spec_embd = self._run_encoder(self._sample_buf)
+            context = self._left_context if use_left_context else None
+            self._spec_embd = self._run_encoder(self._sample_buf, context_audio=context)
             self._spec_audio_len = len(self._sample_buf)
+            self._spec_left_context = self._left_context.copy() if use_left_context else None
 
         # Process complete chunks
         while len(self._sample_buf) >= self._chunk_size_samples:
@@ -278,13 +290,17 @@ class Qwen3StreamingASRStream(ASRStream):
         """Pre-encode tail buffer so finalize() only needs to decode."""
         if len(self._sample_buf) == 0:
             return
-        # Already speculatively encoded with matching length?
+        # Already speculatively encoded with matching length and context?
+        use_left_context = len(self._left_context) >= LEFT_CONTEXT_SAMPLES // 2
         if (self._spec_embd is not None
-                and self._spec_audio_len == len(self._sample_buf)):
+                and self._spec_audio_len == len(self._sample_buf)
+                and (self._spec_left_context is not None or not use_left_context)):
             return
-        # Encode the tail buffer now
-        self._spec_embd = self._run_encoder(self._sample_buf)
+        # Encode the tail buffer now with left context
+        context = self._left_context if use_left_context else None
+        self._spec_embd = self._run_encoder(self._sample_buf, context_audio=context)
         self._spec_audio_len = len(self._sample_buf)
+        self._spec_left_context = self._left_context.copy() if use_left_context else None
 
     def finalize(self) -> str:
         # Flush remaining buffer
@@ -301,11 +317,39 @@ class Qwen3StreamingASRStream(ASRStream):
         )
         return all_text.strip()
 
-    def _run_encoder(self, audio_chunk: np.ndarray) -> np.ndarray:
-        """Encode a single audio chunk via ORT. Returns [1, T', 1024]."""
-        mel = self._backend._compute_mel(audio_chunk)  # [1, 128, T]
-        enc_out = self._backend._encoder.run(None, {"mel": mel})[0]  # [1, T', 1024]
-        return enc_out
+    def _run_encoder(self, audio_chunk: np.ndarray, context_audio: np.ndarray | None = None) -> np.ndarray:
+        """Encode audio chunk via ORT with optional left context.
+
+        If context_audio is provided, encode (context + chunk) as a single window,
+        then trim encoder output to remove context-derived frames.
+
+        Args:
+            audio_chunk: New audio samples [N]
+            context_audio: Optional left-context samples [C] (typically 16000 for 1s)
+
+        Returns:
+            Encoder output [1, T', 1024] for just the new audio portion
+        """
+        if context_audio is not None and len(context_audio) > 0:
+            full_audio = np.concatenate([context_audio, audio_chunk])
+            mel = self._backend._compute_mel(full_audio)
+            enc_out = self._backend._encoder.run(None, {"mel": mel})[0]
+
+            context_samples = len(context_audio)
+            hop_length = 160
+            context_mel_frames = context_samples / hop_length
+            context_enc_frames = int(context_mel_frames * ENCODER_DOWNSAMPLE_RATIO)
+
+            if context_enc_frames > 0 and enc_out.shape[1] > context_enc_frames:
+                logger.debug("Trim encoder: full=%d, context=%d, keep=%d frames",
+                             enc_out.shape[1], context_enc_frames,
+                             enc_out.shape[1] - context_enc_frames)
+                enc_out = enc_out[:, context_enc_frames:, :]
+            return enc_out
+        else:
+            mel = self._backend._compute_mel(audio_chunk)
+            enc_out = self._backend._encoder.run(None, {"mel": mel})[0]
+            return enc_out
 
     def _decode_window(self, all_embd: np.ndarray, max_tokens: int = STREAMING_MAX_TOKENS) -> str | None:
         """Prefill + decode on concatenated window embeddings.
@@ -420,22 +464,35 @@ class Qwen3StreamingASRStream(ASRStream):
             text = text.split("<asr_text>", 1)[1]
         return text.strip()
 
-    def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
-        """Encode chunk, decode with sliding window, update output state."""
+def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
+        """Encode chunk with left context, decode with sliding window, update output state."""
         chunk_sec = len(audio_chunk) / 16000
         self._total_audio_s += chunk_sec
         self._n_chunks += 1
 
-        # 1. Encode (reuse speculative embedding if it matches this chunk)
+        # 1. Encode with left-context (reuse speculative embedding if it matches)
         t0 = time.perf_counter()
+        use_left_context = len(self._left_context) >= LEFT_CONTEXT_SAMPLES // 2
+
         if (self._spec_embd is not None
-                and self._spec_audio_len == len(audio_chunk)):
+                and self._spec_audio_len == len(audio_chunk)
+                and (self._spec_left_context is not None or not use_left_context)):
             enc_out = self._spec_embd
             self._spec_embd = None
             self._spec_audio_len = 0
+            self._spec_left_context = None
         else:
-            enc_out = self._run_encoder(audio_chunk)
-        self._total_enc_ms += (time.perf_counter() - t0) * 1000
+            context = self._left_context if use_left_context else None
+            enc_out = self._run_encoder(audio_chunk, context_audio=context)
+        enc_ms = (time.perf_counter() - t0) * 1000
+        self._total_enc_ms += enc_ms
+
+        # 1b. Update left-context ring buffer for next chunk
+        new_context_source = audio_chunk if len(audio_chunk) >= LEFT_CONTEXT_SAMPLES else np.concatenate([self._left_context, audio_chunk])
+        if len(new_context_source) > LEFT_CONTEXT_SAMPLES:
+            self._left_context = new_context_source[-LEFT_CONTEXT_SAMPLES:]
+        else:
+            self._left_context = new_context_source
 
         # 2. Update sliding window (don't evict on final — keep full context)
         if not is_final and len(self._segments) >= MEMORY_NUM:
@@ -472,6 +529,7 @@ class Qwen3StreamingASRStream(ASRStream):
             # Archive current stable text, reset window for next utterance
             self._archive_text = self._stable_text
             self._segments.clear()
+            self._left_context = np.array([], dtype=np.float32)
             self._prev_text = ""
             self._eos_count = 0
 
