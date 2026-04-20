@@ -221,7 +221,9 @@ class Qwen3StreamingASRStream(ASRStream):
         # Audio buffer (accumulates until chunk_size)
         self._sample_buf = np.array([], dtype=np.float32)
 
-        # Sliding window of encoder embeddings
+        # Sliding window of encoder embeddings. MEMORY_NUM=3 is the decoder
+        # training-distribution cap — >3 concatenated independently-encoded
+        # chunks drive the decoder OOD (hallucinated "今天天天..." tokens).
         self._segments: deque[SegmentInfo] = deque(maxlen=MEMORY_NUM)
 
         # Output state
@@ -240,6 +242,65 @@ class Qwen3StreamingASRStream(ASRStream):
         self._spec_embd = None
         self._spec_audio_len = 0
 
+        # VAD for in-stream silence-based segment breaks (option C).
+        # Splits long utterances at natural pauses before hitting the 3-chunk
+        # training-distribution limit, preserving full transcription.
+        try:
+            import webrtcvad
+            self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        except Exception:
+            self._vad = None
+        # Min silence (ms) at buffer tail to trigger segment flush
+        self._silence_flush_ms = 200
+        # Min audio in current segment (s) before we consider flushing
+        self._min_segment_s = 0.5
+        self._segment_start_samples = 0  # cumulative sample count at segment start
+
+    def _tail_is_silent(self, samples: np.ndarray, sr: int = 16000) -> bool:
+        """True if the last `_silence_flush_ms` of samples is VAD-silent."""
+        if self._vad is None:
+            return False
+        req = int(self._silence_flush_ms / 1000 * sr)
+        if len(samples) < req:
+            return False
+        tail = samples[-req:]
+        frame_len = int(VAD_FRAME_MS * sr / 1000)
+        n_frames = len(tail) // frame_len
+        if n_frames == 0:
+            return False
+        pcm16 = (np.clip(tail[:n_frames * frame_len], -1, 1) * 32767).astype(np.int16).tobytes()
+        frame_bytes = frame_len * 2
+        for i in range(n_frames):
+            if self._vad.is_speech(pcm16[i * frame_bytes:(i + 1) * frame_bytes], sr):
+                return False
+        return True
+
+    def _segment_seconds(self) -> float:
+        """Cumulative audio duration (s) in the current open segment."""
+        segment_window_s = sum(s.embedding.shape[1] for s in self._segments) / 13
+        # Add current buffer (not yet processed)
+        segment_window_s += len(self._sample_buf) / 16000
+        return segment_window_s
+
+    def _flush_segment(self) -> None:
+        """Close current segment: archive stable text + reset sliding window.
+
+        Used when a silence boundary is detected (natural break) or when the
+        segment hits the 3-chunk training-distribution cap. Prevents the
+        decoder from seeing >3 concatenated independently-encoded chunks.
+        """
+        # Drain any pending tail as the segment's final chunk
+        if len(self._sample_buf) > 0:
+            self._process_chunk(self._sample_buf, is_final=True)
+            self._sample_buf = np.array([], dtype=np.float32)
+        # Commit stable text + reset window state for a fresh segment
+        self._archive_text = self._stable_text
+        self._segments.clear()
+        self._prev_text = ""
+        self._eos_count = 0
+        self._spec_embd = None
+        self._spec_audio_len = 0
+
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
@@ -254,6 +315,16 @@ class Qwen3StreamingASRStream(ASRStream):
             ).astype(np.float32)
         self._sample_buf = np.concatenate([self._sample_buf, samples])
 
+        # Option-C segment break: if we've accumulated enough speech AND the
+        # buffer tail is VAD-silent, flush the segment at this natural pause
+        # before the window grows past 3 chunks.
+        if (self._segment_seconds() >= self._min_segment_s
+                and (len(self._segments) > 0 or len(self._sample_buf) >= self._chunk_size_samples)
+                and self._tail_is_silent(self._sample_buf)):
+            logger.info("VAD silence flush at %.2fs cumulative", self._segment_seconds())
+            self._flush_segment()
+            return
+
         # Speculative encoding: pre-encode if buffer >= 50% chunk but not yet full
         min_spec = self._chunk_size_samples // 2
         if (len(self._sample_buf) >= min_spec
@@ -267,6 +338,17 @@ class Qwen3StreamingASRStream(ASRStream):
             chunk = self._sample_buf[:self._chunk_size_samples]
             self._sample_buf = self._sample_buf[self._chunk_size_samples:]
             self._process_chunk(chunk)
+            # Hard cap: if window just hit MEMORY_NUM chunks with no silence
+            # break, force-flush to stay within decoder training distribution.
+            # This accepts a small boundary loss but avoids OOD hallucinations.
+            if len(self._segments) >= MEMORY_NUM and len(self._sample_buf) < self._chunk_size_samples:
+                logger.info("Hard cap flush at %d chunks (no silence found)", len(self._segments))
+                self._archive_text = self._stable_text
+                self._segments.clear()
+                self._prev_text = ""
+                self._eos_count = 0
+                self._spec_embd = None
+                self._spec_audio_len = 0
 
     def get_partial(self) -> tuple[str, bool]:
         return self._stable_text, self._eos_count >= EOS_CONFIRM_COUNT
