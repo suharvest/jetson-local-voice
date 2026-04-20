@@ -275,19 +275,33 @@ class Qwen3StreamingASRStream(ASRStream):
         pass
 
     def finalize(self) -> str:
-        # Flush remaining buffer
+        # 1. Flush remaining buffer (encode it)
         if len(self._sample_buf) > 0:
             self._process_chunk(self._sample_buf, is_final=True)
             self._sample_buf = np.array([], dtype=np.float32)
-        # Return archive + latest window decode
-        all_text = self._archive_text + self._prev_text
+        
+        # 2. Single final decode on ALL segments
+        if not self._segments:
+            return ""
+        
+        all_embd = np.concatenate(
+            [s.embedding for s in self._segments], axis=1
+        )
+        window_sec = sum(s.embedding.shape[1] for s in self._segments) / 13
+        estimated_tokens = max(20, int(window_sec * 15))
+        max_tok = min(200, estimated_tokens)
+        
+        t0 = time.perf_counter()
+        final_text = self._decode_window(all_embd, max_tokens=max_tok)
+        self._total_dec_ms += (time.perf_counter() - t0) * 1000
+        
         logger.info(
             "Qwen3 streaming finalize: %d chunks, %.1fs audio, "
             "enc=%.0fms dec=%.0fms",
             self._n_chunks, self._total_audio_s,
             self._total_enc_ms, self._total_dec_ms,
         )
-        return all_text.strip()
+        return (final_text or "").strip()
 
     def _run_encoder(self, audio_chunk: np.ndarray, context_audio: np.ndarray | None = None) -> np.ndarray:
         """Encode audio chunk via ORT with optional left context.
@@ -457,9 +471,7 @@ class Qwen3StreamingASRStream(ASRStream):
         else:
             self._left_context = new_context_source
 
-        # 2. Update sliding window (don't evict on final — keep full context)
-        if not is_final and len(self._segments) >= MEMORY_NUM:
-            self._segments.popleft()
+        # 2. Append to segments (keep ALL chunks for final decode)
         self._segments.append(SegmentInfo(embedding=enc_out))
 
         # 3. Concatenate all window embeddings
@@ -485,25 +497,16 @@ class Qwen3StreamingASRStream(ASRStream):
         else:
             self._eos_count = 0
 
-        # 5b. Auto-reset on confirmed endpoint
+        # 5b. Endpoint flag only - DO NOT clear segments/state
         if self._eos_count >= EOS_CONFIRM_COUNT and not is_final:
-            logger.info("Semantic endpoint detected at chunk %d, resetting window",
+            logger.info("Semantic endpoint detected at chunk %d (segments kept)",
                         self._n_chunks)
-            # Archive current stable text, reset window for next utterance
-            self._archive_text = self._stable_text
-            self._segments.clear()
-            self._left_context = np.array([], dtype=np.float32)
-            self._prev_text = ""
-            self._eos_count = 0
 
-        # 6. Rollback + LocalAgreement (skip for final chunk)
-        if is_final and raw_text:
-            self._stable_text = self._archive_text + raw_text
-            self._prev_text = raw_text
-        elif raw_text:
+        # 6. Partial display only (rollback + LocalAgreement for stable display)
+        if raw_text:
             rolled = self._apply_rollback(raw_text)
             stable = self._local_agreement(self._prev_text, rolled)
-            self._stable_text = self._archive_text + stable
+            self._stable_text = stable
             self._prev_text = rolled
 
         logger.debug(
