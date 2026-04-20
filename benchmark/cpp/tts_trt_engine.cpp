@@ -958,7 +958,10 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       CHECK_CUDA(cudaStreamSynchronize(stream_));
 
       CaptureGuard capture_guard(stream_);
-      CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+      // ThreadLocal (not Global): Global blocks cudaEventSynchronize on OTHER
+      // streams from OTHER threads for entire capture duration — vocoder.Run
+      // on another thread would crash. EndCapture MUST stay on this thread.
+      CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
       capture_guard.mark_active(nullptr);
 
       // Captured operations: only the TRT enqueueV3 kernel sequence.
@@ -1832,7 +1835,8 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     } else if (use_cp_graph) {
       CHECK_CUDA(cudaStreamSynchronize(stream_));
       CaptureGuard capture_guard(stream_);
-      CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+      // ThreadLocal (see Talker DecodeStep comment at line ~960)
+      CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
       capture_guard.mark_active(nullptr);
 
       if (is_single_head_) {
