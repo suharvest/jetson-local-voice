@@ -156,6 +156,7 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
               const std::string& lang,
               const std::vector<int64_t>& token_ids,
               int max_frames, int seed) -> py::dict {
+             py::gil_scoped_release release;
              SynthResult r;
              if (!token_ids.empty()) {
                r = self.SynthesizeWithTokenIds(text, lang, token_ids,
@@ -164,6 +165,7 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
                r = self.Synthesize(text, lang, max_frames, seed);
              }
 
+             py::gil_scoped_acquire acquire;
              py::dict result;
              result["wav_bytes"] = MakeWav(r.audio, r.sample_rate);
              result["n_frames"] = r.n_frames;
@@ -186,12 +188,14 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
               const std::vector<int64_t>& token_ids,
               py::bytes speaker_emb_bytes,
               int max_frames, int seed) -> py::dict {
+             py::gil_scoped_release release;
              std::string emb_str = speaker_emb_bytes;
              std::vector<float> spk(emb_str.size() / sizeof(float));
              std::memcpy(spk.data(), emb_str.data(), emb_str.size());
 
              auto r = self.SynthesizeWithTokenIds(text, lang, token_ids,
                                                    &spk, max_frames, seed);
+             py::gil_scoped_acquire acquire;
              py::dict result;
              result["wav_bytes"] = MakeWav(r.audio, r.sample_rate);
              result["n_frames"] = r.n_frames;

@@ -467,34 +467,40 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
   if (ort_->HasTalkerPrefill()) {
     // ORT prefill (loads ~1.7GB but reliable for any seq_len)
-    auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
-    result.prefill_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    // Seed TRT KV cache from ORT output
-    std::vector<const float*> kv_ptrs;
-    for (auto& kv : pf_result.kv_data) {
-      kv_ptrs.push_back(kv.data());
+    {
+      std::lock_guard<std::mutex> lock(talker_mutex_);
+      auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
+      result.prefill_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      // Seed TRT KV cache from ORT output
+      std::vector<const float*> kv_ptrs;
+      for (auto& kv : pf_result.kv_data) {
+        kv_ptrs.push_back(kv.data());
+      }
+      talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
+      int last_pos = pf.seq_len - 1;
+      VecCopy(logits.data(),
+              pf_result.logits.data() + last_pos * cfg_.vocab_size,
+              cfg_.vocab_size);
+      VecCopy(last_hidden.data(),
+              pf_result.last_hidden.data() + last_pos * D, D);
     }
-    talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
-    int last_pos = pf.seq_len - 1;
-    VecCopy(logits.data(),
-            pf_result.logits.data() + last_pos * cfg_.vocab_size,
-            cfg_.vocab_size);
-    VecCopy(last_hidden.data(),
-            pf_result.last_hidden.data() + last_pos * D, D);
   } else {
     // TRT unified prefill (requires engine compiled with dynamic seq_len)
-    auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
-    result.prefill_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    // last_pos: engine may output last token only (logits.size()==vocab_size) or all tokens
-    int last_pos = (int)pf_result.logits.size() / cfg_.vocab_size - 1;
-    VecCopy(logits.data(),
-            pf_result.logits.data() + last_pos * cfg_.vocab_size,
-            cfg_.vocab_size);
-    // last_hidden is always full sequence
-    VecCopy(last_hidden.data(),
-            pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
+    {
+      std::lock_guard<std::mutex> lock(talker_mutex_);
+      auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
+      result.prefill_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      // last_pos: engine may output last token only (logits.size()==vocab_size) or all tokens
+      int last_pos = (int)pf_result.logits.size() / cfg_.vocab_size - 1;
+      VecCopy(logits.data(),
+              pf_result.logits.data() + last_pos * cfg_.vocab_size,
+              cfg_.vocab_size);
+      // last_hidden is always full sequence
+      VecCopy(last_hidden.data(),
+              pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
+    }
   }
 
 
@@ -571,9 +577,12 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       int n_groups = cfg_.cp_active_groups;
       // Allocate full-size buffer so engine can zero-fill inactive slots
       std::vector<int> cp_codes(n_groups_full, 0);
-      cp_kv->RunFrameAutoregressive(
-          last_hidden.data(), primary_e_ptr, cp_codes.data(),
-          cp_embed_table_.data(), cp_embed_vocab_, n_groups);
+      {
+        std::lock_guard<std::mutex> lock(talker_mutex_);
+        cp_kv->RunFrameAutoregressive(
+            last_hidden.data(), primary_e_ptr, cp_codes.data(),
+            cp_embed_table_.data(), cp_embed_vocab_, n_groups);
+      }
 
       // Accumulate codec_sum from active residuals only; inactive slots
       // are zero (no embedding contribution, matching zero-fill semantics).
@@ -592,29 +601,32 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       }
     } else {
       // --- Old context-copy CP engine path ---
-      cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
+      {
+        std::lock_guard<std::mutex> lock(talker_mutex_);
+        cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
 
-      for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
-        std::vector<float> cp_logits(cfg_.cp_vocab);
-        cp_->PredictGPU(j, cp_logits.data());
+        for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
+          std::vector<float> cp_logits(cfg_.cp_vocab);
+          cp_->PredictGPU(j, cp_logits.data());
 
-        int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
-        frame_codes.push_back(rc);
+          int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
+          frame_codes.push_back(rc);
 
-        if (cp_->has_embed_table()) {
-          cp_->AppendEmbeddingFromTable(j, rc);
-          if (cp_embed_use_int8_) {
-            float re_buf[1024];
-            CPEmbedLookupINT8(j, rc, re_buf);
-            VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+          if (cp_->has_embed_table()) {
+            cp_->AppendEmbeddingFromTable(j, rc);
+            if (cp_embed_use_int8_) {
+              float re_buf[1024];
+              CPEmbedLookupINT8(j, rc, re_buf);
+              VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+            } else {
+              const float* re = CPEmbedLookup(j, rc);
+              VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+            }
           } else {
-            const float* re = CPEmbedLookup(j, rc);
-            VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+            auto re = ort_->CPEmbed(rc, j);
+            cp_->AppendEmbedding(re.data());
+            VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
           }
-        } else {
-          auto re = ort_->CPEmbed(rc, j);
-          cp_->AppendEmbedding(re.data());
-          VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
         }
       }
     }
@@ -635,7 +647,10 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
     // Talker decode
     auto t_d = Clock::now();
-    talker_->DecodeStep(next_emb.data(), logits.data(), last_hidden.data());
+    {
+      std::lock_guard<std::mutex> lock(talker_mutex_);
+      talker_->DecodeStep(next_emb.data(), logits.data(), last_hidden.data());
+    }
     dt_times.push_back(
         std::chrono::duration<double, std::milli>(Clock::now() - t_d).count());
 
@@ -903,7 +918,6 @@ const float* TTSPipeline::CodecEmbedLookup(int token_id) const {
 SynthResult TTSPipeline::Synthesize(const std::string& text,
                                      const std::string& lang, int max_frames,
                                      int seed) {
-  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth: \"" << text << "\" (" << lang << ")" << std::endl;
   return GenerateInternal(text, lang, nullptr, nullptr, max_frames, seed);
 }
@@ -911,7 +925,6 @@ SynthResult TTSPipeline::Synthesize(const std::string& text,
 SynthResult TTSPipeline::SynthesizeWithSpeaker(
     const std::string& text, const std::string& lang,
     const std::vector<float>& speaker_embed, int max_frames, int seed) {
-  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth (voice clone): \"" << text << "\" (" << lang << ")"
             << std::endl;
   return GenerateInternal(text, lang, speaker_embed.data(), nullptr, max_frames, seed);
@@ -921,7 +934,6 @@ SynthResult TTSPipeline::SynthesizeWithTokenIds(
     const std::string& text, const std::string& lang,
     const std::vector<int64_t>& token_ids,
     const std::vector<float>* speaker_embed, int max_frames, int seed) {
-  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth (token-ids): \"" << text << "\" (" << lang << ", "
             << token_ids.size() << " tokens)" << std::endl;
   return GenerateInternal(text, lang,
@@ -1005,7 +1017,6 @@ void TTSPipeline::SynthesizeStreaming(const std::string& text,
                                        const std::vector<int64_t>& token_ids,
                                        const StreamConfig& config,
                                        AudioChunkCallback callback) {
-  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth streaming (token-ids): \"" << text << "\" (" << lang
             << ", " << token_ids.size() << " tokens)" << std::endl;
   GenerateStreaming(text, lang, nullptr,
@@ -1017,7 +1028,6 @@ void TTSPipeline::SynthesizeStreamingWithSpeaker(
     const std::vector<int64_t>& token_ids,
     const std::vector<float>& speaker_embed, const StreamConfig& config,
     AudioChunkCallback callback) {
-  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth streaming (voice clone): \"" << text << "\" (" << lang
             << ")" << std::endl;
   GenerateStreaming(text, lang, speaker_embed.data(),
@@ -1058,32 +1068,38 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
   std::vector<float> last_hidden(D);
 
   if (ort_->HasTalkerPrefill()) {
-    auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
-    double prefill_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    std::cout << "  Prefill: " << prefill_ms << " ms (ORT)" << std::endl;
-    std::vector<const float*> kv_ptrs;
-    for (auto& kv : pf_result.kv_data) kv_ptrs.push_back(kv.data());
-    talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
-    int last_pos_pf = pf.seq_len - 1;
-    VecCopy(logits.data(),
-            pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
-            cfg_.vocab_size);
-    VecCopy(last_hidden.data(),
-            pf_result.last_hidden.data() + last_pos_pf * D, D);
+    {
+      std::lock_guard<std::mutex> lock(talker_mutex_);
+      auto pf_result = ort_->TalkerPrefill(pf.embeds.data(), pf.seq_len, D);
+      double prefill_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      std::cout << "  Prefill: " << prefill_ms << " ms (ORT)" << std::endl;
+      std::vector<const float*> kv_ptrs;
+      for (auto& kv : pf_result.kv_data) kv_ptrs.push_back(kv.data());
+      talker_->SeedKV(kv_ptrs.data(), (int)kv_ptrs.size(), pf.seq_len);
+      int last_pos_pf = pf.seq_len - 1;
+      VecCopy(logits.data(),
+              pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
+              cfg_.vocab_size);
+      VecCopy(last_hidden.data(),
+              pf_result.last_hidden.data() + last_pos_pf * D, D);
+    }
   } else {
-    auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
-    double prefill_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    std::cout << "  Prefill: " << prefill_ms << " ms (TRT unified)" << std::endl;
-    // last_pos_pf: engine may output last token only (logits.size()==vocab_size) or all tokens
-    int last_pos_pf = (int)pf_result.logits.size() / cfg_.vocab_size - 1;
-    VecCopy(logits.data(),
-            pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
-            cfg_.vocab_size);
-    // last_hidden is always full sequence
-    VecCopy(last_hidden.data(),
-            pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
+    {
+      std::lock_guard<std::mutex> lock(talker_mutex_);
+      auto pf_result = talker_->Prefill(pf.embeds.data(), pf.seq_len);
+      double prefill_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      std::cout << "  Prefill: " << prefill_ms << " ms (TRT unified)" << std::endl;
+      // last_pos_pf: engine may output last token only (logits.size()==vocab_size) or all tokens
+      int last_pos_pf = (int)pf_result.logits.size() / cfg_.vocab_size - 1;
+      VecCopy(logits.data(),
+              pf_result.logits.data() + last_pos_pf * cfg_.vocab_size,
+              cfg_.vocab_size);
+      // last_hidden is always full sequence
+      VecCopy(last_hidden.data(),
+              pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
+    }
   }
 
   // Decode loop with chunked vocoder
@@ -1149,9 +1165,12 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
       int n_groups_full = cfg_.num_code_groups - 1;
       int n_groups = cfg_.cp_active_groups;
       std::vector<int> cp_codes(n_groups_full, 0);
-      cp_kv->RunFrameAutoregressive(
-          last_hidden.data(), primary_e_ptr, cp_codes.data(),
-          cp_embed_table_.data(), cp_embed_vocab_, n_groups);
+      {
+        std::lock_guard<std::mutex> lock(talker_mutex_);
+        cp_kv->RunFrameAutoregressive(
+            last_hidden.data(), primary_e_ptr, cp_codes.data(),
+            cp_embed_table_.data(), cp_embed_vocab_, n_groups);
+      }
 
       for (int j = 0; j < n_groups_full; ++j) {
         int rc = cp_codes[j];
@@ -1167,29 +1186,32 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
         }
       }
     } else {
-      cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
+      {
+        std::lock_guard<std::mutex> lock(talker_mutex_);
+        cp_->BeginFrame(last_hidden.data(), primary_e_ptr);
 
-      for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
-        std::vector<float> cp_logits(cfg_.cp_vocab);
-        cp_->PredictGPU(j, cp_logits.data());
+        for (int j = 0; j < cfg_.num_code_groups - 1; ++j) {
+          std::vector<float> cp_logits(cfg_.cp_vocab);
+          cp_->PredictGPU(j, cp_logits.data());
 
-        int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
-        frame_codes.push_back(rc);
+          int rc = Sample(cp_logits.data(), cfg_.cp_vocab);
+          frame_codes.push_back(rc);
 
-        if (cp_->has_embed_table()) {
-          cp_->AppendEmbeddingFromTable(j, rc);
-          if (cp_embed_use_int8_) {
-            float re_buf[1024];
-            CPEmbedLookupINT8(j, rc, re_buf);
-            VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+          if (cp_->has_embed_table()) {
+            cp_->AppendEmbeddingFromTable(j, rc);
+            if (cp_embed_use_int8_) {
+              float re_buf[1024];
+              CPEmbedLookupINT8(j, rc, re_buf);
+              VecAdd(codec_sum.data(), codec_sum.data(), re_buf, D);
+            } else {
+              const float* re = CPEmbedLookup(j, rc);
+              VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+            }
           } else {
-            const float* re = CPEmbedLookup(j, rc);
-            VecAdd(codec_sum.data(), codec_sum.data(), re, D);
+            auto re = ort_->CPEmbed(rc, j);
+            cp_->AppendEmbedding(re.data());
+            VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
           }
-        } else {
-          auto re = ort_->CPEmbed(rc, j);
-          cp_->AppendEmbedding(re.data());
-          VecAdd(codec_sum.data(), codec_sum.data(), re.data(), D);
         }
       }
     }
@@ -1205,7 +1227,10 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     }
 
     // Talker decode
-    talker_->DecodeStep(next_emb.data(), logits.data(), last_hidden.data());
+    {
+      std::lock_guard<std::mutex> lock(talker_mutex_);
+      talker_->DecodeStep(next_emb.data(), logits.data(), last_hidden.data());
+    }
 
     // Check if we should emit a chunk
     int n = (int)all_codes.size();
