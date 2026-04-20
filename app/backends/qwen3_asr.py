@@ -913,12 +913,14 @@ class Qwen3ASRBackend(ASRBackend):
             AUDIO_START, *([AUDIO_PAD] * audio_len), AUDIO_END, IM_END, 198,
             IM_START, 77091, 198,
         ]
-        if language:
-            if self._tokenizer:
-                lang_ids = self._tokenizer.encode(f"language {language}").ids
-            else:
-                lang_ids = []
-            ids.extend(lang_ids + [ASR_TEXT])
+        # ASR_TEXT anchor MUST be appended unconditionally. Without it on
+        # language=None/auto, decoder has no anchor and hallucinates loops
+        # like "CurrentCurrentCurrent..." on English audio. Confirmed via
+        # LibriSpeech eval: 15/15 real WAVs produced that garbage.
+        if language and self._tokenizer:
+            lang_ids = self._tokenizer.encode(f"language {language}").ids
+            ids.extend(lang_ids)
+        ids.append(ASR_TEXT)
         return ids
 
     def _compute_mel(self, audio):
