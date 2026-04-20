@@ -221,8 +221,11 @@ class Qwen3StreamingASRStream(ASRStream):
         # Audio buffer (accumulates until chunk_size)
         self._sample_buf = np.array([], dtype=np.float32)
 
-        # Sliding window of encoder embeddings
-        self._segments: deque[SegmentInfo] = deque(maxlen=MEMORY_NUM)
+        # Encoder embeddings buffer. No maxlen — sliding window is enforced
+        # by explicit popleft() in _process_chunk (only when not is_final),
+        # so finalize() sees all chunks. maxlen= would silently auto-evict
+        # chunk 0 on the 4th append for >3.6s audio → truncated transcripts.
+        self._segments: deque[SegmentInfo] = deque()
 
         # Output state
         self._archive_text: str = ""
