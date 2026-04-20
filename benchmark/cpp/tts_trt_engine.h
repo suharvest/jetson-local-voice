@@ -57,21 +57,14 @@ class CaptureGuard {
 inline bool ForceEndCapture(cudaStream_t stream, const char* caller) {
   cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
   cudaError_t err = cudaStreamIsCapturing(stream, &status);
-  if (err != cudaSuccess) {
-    std::cerr << "[" << caller << "] cudaStreamIsCapturing err=" << err 
-              << " (" << cudaGetErrorName(err) << ") - cannot force end" << std::endl;
-    return false;
-  }
-  if (status != cudaStreamCaptureStatusActive) {
-    std::cerr << "[" << caller << "] stream not capturing (status=" << (int)status << ") - no action needed" << std::endl;
-    return false;
-  }
+  if (err != cudaSuccess) return false;
+  if (status != cudaStreamCaptureStatusActive) return false;
   cudaGraph_t discard_graph = nullptr;
   err = cudaStreamEndCapture(stream, &discard_graph);
   if (err == cudaSuccess && discard_graph) {
     cudaGraphDestroy(discard_graph);
   }
-  std::cerr << "[" << caller << "] WARN: forced end-capture on stale stream (result=" << err << ")" << std::endl;
+  std::cerr << "[" << caller << "] WARN: forced end-capture on stale stream" << std::endl;
   return true;
 }
 

@@ -13,29 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
-#include <sstream>
-#include <thread>
 #include <vector>
-
-static std::string CaptureStatusStr(cudaStream_t stream) {
-  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-  cudaError_t err = cudaStreamIsCapturing(stream, &status);
-  std::ostringstream oss;
-  oss << "[tid=" << std::this_thread::get_id() << "] ";
-  if (err != cudaSuccess) {
-    oss << "cudaStreamIsCapturing err=" << err << " (" << cudaGetErrorName(err) << ")";
-  } else {
-    const char* s = "Unknown";
-    switch (status) {
-      case cudaStreamCaptureStatusNone: s = "None"; break;
-      case cudaStreamCaptureStatusActive: s = "Active"; break;
-      case cudaStreamCaptureStatusInvalidated: s = "Invalidated"; break;
-      default: s = "Other"; break;
-    }
-    oss << "capture_status=" << s << " (int=" << (int)status << ")";
-  }
-  return oss.str();
-}
 
 #define CHECK_CUDA(call)                                                  \
   do {                                                                    \
@@ -256,9 +234,7 @@ void TRTTalkerEngine::FreeCudaGraphs() {
 void TRTTalkerEngine::Reset() {
   seq_len_ = 0;
   parity_ = 0;
-  std::cerr << "[Talker.Reset] ENTRY " << CaptureStatusStr(stream_) << std::endl;
-  bool forced = ForceEndCapture(stream_, "Talker.Reset");
-  std::cerr << "[Talker.Reset] ForceEndCapture returned " << forced << " " << CaptureStatusStr(stream_) << std::endl;
+  ForceEndCapture(stream_, "Talker.Reset");
   // NOTE: Do NOT clear graph_cache_ here. Cached CUDA graphs remain valid
   // across requests because all GPU buffer addresses (kv_a_, kv_b_, d_emb_,
   // d_logits_, d_hidden_) are fixed allocations that don't change. A graph
@@ -602,9 +578,7 @@ void TRTTalkerEngine::SeedKV(const float* const* kv_ptrs, int n_kv,
 TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
     const float* inputs_embeds, int seq_len) {
   assert(seq_len > 0 && seq_len <= max_seq_);
-  std::cerr << "[Talker.Prefill] ENTRY " << CaptureStatusStr(stream_) << std::endl;
   Reset();
-  std::cerr << "[Talker.Prefill] AFTER Reset " << CaptureStatusStr(stream_) << std::endl;
 
   // Use dedicated prefill engine if available (best quality, no iterative error)
   if (prefill_engine_) {
@@ -830,10 +804,8 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
 
   if (logits_elem_bytes == sizeof(float)) {
     // Need to sync after the async copies above
-    std::cerr << "[RunPrefillEngine] BEFORE sync " << CaptureStatusStr(stream_) << std::endl;
     CHECK_CUDA(cudaEventRecord(ev_d2h_done_, stream_));
     CHECK_CUDA(cudaStreamSynchronize(stream_));
-    std::cerr << "[RunPrefillEngine] AFTER sync OK" << std::endl;
   }
 
   seq_len_ = seq_len;
@@ -861,7 +833,6 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
 
 void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
                                  float* last_hidden) {
-  std::cerr << "[Talker.DecodeStep] ENTRY " << CaptureStatusStr(stream_) << std::endl;
   // Dual-profile engine: use Profile 1 context (ctx_decode_).
   // Single-profile engine: use context_.
   auto* ctx = has_dual_profiles_ ? ctx_decode_.get() : context_.get();
@@ -986,20 +957,17 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       // Synchronize stream before capture to ensure all prior work is complete
       CHECK_CUDA(cudaStreamSynchronize(stream_));
 
-      std::cerr << "[Talker.DecodeStep] BEFORE BeginCapture " << CaptureStatusStr(stream_) << std::endl;
       CaptureGuard capture_guard(stream_);
       CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
       capture_guard.mark_active(nullptr);
-      std::cerr << "[Talker.DecodeStep] AFTER BeginCapture " << CaptureStatusStr(stream_) << std::endl;
 
       // Captured operations: only the TRT enqueueV3 kernel sequence.
-      // H2D (emb, position_ids) and D2D (logits, hidden) are NOT captured
+      // H2D (emb, position_ids) and D2H (logits, hidden) are NOT captured
       // because host pointers may change between calls.
       ctx->enqueueV3(stream_);
 
       CHECK_CUDA(cudaStreamEndCapture(stream_, &capture_graph_));
       capture_guard.mark_done();
-      std::cerr << "[Talker.DecodeStep] AFTER EndCapture " << CaptureStatusStr(stream_) << std::endl;
 
       cudaGraphExec_t exec;
       CHECK_CUDA(cudaGraphInstantiate(&exec, capture_graph_, nullptr, nullptr, 0));
@@ -1114,7 +1082,6 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
 
   seq_len_ += 1;
   parity_ ^= 1;
-  std::cerr << "[Talker.DecodeStep] EXIT " << CaptureStatusStr(stream_) << std::endl;
 }
 
 // ===========================================================================
