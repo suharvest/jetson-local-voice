@@ -250,10 +250,16 @@ class Qwen3StreamingASRStream(ASRStream):
             self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
         except Exception:
             self._vad = None
-        # Min silence (ms) at buffer tail to trigger segment flush
-        self._silence_flush_ms = 200
-        # Min audio in current segment (s) before we consider flushing
-        self._min_segment_s = 0.5
+        # Min silence (ms) at buffer tail to trigger segment flush.
+        # Loose setting (500ms) — only real sentence-end pauses trigger
+        # flush. Tight setting (200ms) was firing on inter-word micro-pauses
+        # in English, splitting each word into its own segment and starving
+        # per-segment decode budget.
+        self._silence_flush_ms = 500
+        # Min audio in current segment (s) before we consider flushing.
+        # ≥1.5s guarantees each segment has enough content for a meaningful
+        # decode (vs 0.5s which produced 1-word mini-segments).
+        self._min_segment_s = 1.5
         self._segment_start_samples = 0  # cumulative sample count at segment start
 
     def _tail_is_silent(self, samples: np.ndarray, sr: int = 16000) -> bool:
@@ -340,12 +346,25 @@ class Qwen3StreamingASRStream(ASRStream):
             self._process_chunk(chunk)
             # Hard cap: if window just hit MEMORY_NUM chunks with no silence
             # break, force-flush to stay within decoder training distribution.
-            # This accepts a small boundary loss but avoids OOD hallucinations.
             if len(self._segments) >= MEMORY_NUM and len(self._sample_buf) < self._chunk_size_samples:
                 logger.info("Hard cap flush at %d chunks (no silence found)", len(self._segments))
-                self._archive_text = self._stable_text
+                # Do ONE full decode on the complete 3-chunk window BEFORE
+                # archiving. Partial decodes (STREAMING_MAX_TOKENS=4) only
+                # captured ~12 tokens total across 3 chunks, starving middle
+                # content. A final-mode decode with scaled budget (~50 tokens)
+                # captures the full segment text.
+                all_embd = np.concatenate(
+                    [s.embedding for s in self._segments], axis=1
+                )
+                window_sec = sum(s.embedding.shape[1] for s in self._segments) / 13
+                max_tok = min(200, max(20, int(window_sec * 15)))
+                full_text = self._decode_window(all_embd, max_tokens=max_tok)
+                if full_text:
+                    # Append full segment text (not the partial-starved stable)
+                    self._archive_text += full_text + " "
                 self._segments.clear()
                 self._prev_text = ""
+                self._stable_text = self._archive_text
                 self._eos_count = 0
                 self._spec_embd = None
                 self._spec_audio_len = 0
