@@ -901,8 +901,9 @@ const float* TTSPipeline::CodecEmbedLookup(int token_id) const {
 }
 
 SynthResult TTSPipeline::Synthesize(const std::string& text,
-                                    const std::string& lang, int max_frames,
-                                    int seed) {
+                                     const std::string& lang, int max_frames,
+                                     int seed) {
+  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth: \"" << text << "\" (" << lang << ")" << std::endl;
   return GenerateInternal(text, lang, nullptr, nullptr, max_frames, seed);
 }
@@ -910,6 +911,7 @@ SynthResult TTSPipeline::Synthesize(const std::string& text,
 SynthResult TTSPipeline::SynthesizeWithSpeaker(
     const std::string& text, const std::string& lang,
     const std::vector<float>& speaker_embed, int max_frames, int seed) {
+  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth (voice clone): \"" << text << "\" (" << lang << ")"
             << std::endl;
   return GenerateInternal(text, lang, speaker_embed.data(), nullptr, max_frames, seed);
@@ -919,11 +921,12 @@ SynthResult TTSPipeline::SynthesizeWithTokenIds(
     const std::string& text, const std::string& lang,
     const std::vector<int64_t>& token_ids,
     const std::vector<float>* speaker_embed, int max_frames, int seed) {
+  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth (token-ids): \"" << text << "\" (" << lang << ", "
             << token_ids.size() << " tokens)" << std::endl;
   return GenerateInternal(text, lang,
-                          speaker_embed ? speaker_embed->data() : nullptr,
-                          &token_ids, max_frames, seed);
+                           speaker_embed ? speaker_embed->data() : nullptr,
+                           &token_ids, max_frames, seed);
 }
 
 std::vector<float> TTSPipeline::ExtractSpeakerEmbedding(const float* mel,
@@ -998,14 +1001,15 @@ void TTSPipeline::PrintProfilingStats() {
 // Streaming synthesis
 // ---------------------------------------------------------------------------
 void TTSPipeline::SynthesizeStreaming(const std::string& text,
-                                      const std::string& lang,
-                                      const std::vector<int64_t>& token_ids,
-                                      const StreamConfig& config,
-                                      AudioChunkCallback callback) {
+                                       const std::string& lang,
+                                       const std::vector<int64_t>& token_ids,
+                                       const StreamConfig& config,
+                                       AudioChunkCallback callback) {
+  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth streaming (token-ids): \"" << text << "\" (" << lang
             << ", " << token_ids.size() << " tokens)" << std::endl;
   GenerateStreaming(text, lang, nullptr,
-                    token_ids.empty() ? nullptr : &token_ids, config, callback);
+                     token_ids.empty() ? nullptr : &token_ids, config, callback);
 }
 
 void TTSPipeline::SynthesizeStreamingWithSpeaker(
@@ -1013,10 +1017,11 @@ void TTSPipeline::SynthesizeStreamingWithSpeaker(
     const std::vector<int64_t>& token_ids,
     const std::vector<float>& speaker_embed, const StreamConfig& config,
     AudioChunkCallback callback) {
+  std::lock_guard<std::mutex> lock(talker_mutex_);
   std::cout << "Synth streaming (voice clone): \"" << text << "\" (" << lang
             << ")" << std::endl;
   GenerateStreaming(text, lang, speaker_embed.data(),
-                    token_ids.empty() ? nullptr : &token_ids, config, callback);
+                     token_ids.empty() ? nullptr : &token_ids, config, callback);
 }
 
 void TTSPipeline::GenerateStreaming(const std::string& text,

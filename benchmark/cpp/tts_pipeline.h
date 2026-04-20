@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -209,4 +210,8 @@ class TTSPipeline {
 
   // RNG for sampling — seeded per request for reproducibility
   std::mt19937 rng_{42};
+
+  // Mutex to serialize access to talker_ (prevents race between streaming daemon thread and offline requests)
+  // Without this, streaming TTS daemon thread may leave stream in capturing state when next offline request starts.
+  std::mutex talker_mutex_;
 };
