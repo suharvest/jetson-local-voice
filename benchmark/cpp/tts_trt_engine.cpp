@@ -29,10 +29,10 @@ static std::string CaptureStatusStr(cudaStream_t stream) {
     switch (status) {
       case cudaStreamCaptureStatusNone: s = "None"; break;
       case cudaStreamCaptureStatusActive: s = "Active"; break;
-      case cudaStreamCaptureStatusEnded: s = "Ended"; break;
       case cudaStreamCaptureStatusInvalidated: s = "Invalidated"; break;
+      default: s = "Other"; break;
     }
-    oss << "capture_status=" << s;
+    oss << "capture_status=" << s << " (int=" << (int)status << ")";
   }
   return oss.str();
 }
