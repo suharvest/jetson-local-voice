@@ -247,11 +247,6 @@ class Qwen3StreamingASRStream(ASRStream):
         self._total_dec_ms: float = 0.0
         self._n_chunks: int = 0
 
-        # Speculative encoding
-        self._spec_embd = None
-        self._spec_audio_len = 0
-        self._spec_left_context = None
-
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
@@ -266,17 +261,6 @@ class Qwen3StreamingASRStream(ASRStream):
             ).astype(np.float32)
         self._sample_buf = np.concatenate([self._sample_buf, samples])
 
-        # Speculative encoding: pre-encode if buffer >= 50% chunk but not yet full
-        min_spec = self._chunk_size_samples // 2
-        use_left_context = len(self._left_context) >= LEFT_CONTEXT_SAMPLES // 2
-        if (len(self._sample_buf) >= min_spec
-                and len(self._sample_buf) != self._spec_audio_len
-                and len(self._sample_buf) < self._chunk_size_samples):
-            context = self._left_context if use_left_context else None
-            self._spec_embd = self._run_encoder(self._sample_buf, context_audio=context)
-            self._spec_audio_len = len(self._sample_buf)
-            self._spec_left_context = self._left_context.copy() if use_left_context else None
-
         # Process complete chunks
         while len(self._sample_buf) >= self._chunk_size_samples:
             chunk = self._sample_buf[:self._chunk_size_samples]
@@ -287,20 +271,8 @@ class Qwen3StreamingASRStream(ASRStream):
         return self._stable_text, self._eos_count >= EOS_CONFIRM_COUNT
 
     def prepare_finalize(self) -> None:
-        """Pre-encode tail buffer so finalize() only needs to decode."""
-        if len(self._sample_buf) == 0:
-            return
-        # Already speculatively encoded with matching length and context?
-        use_left_context = len(self._left_context) >= LEFT_CONTEXT_SAMPLES // 2
-        if (self._spec_embd is not None
-                and self._spec_audio_len == len(self._sample_buf)
-                and (self._spec_left_context is not None or not use_left_context)):
-            return
-        # Encode the tail buffer now with left context
-        context = self._left_context if use_left_context else None
-        self._spec_embd = self._run_encoder(self._sample_buf, context_audio=context)
-        self._spec_audio_len = len(self._sample_buf)
-        self._spec_left_context = self._left_context.copy() if use_left_context else None
+        """No-op for compatibility; encoding happens in finalize()."""
+        pass
 
     def finalize(self) -> str:
         # Flush remaining buffer
@@ -464,26 +436,17 @@ class Qwen3StreamingASRStream(ASRStream):
             text = text.split("<asr_text>", 1)[1]
         return text.strip()
 
-def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
+    def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
         """Encode chunk with left context, decode with sliding window, update output state."""
         chunk_sec = len(audio_chunk) / 16000
         self._total_audio_s += chunk_sec
         self._n_chunks += 1
 
-        # 1. Encode with left-context (reuse speculative embedding if it matches)
+        # 1. Encode with left-context
         t0 = time.perf_counter()
         use_left_context = len(self._left_context) >= LEFT_CONTEXT_SAMPLES // 2
-
-        if (self._spec_embd is not None
-                and self._spec_audio_len == len(audio_chunk)
-                and (self._spec_left_context is not None or not use_left_context)):
-            enc_out = self._spec_embd
-            self._spec_embd = None
-            self._spec_audio_len = 0
-            self._spec_left_context = None
-        else:
-            context = self._left_context if use_left_context else None
-            enc_out = self._run_encoder(audio_chunk, context_audio=context)
+        context = self._left_context if use_left_context else None
+        enc_out = self._run_encoder(audio_chunk, context_audio=context)
         enc_ms = (time.perf_counter() - t0) * 1000
         self._total_enc_ms += enc_ms
 
@@ -897,7 +860,8 @@ class Qwen3ASRBackend(ASRBackend):
                 lang_ids = self._tokenizer.encode(f"language {language}").ids
             else:
                 lang_ids = []
-            ids.extend(lang_ids + [ASR_TEXT])
+            ids.extend(lang_ids)
+        ids.append(ASR_TEXT)
         return ids
 
     def _compute_mel(self, audio):
