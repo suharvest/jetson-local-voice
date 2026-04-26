@@ -46,7 +46,7 @@ PARTIAL_MAX_TOKENS = 12        # tokens per partial decode
 DEDUP_MAX_OVERLAP = 12         # max token overlap for boundary dedup
 
 # ── VAD endpoint parameters ──
-VAD_ENDPOINT_SILENCE_MS = 500  # trailing silence to trigger endpoint
+VAD_ENDPOINT_SILENCE_MS = int(os.environ.get("VAD_ENDPOINT_SILENCE_MS", "1000"))  # trailing silence to trigger endpoint (default 1000ms)
 VAD_MIN_UTTERANCE_S = 1.0      # min speech before endpoint eligible
 
 # ── Legacy (still used by Qwen3ASRStream / offline path) ──
@@ -402,7 +402,11 @@ class Qwen3StreamingASRStream(ASRStream):
         for i in range(n):
             if self._vad.is_speech(pcm[i * fb:(i + 1) * fb], 16000):
                 if self._episode_final:
-                    self._episode_final = False  # new utterance
+                    # New utterance starting: reset committed state to avoid
+                    # cross-utterance dedup errors from encoder context carryover
+                    self._committed_token_ids = []
+                    self._archive_text = ""
+                    self._episode_final = False
                 self._vad_speech_samples += frame_len
                 self._vad_silence_samples = 0
             else:
