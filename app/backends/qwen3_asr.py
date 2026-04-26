@@ -25,6 +25,32 @@ from asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResul
 
 logger = logging.getLogger(__name__)
 
+# Dedicated CUDA stream for ORT CUDA EP to avoid legacy stream conflict with TRT capture
+_ASR_CUDA_STREAM = None
+_ASR_CUDA_STREAM_HANDLE = None
+
+
+def _get_asr_cuda_stream_handle() -> str:
+    global _ASR_CUDA_STREAM, _ASR_CUDA_STREAM_HANDLE
+    if _ASR_CUDA_STREAM_HANDLE is None:
+        from packaging import version
+        import onnxruntime as ort
+
+        if version.parse(ort.__version__) < version.parse("1.14"):
+            raise RuntimeError(
+                f"ORT {ort.__version__} < 1.14 does not support user_compute_stream"
+            )
+        from cuda import cudart
+
+        err, stream = cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaStreamCreateWithFlags failed: {err}")
+        _ASR_CUDA_STREAM = stream
+        _ASR_CUDA_STREAM_HANDLE = str(int(stream))
+        logger.info("ASR ORT CUDA EP user_compute_stream=%s", _ASR_CUDA_STREAM_HANDLE)
+    return _ASR_CUDA_STREAM_HANDLE
+
+
 # Self-exported v2 with per-layer KV cache (validated with ORT 1.20 CUDA EP)
 _BASE = os.environ.get("QWEN3_ASR_MODEL_BASE", "/opt/models/qwen3-asr-v2")
 
@@ -689,6 +715,10 @@ class Qwen3ASRBackend(ASRBackend):
         # ── 1. ORT encoder (CUDA EP) — load before TRT to avoid CUDA state pollution ──
         import onnxruntime as ort
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        provider_options = [
+            {"device_id": 0, "user_compute_stream": _get_asr_cuda_stream_handle()},
+            {},
+        ]
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 
@@ -696,7 +726,9 @@ class Qwen3ASRBackend(ASRBackend):
         for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
             enc_path = os.path.join(_BASE, enc_name)
             if os.path.exists(enc_path):
-                self._encoder = ort.InferenceSession(enc_path, so, providers=providers)
+                self._encoder = ort.InferenceSession(
+                    enc_path, so, providers=providers, provider_options=provider_options
+                )
                 logger.info("Encoder loaded: %s", enc_name)
                 break
 
@@ -725,7 +757,9 @@ class Qwen3ASRBackend(ASRBackend):
                 path = os.path.join(_BASE, dec_name)
                 if os.path.exists(path):
                     try:
-                        self._decoder_ort = ort.InferenceSession(path, so_dec, providers=providers)
+                        self._decoder_ort = ort.InferenceSession(
+                            path, so_dec, providers=providers, provider_options=provider_options
+                        )
                         logger.info("ORT decoder loaded (fallback): %s", dec_name)
                         break
                     except Exception as e:
