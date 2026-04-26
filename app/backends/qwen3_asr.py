@@ -231,6 +231,7 @@ class Qwen3StreamingASRStream(ASRStream):
 
         # Audio accumulation (kept for left-context; trimmed periodically)
         self._audio_buf = np.array([], dtype=np.float32)
+        self._utterance_audio_buffer: list[np.ndarray] = []
         self._processed_samples = 0
 
         # Rolling encoder output buffer (frames for decoder prefill)
@@ -277,6 +278,7 @@ class Qwen3StreamingASRStream(ASRStream):
                 np.arange(len(samples)), samples,
             ).astype(np.float32)
 
+        self._utterance_audio_buffer.append(samples.copy())
         self._audio_buf = np.concatenate([self._audio_buf, samples])
 
         # Track VAD on incoming audio
@@ -306,16 +308,8 @@ class Qwen3StreamingASRStream(ASRStream):
         return text, self._episode_final
 
     def prepare_finalize(self) -> None:
-        """Pre-encode any unprocessed tail so finalize is instant."""
-        tail_len = len(self._audio_buf) - self._processed_samples
-        if tail_len <= 0:
-            return
-        if self._tail_embd is not None and self._tail_audio_len == tail_len:
-            return
-        ctx_audio, n_ctx = self._get_left_context(self._processed_samples)
-        new_audio = self._audio_buf[self._processed_samples:]
-        self._tail_embd = self._encode_with_context(ctx_audio, new_audio, n_ctx)
-        self._tail_audio_len = tail_len
+        """No-op: offline final decode uses full-audio, not encoder tail."""
+        pass
 
     def finalize(self) -> str:
         # Drain remaining unprocessed audio into encoder buffer
@@ -336,20 +330,10 @@ class Qwen3StreamingASRStream(ASRStream):
                 self._total_encoder_frames += enc_out.shape[1]
             self._processed_samples = len(self._audio_buf)
 
-        # Force final decode if not already endpointed
-        if not self._episode_final and self._encoder_frames:
-            all_frames = np.concatenate(self._encoder_frames, axis=1)
-            final_ids = self._decode_final(all_frames)
-            if final_ids:
-                deduped = self._dedup_boundary_tokens(
-                    self._committed_token_ids, final_ids,
-                )
-                self._committed_token_ids.extend(deduped)
-                decoded = self._backend._tokenizer.decode(self._committed_token_ids)
-                if "<asr_text>" in decoded:
-                    decoded = decoded.split("<asr_text>", 1)[1]
-                self._archive_text = decoded.strip()
-                self._episode_final = True
+        # Force final decode if not already endpointed (offline full-audio)
+        if not self._episode_final:
+            self._archive_text = self._offline_final_text()
+            self._episode_final = True
 
         logger.info(
             "Qwen3 streaming finalize: %d chunks, %.1fs audio, "
@@ -402,8 +386,9 @@ class Qwen3StreamingASRStream(ASRStream):
         for i in range(n):
             if self._vad.is_speech(pcm[i * fb:(i + 1) * fb], 16000):
                 if self._episode_final:
-                    # New utterance starting: reset committed state to avoid
-                    # cross-utterance dedup errors from encoder context carryover
+                    # New utterance starting: reset state to avoid
+                    # cross-utterance contamination
+                    self._utterance_audio_buffer = []
                     self._committed_token_ids = []
                     self._archive_text = ""
                     self._episode_final = False
@@ -468,36 +453,30 @@ class Qwen3StreamingASRStream(ASRStream):
         logger.debug("Chunk %d: partial='%s'", self._n_chunks,
                       self._partial_text[:50] if self._partial_text else "<empty>")
 
+    def _offline_final_text(self) -> str:
+        """Full-audio single-pass decode via offline transcribe_audio."""
+        if not self._utterance_audio_buffer:
+            return ''
+        audio = np.concatenate(self._utterance_audio_buffer)
+        return self._backend.transcribe_audio(audio, language=self._language).text
+
     def _do_final_decode(self) -> None:
-        """Run final decode and commit the result."""
-        if not self._encoder_frames:
-            return
+        """Run final decode via offline full-audio single-pass decode."""
+        self._archive_text = self._offline_final_text()
 
-        all_frames = np.concatenate(self._encoder_frames, axis=1)
-        final_ids = self._decode_final(all_frames)
-
-        if final_ids:
-            deduped = self._dedup_boundary_tokens(
-                self._committed_token_ids, final_ids,
-            )
-            self._committed_token_ids.extend(deduped)
-            decoded = self._backend._tokenizer.decode(self._committed_token_ids)
-            if "<asr_text>" in decoded:
-                decoded = decoded.split("<asr_text>", 1)[1]
-            self._archive_text = decoded.strip()
-
-        # Reset for next utterance
-        self._encoder_frames.clear()
-        self._total_encoder_frames = 0
+        # Reset state for next utterance
         self._partial_text = ""
         self._partial_token_ids = []
+        self._committed_token_ids = []
+        self._encoder_frames.clear()
+        self._total_encoder_frames = 0
         self._vad_speech_samples = 0
         self._vad_silence_samples = 0
+        self._utterance_audio_buffer.clear()
         self._episode_final = True
 
         logger.info(
-            "VAD endpoint: %d committed tokens, text='%s'",
-            len(self._committed_token_ids),
+            "VAD endpoint (offline): text='%s'",
             self._archive_text[-60:] if self._archive_text else "",
         )
 
