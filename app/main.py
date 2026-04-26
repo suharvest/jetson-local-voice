@@ -434,6 +434,7 @@ async def _asr_stream_backend(
                 if cmd.get("command") == "reset":
                     stream = asr_be.create_stream(language=language)
                     await ws.send_json({
+                        "type": "reset",
                         "text": "",
                         "is_final": True,
                         "is_stable": True,
@@ -443,6 +444,7 @@ async def _asr_stream_backend(
                 elif cmd.get("command") == "end_utterance":
                     final_text = await asyncio.to_thread(stream.force_endpoint)
                     await ws.send_json({
+                        "type": "final",
                         "text": final_text,
                         "is_final": True,
                         "is_stable": True,
@@ -461,6 +463,7 @@ async def _asr_stream_backend(
                 await asyncio.to_thread(stream.prepare_finalize)
                 final_text = await asyncio.to_thread(stream.finalize)
                 await ws.send_json({
+                    "type": "final",
                     "text": final_text,
                     "is_final": True,
                     "is_stable": True,
@@ -474,11 +477,20 @@ async def _asr_stream_backend(
             # Check for partial results
             partial_text, is_endpoint = stream.get_partial()
             if partial_text:
-                await ws.send_json({
-                    "text": partial_text,
-                    "is_final": is_endpoint,
-                    "is_stable": False,
-                })
+                if is_endpoint:
+                    await ws.send_json({
+                        "type": "final",
+                        "text": partial_text,
+                        "is_final": True,
+                        "is_stable": True,
+                    })
+                else:
+                    await ws.send_json({
+                        "type": "partial",
+                        "text": partial_text,
+                        "is_final": False,
+                        "is_stable": False,
+                    })
 
     except WebSocketDisconnect:
         logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)

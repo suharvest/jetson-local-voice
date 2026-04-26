@@ -34,7 +34,7 @@ def run_v2v(session, base_url, wav_bytes, language="auto", realtime=True):
     final_text = ""
     while True:
         data = json.loads(ws.recv())
-        if data.get("is_final"):
+        if data.get("type") == "final":
             final_text = data.get("text", "").strip()
             break
         final_text = data.get("text", "").strip()
