@@ -440,6 +440,14 @@ async def _asr_stream_backend(
                         "reset": True,
                     })
                     logger.debug("ASR stream reset by client command (backend=%s)", asr_be.name)
+                elif cmd.get("command") == "end_utterance":
+                    final_text = await asyncio.to_thread(stream.force_endpoint)
+                    await ws.send_json({
+                        "text": final_text,
+                        "is_final": True,
+                        "is_stable": True,
+                    })
+                    logger.debug("ASR utterance endpoint forced (backend=%s)", asr_be.name)
                 continue
 
             # ── Binary message: audio data ──

@@ -17,7 +17,6 @@ import os
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -38,8 +37,19 @@ AUDIO_PAD = 151676
 ASR_TEXT = 151704
 EOS_IDS = {151643, 151645}
 
-# Streaming parameters
-CHUNK_SIZE_SEC = 1.2
+# ── True streaming parameters ──
+CHUNK_SIZE_SEC = 0.25          # 250ms chunks (balance latency vs encoder cost)
+LEFT_CONTEXT_SEC = 1.0         # left-context audio ring buffer
+ENCODER_HOP_SAMPLES = 1280     # hop_length(160) × encoder conv stride(8)
+ROLLING_BUFFER_SEC = 5.0       # encoder output buffer for decoder prefill
+PARTIAL_MAX_TOKENS = 12        # tokens per partial decode
+DEDUP_MAX_OVERLAP = 12         # max token overlap for boundary dedup
+
+# ── VAD endpoint parameters ──
+VAD_ENDPOINT_SILENCE_MS = 500  # trailing silence to trigger endpoint
+VAD_MIN_UTTERANCE_S = 1.0      # min speech before endpoint eligible
+
+# ── Legacy (still used by Qwen3ASRStream / offline path) ──
 MEMORY_NUM = 3
 ROLLBACK_TOKENS = 3
 EOS_CONFIRM_COUNT = 2
@@ -153,12 +163,6 @@ def _join_segments(parts: list[str]) -> str:
     return "".join(out)
 
 
-@dataclass
-class SegmentInfo:
-    """One chunk's encoder output stored in the sliding window."""
-    embedding: np.ndarray   # [1, T', 1024]
-
-
 class Qwen3ASRStream(ASRStream):
     """Accumulate-then-transcribe streaming session for Qwen3-ASR.
 
@@ -211,207 +215,307 @@ def _is_cjk(ch: str) -> bool:
 
 
 class Qwen3StreamingASRStream(ASRStream):
-    """Real streaming ASR: encode-once + sliding window + re-prefill per chunk."""
+    """True streaming ASR: 250ms chunks + left-context encoder + VAD endpoint.
+
+    Per-chunk: encode (left_context + new) → trim context frames → partial
+    decode (8-12 tokens).  VAD detects trailing-silence endpoint and triggers
+    a final decode with full token budget + EOS termination.
+    """
 
     def __init__(self, backend: "Qwen3ASRBackend", language: str = "auto"):
         self._backend = backend
         self._language = language
-        self._chunk_size_samples = int(CHUNK_SIZE_SEC * 16000)
+        self._chunk_size_samples = int(CHUNK_SIZE_SEC * 16000)       # 250ms
+        self._left_context_samples = int(LEFT_CONTEXT_SEC * 16000)   # 1.0s
+        self._encoder_hop_samples = ENCODER_HOP_SAMPLES             # 1280
 
-        # Audio buffer (accumulates until chunk_size)
-        self._sample_buf = np.array([], dtype=np.float32)
+        # Audio accumulation (kept for left-context; trimmed periodically)
+        self._audio_buf = np.array([], dtype=np.float32)
+        self._processed_samples = 0
 
-        # Sliding window of encoder embeddings. MEMORY_NUM=3 is the decoder
-        # training-distribution cap — >3 concatenated independently-encoded
-        # chunks drive the decoder OOD (hallucinated "今天天天..." tokens).
-        self._segments: deque[SegmentInfo] = deque(maxlen=MEMORY_NUM)
+        # Rolling encoder output buffer (frames for decoder prefill)
+        self._encoder_frames: list[np.ndarray] = []
+        self._total_encoder_frames = 0
+        self._max_encoder_frames = int(ROLLING_BUFFER_SEC * 13)
 
         # Output state
+        self._committed_token_ids: list[int] = []
         self._archive_text: str = ""
-        self._prev_text: str = ""
-        self._stable_text: str = ""
-        self._eos_count: int = 0
+        self._partial_text: str = ""
+        self._partial_token_ids: list[int] = []
+        self._episode_final: bool = False
 
-        # Timing stats
+        # Timing
         self._total_audio_s: float = 0.0
         self._total_enc_ms: float = 0.0
         self._total_dec_ms: float = 0.0
         self._n_chunks: int = 0
 
-        # Speculative encoding
-        self._spec_embd = None
-        self._spec_audio_len = 0
-
-        # VAD for in-stream silence-based segment breaks (option C).
-        # Splits long utterances at natural pauses before hitting the 3-chunk
-        # training-distribution limit, preserving full transcription.
+        # VAD (webrtcvad, 20ms frames)
         try:
             import webrtcvad
             self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
         except Exception:
             self._vad = None
-        # Min silence (ms) at buffer tail to trigger segment flush.
-        # Loose setting (500ms) — only real sentence-end pauses trigger
-        # flush. Tight setting (200ms) was firing on inter-word micro-pauses
-        # in English, splitting each word into its own segment and starving
-        # per-segment decode budget.
-        self._silence_flush_ms = 500
-        # Min audio in current segment (s) before we consider flushing.
-        # ≥1.5s guarantees each segment has enough content for a meaningful
-        # decode (vs 0.5s which produced 1-word mini-segments).
-        self._min_segment_s = 1.5
-        self._segment_start_samples = 0  # cumulative sample count at segment start
+        self._vad_speech_samples = 0
+        self._vad_silence_samples = 0
 
-    def _tail_is_silent(self, samples: np.ndarray, sr: int = 16000) -> bool:
-        """True if the last `_silence_flush_ms` of samples is VAD-silent."""
-        if self._vad is None:
-            return False
-        req = int(self._silence_flush_ms / 1000 * sr)
-        if len(samples) < req:
-            return False
-        tail = samples[-req:]
-        frame_len = int(VAD_FRAME_MS * sr / 1000)
-        n_frames = len(tail) // frame_len
-        if n_frames == 0:
-            return False
-        pcm16 = (np.clip(tail[:n_frames * frame_len], -1, 1) * 32767).astype(np.int16).tobytes()
-        frame_bytes = frame_len * 2
-        for i in range(n_frames):
-            if self._vad.is_speech(pcm16[i * frame_bytes:(i + 1) * frame_bytes], sr):
-                return False
-        return True
+        # Legacy tail-optimisation (reuse pre-encoded tail in finalize)
+        self._tail_embd: Optional[np.ndarray] = None
+        self._tail_audio_len = 0
 
-    def _segment_seconds(self) -> float:
-        """Cumulative audio duration (s) in the current open segment."""
-        segment_window_s = sum(s.embedding.shape[1] for s in self._segments) / 13
-        # Add current buffer (not yet processed)
-        segment_window_s += len(self._sample_buf) / 16000
-        return segment_window_s
-
-    def _flush_segment(self) -> None:
-        """Close current segment: archive stable text + reset sliding window.
-
-        Used when a silence boundary is detected (natural break) or when the
-        segment hits the 3-chunk training-distribution cap. Prevents the
-        decoder from seeing >3 concatenated independently-encoded chunks.
-        """
-        # Drain any pending tail as the segment's final chunk
-        if len(self._sample_buf) > 0:
-            self._process_chunk(self._sample_buf, is_final=True)
-            self._sample_buf = np.array([], dtype=np.float32)
-        # Commit stable text + reset window state for a fresh segment
-        self._archive_text = self._stable_text
-        self._segments.clear()
-        self._prev_text = ""
-        self._eos_count = 0
-        self._spec_embd = None
-        self._spec_audio_len = 0
+    # ── Public API ────────────────────────────────────────────────
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
-        # Resample to 16kHz if needed
         if sample_rate != 16000:
             ratio = 16000 / sample_rate
             new_len = int(len(samples) * ratio)
             samples = np.interp(
                 np.linspace(0, len(samples) - 1, new_len),
-                np.arange(len(samples)),
-                samples,
+                np.arange(len(samples)), samples,
             ).astype(np.float32)
-        self._sample_buf = np.concatenate([self._sample_buf, samples])
 
-        # Option-C segment break: if we've accumulated enough speech AND the
-        # buffer tail is VAD-silent, flush the segment at this natural pause
-        # before the window grows past 3 chunks.
-        if (self._segment_seconds() >= self._min_segment_s
-                and (len(self._segments) > 0 or len(self._sample_buf) >= self._chunk_size_samples)
-                and self._tail_is_silent(self._sample_buf)):
-            logger.info("VAD silence flush at %.2fs cumulative", self._segment_seconds())
-            self._flush_segment()
-            return
+        self._audio_buf = np.concatenate([self._audio_buf, samples])
 
-        # Speculative encoding: pre-encode if buffer >= 50% chunk but not yet full
-        min_spec = self._chunk_size_samples // 2
-        if (len(self._sample_buf) >= min_spec
-                and len(self._sample_buf) != self._spec_audio_len
-                and len(self._sample_buf) < self._chunk_size_samples):
-            self._spec_embd = self._run_encoder(self._sample_buf)
-            self._spec_audio_len = len(self._sample_buf)
+        # Track VAD on incoming audio
+        self._run_vad(samples)
 
-        # Process complete chunks
-        while len(self._sample_buf) >= self._chunk_size_samples:
-            chunk = self._sample_buf[:self._chunk_size_samples]
-            self._sample_buf = self._sample_buf[self._chunk_size_samples:]
-            self._process_chunk(chunk)
-            # Hard cap: if window just hit MEMORY_NUM chunks with no silence
-            # break, force-flush to stay within decoder training distribution.
-            if len(self._segments) >= MEMORY_NUM and len(self._sample_buf) < self._chunk_size_samples:
-                logger.info("Hard cap flush at %d chunks (no silence found)", len(self._segments))
-                # Do ONE full decode on the complete 3-chunk window BEFORE
-                # archiving. Partial decodes (STREAMING_MAX_TOKENS=4) only
-                # captured ~12 tokens total across 3 chunks, starving middle
-                # content. A final-mode decode with scaled budget (~50 tokens)
-                # captures the full segment text.
-                all_embd = np.concatenate(
-                    [s.embedding for s in self._segments], axis=1
-                )
-                window_sec = sum(s.embedding.shape[1] for s in self._segments) / 13
-                max_tok = min(200, max(20, int(window_sec * 15)))
-                full_text = self._decode_window(all_embd, max_tokens=max_tok)
-                if full_text:
-                    # Append full segment text (not the partial-starved stable)
-                    self._archive_text += full_text + " "
-                self._segments.clear()
-                self._prev_text = ""
-                self._stable_text = self._archive_text
-                self._eos_count = 0
-                self._spec_embd = None
-                self._spec_audio_len = 0
+        # Process complete 250ms chunks
+        chunk_sz = self._chunk_size_samples
+        while len(self._audio_buf) - self._processed_samples >= chunk_sz:
+            self._process_streaming_chunk()
+
+        # Check VAD endpoint (trailing silence ≥500ms + utterance ≥1s)
+        if self._check_vad_endpoint():
+            self._do_final_decode()
+
+        # Trim old audio periodically (keep 2× left-context headroom)
+        max_prefix = self._left_context_samples + chunk_sz
+        if self._processed_samples > max_prefix * 2:
+            trim = self._processed_samples - max_prefix
+            self._audio_buf = self._audio_buf[trim:]
+            self._processed_samples -= trim
 
     def get_partial(self) -> tuple[str, bool]:
-        return self._stable_text, self._eos_count >= EOS_CONFIRM_COUNT
+        text = self._archive_text
+        if self._partial_text and not self._episode_final:
+            sep = " " if not (self._archive_text and _is_cjk(self._archive_text[-1])) else ""
+            text = (self._archive_text + sep + self._partial_text).strip()
+        return text, self._episode_final
 
     def prepare_finalize(self) -> None:
-        """Pre-encode tail buffer so finalize() only needs to decode."""
-        if len(self._sample_buf) == 0:
+        """Pre-encode any unprocessed tail so finalize is instant."""
+        tail_len = len(self._audio_buf) - self._processed_samples
+        if tail_len <= 0:
             return
-        # Already speculatively encoded with matching length?
-        if (self._spec_embd is not None
-                and self._spec_audio_len == len(self._sample_buf)):
+        if self._tail_embd is not None and self._tail_audio_len == tail_len:
             return
-        # Encode the tail buffer now
-        self._spec_embd = self._run_encoder(self._sample_buf)
-        self._spec_audio_len = len(self._sample_buf)
+        ctx_audio, n_ctx = self._get_left_context(self._processed_samples)
+        new_audio = self._audio_buf[self._processed_samples:]
+        self._tail_embd = self._encode_with_context(ctx_audio, new_audio, n_ctx)
+        self._tail_audio_len = tail_len
 
     def finalize(self) -> str:
-        # Flush remaining buffer
-        if len(self._sample_buf) > 0:
-            self._process_chunk(self._sample_buf, is_final=True)
-            self._sample_buf = np.array([], dtype=np.float32)
-        # Return archive + latest window decode
-        all_text = self._archive_text + self._prev_text
+        # Drain remaining unprocessed audio into encoder buffer
+        while len(self._audio_buf) - self._processed_samples >= self._chunk_size_samples:
+            self._process_streaming_chunk()
+
+        tail_len = len(self._audio_buf) - self._processed_samples
+        if tail_len > 0:
+            if (self._tail_embd is not None
+                    and self._tail_audio_len == tail_len):
+                enc_out = self._tail_embd
+            else:
+                ctx_audio, n_ctx = self._get_left_context(self._processed_samples)
+                new_audio = self._audio_buf[self._processed_samples:]
+                enc_out = self._encode_with_context(ctx_audio, new_audio, n_ctx)
+            if enc_out is not None and enc_out.shape[1] > 0:
+                self._encoder_frames.append(enc_out)
+                self._total_encoder_frames += enc_out.shape[1]
+            self._processed_samples = len(self._audio_buf)
+
+        # Force final decode if not already endpointed
+        if not self._episode_final and self._encoder_frames:
+            all_frames = np.concatenate(self._encoder_frames, axis=1)
+            final_ids = self._decode_final(all_frames)
+            if final_ids:
+                deduped = self._dedup_boundary_tokens(
+                    self._committed_token_ids, final_ids,
+                )
+                self._committed_token_ids.extend(deduped)
+                decoded = self._backend._tokenizer.decode(self._committed_token_ids)
+                if "<asr_text>" in decoded:
+                    decoded = decoded.split("<asr_text>", 1)[1]
+                self._archive_text = decoded.strip()
+                self._episode_final = True
+
         logger.info(
             "Qwen3 streaming finalize: %d chunks, %.1fs audio, "
             "enc=%.0fms dec=%.0fms",
             self._n_chunks, self._total_audio_s,
             self._total_enc_ms, self._total_dec_ms,
         )
-        return all_text.strip()
+        return self._archive_text.strip()
 
-    def _run_encoder(self, audio_chunk: np.ndarray) -> np.ndarray:
-        """Encode a single audio chunk via ORT. Returns [1, T', 1024]."""
-        mel = self._backend._compute_mel(audio_chunk)  # [1, 128, T]
+    def force_endpoint(self) -> str:
+        """Trigger endpoint on demand (e.g. end_utterance WS command)."""
+        if not self._episode_final:
+            self._do_final_decode()
+        return self._archive_text
+
+    # ── Internal: audio / encoder ─────────────────────────────────
+
+    def _get_left_context(self, chunk_start: int) -> tuple[np.ndarray, int]:
+        """Return (left-context audio, context_sample_count) for chunk_start."""
+        ctx_start = max(0, chunk_start - self._left_context_samples)
+        return self._audio_buf[ctx_start:chunk_start], chunk_start - ctx_start
+
+    def _encode_with_context(
+        self, ctx_audio: np.ndarray, new_audio: np.ndarray, n_context: int,
+    ) -> Optional[np.ndarray]:
+        """Encode (context + new) → [1, T_new, 1024], trimming context frames."""
+        if len(ctx_audio) > 0:
+            audio = np.concatenate([ctx_audio, new_audio])
+        else:
+            audio = new_audio
+        mel = self._backend._compute_mel(audio)
         enc_out = self._backend._encoder.run(None, {"mel": mel})[0]  # [1, T', 1024]
-        return enc_out
+        trim = int(n_context / self._encoder_hop_samples)
+        if trim >= enc_out.shape[1]:
+            return None
+        return enc_out[:, trim:, :]
 
-    def _decode_window(self, all_embd: np.ndarray, max_tokens: int = STREAMING_MAX_TOKENS) -> str | None:
-        """Prefill + decode on concatenated window embeddings.
+    # ── Internal: VAD ─────────────────────────────────────────────
 
-        Prefers TRT prefill (40ms) over ORT prefill (200ms).
-        For intermediate chunks (small max_tokens), exits early if decoded
-        text already covers previous result (no new information).
-        Returns decoded text, or None if decoder immediately produced EOS.
+    def _run_vad(self, samples: np.ndarray) -> None:
+        if self._vad is None:
+            return
+        frame_len = int(VAD_FRAME_MS * 16000 / 1000)
+        n = len(samples) // frame_len
+        if n == 0:
+            return
+        pcm = (np.clip(samples[:n * frame_len], -1, 1)
+               * 32767).astype(np.int16).tobytes()
+        fb = frame_len * 2
+        for i in range(n):
+            if self._vad.is_speech(pcm[i * fb:(i + 1) * fb], 16000):
+                if self._episode_final:
+                    self._episode_final = False  # new utterance
+                self._vad_speech_samples += frame_len
+                self._vad_silence_samples = 0
+            else:
+                self._vad_silence_samples += frame_len
+
+    def _check_vad_endpoint(self) -> bool:
+        if self._vad is None or self._episode_final:
+            return False
+        return (
+            self._vad_speech_samples >= int(VAD_MIN_UTTERANCE_S * 16000)
+            and self._vad_silence_samples >= int(VAD_ENDPOINT_SILENCE_MS * 16000 / 1000)
+        )
+
+    # ── Internal: chunk processing ────────────────────────────────
+
+    def _process_streaming_chunk(self) -> None:
+        chunk_sz = self._chunk_size_samples
+        new_start = self._processed_samples
+        new_end = new_start + chunk_sz
+        new_audio = self._audio_buf[new_start:new_end]
+        ctx_audio, n_context = self._get_left_context(new_start)
+
+        t0 = time.perf_counter()
+        enc_out = self._encode_with_context(ctx_audio, new_audio, n_context)
+        self._total_enc_ms += (time.perf_counter() - t0) * 1000
+
+        if enc_out is None or enc_out.shape[1] == 0:
+            self._processed_samples = new_end
+            return
+
+        # Append to rolling encoder buffer
+        self._encoder_frames.append(enc_out)
+        self._total_encoder_frames += enc_out.shape[1]
+        while (self._total_encoder_frames > self._max_encoder_frames
+               and len(self._encoder_frames) > 1):
+            removed = self._encoder_frames.pop(0)
+            self._total_encoder_frames -= removed.shape[1]
+
+        self._processed_samples = new_end
+        self._n_chunks += 1
+        self._total_audio_s += chunk_sz / 16000
+
+        # Partial decode (skip if endpoint already finalized)
+        if self._episode_final or not self._encoder_frames:
+            return
+
+        all_frames = np.concatenate(self._encoder_frames, axis=1)
+        t0 = time.perf_counter()
+        partial_ids = self._decode_partial(all_frames)
+        self._total_dec_ms += (time.perf_counter() - t0) * 1000
+
+        if partial_ids:
+            self._partial_token_ids = partial_ids
+            decoded = self._backend._tokenizer.decode(partial_ids)
+            if "<asr_text>" in decoded:
+                decoded = decoded.split("<asr_text>", 1)[1]
+            self._partial_text = decoded.strip()
+
+        logger.debug("Chunk %d: partial='%s'", self._n_chunks,
+                      self._partial_text[:50] if self._partial_text else "<empty>")
+
+    def _do_final_decode(self) -> None:
+        """Run final decode and commit the result."""
+        if not self._encoder_frames:
+            return
+
+        all_frames = np.concatenate(self._encoder_frames, axis=1)
+        final_ids = self._decode_final(all_frames)
+
+        if final_ids:
+            deduped = self._dedup_boundary_tokens(
+                self._committed_token_ids, final_ids,
+            )
+            self._committed_token_ids.extend(deduped)
+            decoded = self._backend._tokenizer.decode(self._committed_token_ids)
+            if "<asr_text>" in decoded:
+                decoded = decoded.split("<asr_text>", 1)[1]
+            self._archive_text = decoded.strip()
+
+        # Reset for next utterance
+        self._encoder_frames.clear()
+        self._total_encoder_frames = 0
+        self._partial_text = ""
+        self._partial_token_ids = []
+        self._vad_speech_samples = 0
+        self._vad_silence_samples = 0
+        self._episode_final = True
+
+        logger.info(
+            "VAD endpoint: %d committed tokens, text='%s'",
+            len(self._committed_token_ids),
+            self._archive_text[-60:] if self._archive_text else "",
+        )
+
+    # ── Internal: decode ─────────────────────────────────────────
+
+    def _decode_partial(self, all_frames: np.ndarray) -> list[int]:
+        """Partial decode: limited budget, EOS-break OK but not committed."""
+        return self._decode_window_internal(all_frames,
+                                            max_tokens=PARTIAL_MAX_TOKENS)
+
+    def _decode_final(self, all_frames: np.ndarray) -> list[int]:
+        """Final decode: budget scales with audio duration, EOS terminates."""
+        window_sec = all_frames.shape[1] / 13  # ~13 encoder fps
+        max_tok = min(200, max(20, int(window_sec * 15)))
+        return self._decode_window_internal(all_frames, max_tokens=max_tok)
+
+    def _decode_window_internal(
+        self, all_embd: np.ndarray, max_tokens: int,
+    ) -> list[int]:
+        """Prefill + autoregressive decode.  Returns token-ID list.
+
+        TRT path preferred (40ms prefill); ORT fallback (200ms prefill).
         """
         audio_len = all_embd.shape[1]
         lang = self._language if self._language != "auto" else None
@@ -419,48 +523,46 @@ class Qwen3StreamingASRStream(ASRStream):
         seq_len = len(prompt_ids)
         audio_offset = prompt_ids.index(AUDIO_PAD)
 
-        # Detect dtype from decoder
         trt_dec = self._backend._decoder
         ort_dec = self._backend._decoder_ort
-        # For TRT path, always use float32 (TRT engine is BF16 internally but accepts FP32)
-        # For ORT path, detect from session input type
         if ort_dec:
             first_input = ort_dec.get_inputs()[0]
-            model_dtype = np.float16 if first_input.type == "tensor(float16)" else np.float32
+            model_dtype = (
+                np.float16 if first_input.type == "tensor(float16)" else np.float32
+            )
         else:
             model_dtype = np.float32
 
-        # Build input embeddings: text tokens + audio features
         embed_tokens = self._backend._embed_tokens
         input_embeds = np.zeros((1, seq_len, 1024), dtype=np.float32)
         for i, tid in enumerate(prompt_ids):
             input_embeds[0, i] = embed_tokens[tid]
-        # Inject audio embeddings at AUDIO_PAD positions
         audio_end = min(audio_offset + audio_len, seq_len)
-        input_embeds[0, audio_offset:audio_end] = all_embd[0, :audio_end - audio_offset].astype(np.float32)
+        input_embeds[0, audio_offset:audio_end] = (
+            all_embd[0, :audio_end - audio_offset].astype(np.float32)
+        )
 
-        # === TRT prefill path (fast, preferred) ===
+        output_ids: list[int] = []
+
+        # ── TRT prefill ──
         if trt_dec and seq_len <= getattr(self._backend, '_trt_max_seq', 500):
             result = trt_dec.prefill(input_embeds)
-            logits = result["logits"]  # [1, S, vocab_size]
-
-            # Decode loop — TRT, KV cache already on GPU from prefill
-            output_ids = []
-            for step in range(max_tokens):
+            logits = result["logits"]
+            for _step in range(max_tokens):
                 next_token = int(np.argmax(logits[0, -1, :]))
                 if next_token in EOS_IDS:
                     break
                 output_ids.append(next_token)
-                embeds = embed_tokens[next_token].astype(np.float32)[np.newaxis, np.newaxis, :]
+                embeds = embed_tokens[next_token].astype(np.float32)[
+                    np.newaxis, np.newaxis, :
+                ]
                 logits = trt_dec.decode_step(embeds, 151936)
 
-        # === ORT fallback path ===
+        # ── ORT fallback ──
         elif ort_dec:
-            # Build ORT prefill inputs
-            n_layers = 28
-            H, dh = 8, 128
+            n_layers, H, dh = 28, 8, 128
             valid_names = [i.name for i in ort_dec.get_inputs()]
-            prefill_in = {
+            prefill_in: dict = {
                 "input_embeds": input_embeds.astype(model_dtype),
                 "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
             }
@@ -468,13 +570,14 @@ class Qwen3StreamingASRStream(ASRStream):
                 for kv_type in ("past_key_", "past_value_"):
                     name = f"{kv_type}{layer}"
                     if name in valid_names:
-                        prefill_in[name] = np.zeros((1, H, 0, dh), dtype=model_dtype)
-
+                        prefill_in[name] = np.zeros(
+                            (1, H, 0, dh), dtype=model_dtype,
+                        )
             valid = {n: v for n, v in prefill_in.items() if n in valid_names}
             outputs = ort_dec.run(None, valid)
             out_map = dict(zip([o.name for o in ort_dec.get_outputs()], outputs))
             logits = out_map.get("logits")
-            kv = {}
+            kv: dict = {}
             for k, v in out_map.items():
                 if k.startswith("new_past_"):
                     kv[k.replace("new_past_", "past_")] = v
@@ -483,20 +586,24 @@ class Qwen3StreamingASRStream(ASRStream):
                 elif k.startswith("past_"):
                     kv[k] = v
 
-            # Decode loop — ORT
-            output_ids = []
-            for step in range(max_tokens):
+            for _step in range(max_tokens):
                 next_token = int(np.argmax(logits[0, -1, :]))
                 if next_token in EOS_IDS:
                     break
                 output_ids.append(next_token)
-                embeds = embed_tokens[next_token].astype(model_dtype)[np.newaxis, np.newaxis, :]
-                cur_pos = seq_len + step
-                step_in = {"input_embeds": embeds,
-                           "position_ids": np.array([[cur_pos]], dtype=np.int64)}
+                embeds = embed_tokens[next_token].astype(model_dtype)[
+                    np.newaxis, np.newaxis, :
+                ]
+                cur_pos = seq_len + len(output_ids)
+                step_in = {
+                    "input_embeds": embeds,
+                    "position_ids": np.array([[cur_pos]], dtype=np.int64),
+                }
                 step_in.update(kv)
                 step_out = ort_dec.run(None, step_in)
-                step_map = dict(zip([o.name for o in ort_dec.get_outputs()], step_out))
+                step_map = dict(
+                    zip([o.name for o in ort_dec.get_outputs()], step_out)
+                )
                 logits = step_map.get("logits")
                 kv = {}
                 for k, v in step_map.items():
@@ -508,88 +615,29 @@ class Qwen3StreamingASRStream(ASRStream):
                         kv[k] = v
         else:
             logger.warning("No decoder available for streaming")
-            return None
+            return []
 
-        if not output_ids:
-            return None
+        return output_ids
 
-        text = self._backend._tokenizer.decode(output_ids)
-        if "<asr_text>" in text:
-            text = text.split("<asr_text>", 1)[1]
-        return text.strip()
+    # ── Internal: dedup ───────────────────────────────────────────
 
-    def _process_chunk(self, audio_chunk: np.ndarray, is_final: bool = False) -> None:
-        """Encode chunk, decode with sliding window, update output state."""
-        chunk_sec = len(audio_chunk) / 16000
-        self._total_audio_s += chunk_sec
-        self._n_chunks += 1
+    def _dedup_boundary_tokens(
+        self, archive_ids: list[int], new_ids: list[int],
+        max_overlap: int = DEDUP_MAX_OVERLAP,
+    ) -> list[int]:
+        """Return suffix of *new_ids* with the longest prefix overlap removed.
 
-        # 1. Encode (reuse speculative embedding if it matches this chunk)
-        t0 = time.perf_counter()
-        if (self._spec_embd is not None
-                and self._spec_audio_len == len(audio_chunk)):
-            enc_out = self._spec_embd
-            self._spec_embd = None
-            self._spec_audio_len = 0
-        else:
-            enc_out = self._run_encoder(audio_chunk)
-        self._total_enc_ms += (time.perf_counter() - t0) * 1000
+        Compares token IDs (not strings), so the match is exact.
+        """
+        if not archive_ids or not new_ids:
+            return new_ids
+        limit = min(len(archive_ids), len(new_ids), max_overlap)
+        for k in range(limit, 0, -1):
+            if archive_ids[-k:] == new_ids[:k]:
+                return new_ids[k:]
+        return new_ids
 
-        # 2. Update sliding window (don't evict on final — keep full context)
-        if not is_final and len(self._segments) >= MEMORY_NUM:
-            self._segments.popleft()
-        self._segments.append(SegmentInfo(embedding=enc_out))
-
-        # 3. Concatenate all window embeddings
-        all_embd = np.concatenate(
-            [s.embedding for s in self._segments], axis=1
-        )
-
-        # 4. Decode
-        if is_final:
-            # Scale max_tokens to expected output length (~15 tokens/sec)
-            window_sec = sum(s.embedding.shape[1] for s in self._segments) / 13  # ~13 features/sec
-            estimated_tokens = max(20, int(window_sec * 15))
-            max_tok = min(200, estimated_tokens)
-        else:
-            max_tok = STREAMING_MAX_TOKENS
-        t0 = time.perf_counter()
-        raw_text = self._decode_window(all_embd, max_tokens=max_tok)
-        self._total_dec_ms += (time.perf_counter() - t0) * 1000
-
-        # 5. Endpoint detection
-        if raw_text is None:
-            self._eos_count += 1
-        else:
-            self._eos_count = 0
-
-        # 5b. Auto-reset on confirmed endpoint
-        if self._eos_count >= EOS_CONFIRM_COUNT and not is_final:
-            logger.info("Semantic endpoint detected at chunk %d, resetting window",
-                        self._n_chunks)
-            # Archive current stable text, reset window for next utterance
-            self._archive_text = self._stable_text
-            self._segments.clear()
-            self._prev_text = ""
-            self._eos_count = 0
-
-        # 6. Rollback + LocalAgreement (skip for final chunk)
-        if is_final and raw_text:
-            self._stable_text = self._archive_text + raw_text
-            self._prev_text = raw_text
-        elif raw_text:
-            rolled = self._apply_rollback(raw_text)
-            stable = self._local_agreement(self._prev_text, rolled)
-            self._stable_text = self._archive_text + stable
-            self._prev_text = rolled
-
-        logger.debug(
-            "Chunk %d: %.1fs audio, enc=%.0fms, dec=%.0fms, "
-            "eos_count=%d, text='%s'",
-            self._n_chunks, chunk_sec,
-            self._total_enc_ms, self._total_dec_ms,
-            self._eos_count, self._stable_text[-50:] if self._stable_text else "",
-        )
+    # ── Legacy helpers (retained for reference) ──────────────────
 
     def _apply_rollback(self, text: str) -> str:
         """Strip last tokens to remove boundary jitter. Adaptive for short text."""
@@ -610,11 +658,8 @@ class Qwen3StreamingASRStream(ASRStream):
         i = 0
         while i < min_len and prev[i] == curr[i]:
             i += 1
-        # For CJK: each char is a word, so character boundary is fine.
-        # For English: snap back to last space boundary.
         result = curr[:i]
         if i < len(curr) and i > 0 and not _is_cjk(curr[i - 1]):
-            # Snap to last space
             last_space = result.rfind(" ")
             if last_space > 0:
                 result = result[:last_space + 1]
