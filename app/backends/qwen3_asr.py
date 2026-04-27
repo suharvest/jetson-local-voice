@@ -304,10 +304,14 @@ class Qwen3StreamingASRStream(ASRStream):
                 np.arange(len(samples)), samples,
             ).astype(np.float32)
 
+        # Check for new utterance BEFORE appending — VAD state reset
+        # must not discard current chunk (M1 fix).
+        self._check_new_utterance_resume(samples)
+
         self._utterance_audio_buffer.append(samples.copy())
         self._audio_buf = np.concatenate([self._audio_buf, samples])
 
-        # Track VAD on incoming audio
+        # Track VAD on incoming audio (no longer resets buffer)
         self._run_vad(samples)
 
         # Process complete 250ms chunks
@@ -367,6 +371,18 @@ class Qwen3StreamingASRStream(ASRStream):
             self._n_chunks, self._total_audio_s,
             self._total_enc_ms, self._total_dec_ms,
         )
+
+        # Sync ASR ORT user_compute_stream so all ASR GPU work is done
+        # before the caller hands off to TTS TRT CUDA Graph capture.
+        # Without this, V2V triggers CUDA error 906 (legacy stream
+        # depend on capturing blocking stream).
+        if _ASR_CUDA_STREAM is not None:
+            try:
+                from cuda import cudart
+                cudart.cudaStreamSynchronize(_ASR_CUDA_STREAM)
+            except Exception as e:  # pragma: no cover
+                logger.warning("ASR stream sync on finalize failed: %s", e)
+
         return self._archive_text.strip()
 
     def force_endpoint(self) -> str:
@@ -399,6 +415,56 @@ class Qwen3StreamingASRStream(ASRStream):
 
     # ── Internal: VAD ─────────────────────────────────────────────
 
+    def _check_new_utterance_resume(self, samples: np.ndarray) -> bool:
+        """Check if *samples* contain speech starting a new utterance.
+
+        Must be called BEFORE appending to _utterance_audio_buffer so that
+        the first chunk of the new utterance is preserved. When a new
+        utterance is detected (previous episode finalized + current chunk
+        contains speech), all per-utterance state is reset so the new
+        chunk is the first sample of the next episode.
+
+        Returns True if a new-utterance reset was performed.
+        """
+        if not self._episode_final:
+            return False
+        # Detect speech presence in the incoming chunk. Prefer webrtcvad if
+        # available; otherwise fall back to a simple energy heuristic so
+        # the bug-fix path still triggers in test/CI environments without
+        # the VAD installed.
+        has_speech = False
+        if self._vad is not None:
+            frame_len = int(VAD_FRAME_MS * 16000 / 1000)
+            n = len(samples) // frame_len
+            if n > 0:
+                pcm = (np.clip(samples[:n * frame_len], -1, 1)
+                       * 32767).astype(np.int16).tobytes()
+                fb = frame_len * 2
+                for i in range(n):
+                    if self._vad.is_speech(pcm[i * fb:(i + 1) * fb], 16000):
+                        has_speech = True
+                        break
+        else:
+            # Energy fallback: RMS above a small threshold counts as speech.
+            if len(samples) > 0:
+                rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+                has_speech = rms > 1e-3
+        if not has_speech:
+            return False
+
+        # Full per-utterance state reset.
+        self._utterance_audio_buffer = []
+        self._partial_text = ""
+        self._partial_token_ids = []
+        self._committed_token_ids = []
+        self._encoder_frames = []
+        self._total_encoder_frames = 0
+        self._vad_speech_samples = 0
+        self._vad_silence_samples = 0
+        self._archive_text = ""
+        self._episode_final = False
+        return True
+
     def _run_vad(self, samples: np.ndarray) -> None:
         if self._vad is None:
             return
@@ -411,13 +477,6 @@ class Qwen3StreamingASRStream(ASRStream):
         fb = frame_len * 2
         for i in range(n):
             if self._vad.is_speech(pcm[i * fb:(i + 1) * fb], 16000):
-                if self._episode_final:
-                    # New utterance starting: reset state to avoid
-                    # cross-utterance contamination
-                    self._utterance_audio_buffer = []
-                    self._committed_token_ids = []
-                    self._archive_text = ""
-                    self._episode_final = False
                 self._vad_speech_samples += frame_len
                 self._vad_silence_samples = 0
             else:
