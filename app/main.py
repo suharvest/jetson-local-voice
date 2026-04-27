@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, StreamingResponse
@@ -43,8 +44,27 @@ class CloneStreamRequest(BaseModel):
 
 _asr_backend = None
 
+# Dedicated single-thread executor for streaming TTS (T3 fix).
+# Default asyncio executor spawns multiple worker threads; each new thread
+# observes a cold CUDA per-thread context for the C++ TRT engine, which
+# inflates streaming prefill from ~16ms (warm) to 33-122ms (cold) under
+# any concurrency. Pinning streaming TTS to a single worker keeps the
+# CUDA context warm across all requests. ASR continues to use the
+# default executor (asyncio.to_thread).
+_tts_stream_executor: ThreadPoolExecutor | None = None
+
+
 def _get_asr_backend():
     return _asr_backend
+
+
+def _get_tts_stream_executor() -> ThreadPoolExecutor:
+    global _tts_stream_executor
+    if _tts_stream_executor is None:
+        _tts_stream_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tts-stream"
+        )
+    return _tts_stream_executor
 
 @app.on_event("startup")
 async def startup():
@@ -79,6 +99,31 @@ async def startup():
     import tts_service
     logger.info("Pre-loading TTS model...")
     tts_service.preload()
+
+    # Warm up the dedicated streaming-TTS executor thread so its CUDA
+    # per-thread context is initialized before the first /tts/stream
+    # request lands. Without this, the very first streaming request
+    # pays a ~30ms cold-context tax on prefill.
+    try:
+        from tts_backend import TTSCapability
+        if tts_service.has_capability(TTSCapability.STREAMING):
+            backend = tts_service.get_backend()
+            executor = _get_tts_stream_executor()
+
+            def _warm_stream():
+                try:
+                    # Run one tiny streaming synthesis on the executor
+                    # thread to materialize CUDA context state.
+                    for _ in backend.generate_streaming("你好"):
+                        pass
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("TTS streaming warm-up failed: %s", exc)
+
+            import asyncio as _asyncio
+            await _asyncio.get_event_loop().run_in_executor(executor, _warm_stream)
+            logger.info("TTS streaming executor warmed up (1 thread, CUDA primed).")
+    except Exception as exc:  # pragma: no cover
+        logger.warning("TTS streaming executor warm-up skipped: %s", exc)
 
     logger.info("Speech service ready.")
 
@@ -201,7 +246,7 @@ async def tts_stream(req: TTSRequest):
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
-        loop.run_in_executor(None, _run)
+        loop.run_in_executor(_get_tts_stream_executor(), _run)
 
         while True:
             chunk = await queue.get()
@@ -331,7 +376,7 @@ async def tts_clone_stream(req: CloneStreamRequest):
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
-        loop.run_in_executor(None, _run)
+        loop.run_in_executor(_get_tts_stream_executor(), _run)
 
         while True:
             chunk = await queue.get()
