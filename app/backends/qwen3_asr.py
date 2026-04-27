@@ -64,7 +64,7 @@ ASR_TEXT = 151704
 EOS_IDS = {151643, 151645}
 
 # ── True streaming parameters ──
-CHUNK_SIZE_SEC = 0.25          # 250ms chunks (balance latency vs encoder cost)
+CHUNK_SIZE_SEC = 0.4           # 400ms chunks (reduce partial frequency vs latency)
 LEFT_CONTEXT_SEC = 1.0         # left-context audio ring buffer
 ENCODER_HOP_SAMPLES = 1280     # hop_length(160) × encoder conv stride(8)
 ROLLING_BUFFER_SEC = 5.0       # encoder output buffer for decoder prefill
@@ -251,7 +251,7 @@ class Qwen3StreamingASRStream(ASRStream):
     def __init__(self, backend: "Qwen3ASRBackend", language: str = "auto"):
         self._backend = backend
         self._language = language
-        self._chunk_size_samples = int(CHUNK_SIZE_SEC * 16000)       # 250ms
+        self._chunk_size_samples = int(CHUNK_SIZE_SEC * 16000)       # 400ms
         self._left_context_samples = int(LEFT_CONTEXT_SEC * 16000)   # 1.0s
         self._encoder_hop_samples = ENCODER_HOP_SAMPLES             # 1280
 
