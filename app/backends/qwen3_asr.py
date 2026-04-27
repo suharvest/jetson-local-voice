@@ -1027,6 +1027,12 @@ class Qwen3ASRBackend(ASRBackend):
         decode_ms = (time.perf_counter() - t0) * 1000
         total_ms = (time.perf_counter() - t_total) * 1000
 
+        # A0 instrumentation: per-call enc / prefill+decode split for offline path
+        logger.info(
+            "offline transcribe: enc=%.0fms prefill+dec=%.0fms tokens=%d audio=%.2fs",
+            enc_ms, decode_ms, len(output_ids), len(audio) / 16000,
+        )
+
         # Decode text
         text = self._tokenizer.decode(output_ids) if self._tokenizer else f"[{len(output_ids)} tokens]"
         if "<asr_text>" in text:
