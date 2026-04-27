@@ -1119,20 +1119,43 @@ class Qwen3ASRBackend(ASRBackend):
         return ids
 
     def _compute_mel(self, audio):
-        from transformers import WhisperFeatureExtractor
         # Use chunk_length matching actual audio to avoid excessive padding
         audio_secs = len(audio) / 16000
         chunk_len = min(30, int(audio_secs) + 1)  # Round up, max 30s
         # Cache the feature extractor for common chunk lengths
         if not hasattr(self, '_mel_cache'):
             self._mel_cache = {}
-        if chunk_len not in self._mel_cache:
-            self._mel_cache[chunk_len] = WhisperFeatureExtractor(
-                feature_size=128, sampling_rate=16000,
-                n_fft=400, hop_length=160, chunk_length=chunk_len)
-        fe = self._mel_cache[chunk_len]
-        features = fe(audio, sampling_rate=16000, return_tensors="np")
-        return features["input_features"]  # [1, 128, T]
+
+        # MEL_BACKEND=librosa (default) uses local librosa+numpy path
+        # (drops the transformers runtime dep). MEL_BACKEND=transformers
+        # keeps WhisperFeatureExtractor as an immediate rollback path.
+        # See docs/plans/asr-mel-librosa-2026-04-27.md.
+        mel_backend = os.environ.get("MEL_BACKEND", "librosa").strip().lower()
+        if mel_backend == "transformers":
+            from transformers import WhisperFeatureExtractor
+            cache_key = ("transformers", chunk_len)
+            if cache_key not in self._mel_cache:
+                self._mel_cache[cache_key] = WhisperFeatureExtractor(
+                    feature_size=128, sampling_rate=16000,
+                    n_fft=400, hop_length=160, chunk_length=chunk_len)
+            fe = self._mel_cache[cache_key]
+            features = fe(audio, sampling_rate=16000, return_tensors="np")
+            return features["input_features"]  # [1, 128, T]
+        if mel_backend != "librosa":
+            raise ValueError(
+                f"Unsupported MEL_BACKEND={mel_backend!r}; expected 'librosa' or 'transformers'"
+            )
+        try:
+            from app.utils.whisper_mel import compute_whisper_log_mel
+        except ImportError:
+            try:
+                from utils.whisper_mel import compute_whisper_log_mel
+            except ImportError:
+                # Container overlay layout ships whisper_mel.py next to this
+                # backend (under backends/) because /opt/speech/app/utils/ is
+                # not bind-mountable without a compose change.
+                from backends.whisper_mel import compute_whisper_log_mel
+        return compute_whisper_log_mel(audio, chunk_len, self._mel_cache)
 
     @staticmethod
     def _bytes_to_float(audio_bytes):
