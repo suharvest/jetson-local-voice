@@ -1,0 +1,20 @@
+ASR: qwen3_asr  TTS: qwen3_trt
+Mode: realtime
+
+--- Run 1/2 ---
+
+Sentence                       Audio     ASR   Hand    TTFB  EOS>Aud Text
+---------------------------------------------------------------------------------------------------------
+你好世界                            1.0s    469ms     0ms     21ms     491ms 你好，你好，世界。
+今天天气不错我们出去玩吧                    3.8s   1253ms     0ms      6ms    1260ms 当前。
+Hello world how are you today   1.9s    272ms     0ms      6ms     278ms Current.
+
+--- Run 2/2 ---
+
+Sentence                       Audio     ASR   Hand    TTFB  EOS>Aud Text
+---------------------------------------------------------------------------------------------------------
+你好世界                            1.1s    268ms     0ms      5ms     274ms 你好，好，世界。
+今天天气不错我们出去玩吧                    2.9s    547ms     0ms      6ms     554ms 天天天天天天天。
+Hello world how are you today   4.2s    176ms     0ms      5ms     182ms Current.
+
+DONE
