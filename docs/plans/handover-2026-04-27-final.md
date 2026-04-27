@@ -1,10 +1,11 @@
 # 交接文档 — 2026-04-27 全天 session 总结
 
-**Session 范围**：从早上接手 ASR 优化 → 到晚上 v3.4 image ship + v3.5 clean rebuild 派 background。
+**Session 范围**：从早上接手 ASR 优化 → v3.4 ship → v3.5 干净 build 试错 → v3.4-slim 切 prod → Orin Nano 试。
 **起点 commit**：`be0ef76`（feature/asr1-true-streaming）
-**终点 commit (撰写时)**：`a3afd28`（main，PR #5 已 merge）
-**v3.5 image build 仍在 background companion 跑** (job `20260427-193555-610894`)
-**Prod**：orin-nx container `reachy_speech-speech-1` 跑 image `jetson-voice-speech:v3.4-librosa-no-transformers`
+**终点 commit**：`6d99cab`（main，PR #5 已 merge）
+**Prod (晚上 21:35 切)**：orin-nx container `reachy_speech-speech-1` 跑 image **`jetson-voice-speech:v3.4-slim`** (1.49GB, 比原 v3.4 -36%)
+**Orin Nano 测试** background 跑中 (agent `acd84e080afb0c1d5`)
+**v3.5 clean build 已弃** (TRT 10.4 跟 engine 10.3 ABI 不兼容, image 留着但用不了)
 
 ---
 
@@ -222,14 +223,31 @@
 
 ---
 
-## 6. 当前进行中
+## 6. v3.5 clean build 试错总结（弃）
 
-### v3.5 clean rebuild (background companion `20260427-193555-610894`)
-- Phase 1 ✅ Mac repo sync 到 orin-nx
-- Phase 2 ⏳ Docker Hub 国内不通，**Mac 拉 base image → save 成 5.6GB tarball → fleet push 到 orin-nx 走 docker load**
-- Phase 3-6 待跑（build / test / V2V / 切 prod）
-- 预计还要 30-50 分钟
-- 完成后 v3.5 image 应该 < v3.4 (没有一天 cache 累积) + 自包含 + 文档化（dustynv 国内 workaround 也成最佳实践）
+派了 deepseek-flash 想从 dustynv base 干净 build，过程踩了：
+1. Docker Hub 国内全断（Hub / daocloud / 阿里 / nvcr.io）
+2. agent 绕开走 Mac 拉 base + docker save 成 5.6GB → fleet push → load (展开 17.2GB)
+3. GitHub jetson-qwen3-speech 仓库国内不通 → Mac clone 后 tar 传过去
+4. base image 自带 pip 索引指 `jetson.webredirect.org` 国内不通 → agent 选 PIP_INDEX_URL=pypi.org（错，应该选清华/阿里）
+5. 用户指出选错 mirror 后 stop agent
+6. 主线程定位到真正阻断点：**`registry-1.docker.io` 解析到 Facebook IP**（DNS 投毒）+ **clear winning 是 Tsinghua mirror**
+7. v3.5-clean image 实际**build 出来了**（18.2GB，因为 dustynv base 自身就 17.2GB）
+8. 起来测发现：**TRT 10.4 vs engine 10.3 ABI 不兼容** `Error Code 6: deserializeCudaEngine version mismatch`
+9. **决定 v3.5 弃**，转走"基于 v3.4 切 slim"路径
+
+### v3.4-slim ship (晚上 21:35) ✅
+- Agent 在 v3.4 容器里清 pip cache + `__pycache__` + tests/ + apt lists + `/tmp` (~400MB) → docker commit → docker export | import flatten → 重 set ENV/CMD
+- Image **1.49GB** (vs v3.4 2.34GB, **-36%**)
+- 维护窗口测：N=15 warmup=8 V2V steady ~390ms (跟 v3.4 baseline 327-348ms 噪音带内)，CER 不退，文本全对
+- **prod 已切**：compose `image: jetson-voice-speech:v3.4-slim`，container Up 30s 时 /health 200
+
+### Orin Nano 8GB 测试 (background, agent `acd84e080afb0c1d5`)
+- 找 fleet 里 Orin Nano 设备
+- 把 v3.4-slim 用 docker save | gzip 传过去 (~700-800MB)
+- 用 paraformer + matcha (zh_en mode, ~1GB 模型) 起 container
+- 实测 RAM + V2V 数字
+- 推荐用：8GB Nano + zh_en mode；qwen3 multilanguage mode 在 8GB Nano 99% OOM 不试
 
 ---
 
@@ -276,9 +294,31 @@
 
 ## 9. 下次接手建议
 
-1. **先看 v3.5 build 跑完没**：`node /Users/harvest/project/claude-rescue/scripts/claude-companion.mjs status 20260427-193555-610894`
-2. **快赢顺序**：A2 Path A v2（修 ONNX shape）→ TTS T4/T6/T7 → C5
-3. **任何 V2V 测量必读 `feedback_v2v_warmup_curve_trap.md`**，N≥15 warmup=8 起步
-4. **C3 multi-step graph 不要碰**，除非项目稳定性可承受 16-28h 工程 + Myelin 风险
-5. **多用户支持** 优先尝试 paraformer+matcha 切换（5 分钟事），再考虑多进程
-6. **C++ 重 build .so** 必须先派 codex 出 spec，不要让 sonnet/glm 自己设计
+1. **先看 Orin Nano 测试结果** (agent `acd84e080afb0c1d5`)：能跑就敲定 Nano 部署 spec
+2. **prod 已是 v3.4-slim**，v3.4-librosa-no-transformers 旧 tag 留着回退（compose backup `.bak.before_v34slim`）
+3. **快赢顺序**：A2 Path A v2（修 ONNX shape inference）→ TTS T4/T6/T7 → C5 (KV BF16 IO engine rebuild)
+4. **任何 V2V 测量必读 `feedback_v2v_warmup_curve_trap.md`**，N≥15 warmup=8 起步，复杂场景 N=20 warmup=12
+5. **C3 multi-step graph 不要碰**，除非项目稳定性可承受 16-28h 工程 + Myelin 风险
+6. **多用户支持** 优先尝试 paraformer+matcha 切换 (`LANGUAGE_MODE=zh_en` + restart)，再考虑多进程
+7. **C++ 重 build .so** 必须先派 codex 出 spec，不要让 sonnet/glm 自己设计
+8. **国内构建注意**：`docker.io` 被 DNS 投毒（解析到 Facebook IP），需要绕路；pip 用 Tsinghua/阿里 mirror（agent 容易选错为 pypi.org）；docker base image 走 Mac 拉 → save → load 中转
+9. **v3.5 clean rebuild 暂搁置** — TRT 10.4 vs 10.3 ABI lock-in 意味着 base image 升级必须同步重 build 全部 engine，是更大工程不能轻动
+
+## 10. v3.4-slim 分发说明
+
+- Image: `jetson-voice-speech:v3.4-slim` (1.49GB)
+- 导出: `docker save jetson-voice-speech:v3.4-slim | gzip > v34-slim.tar.gz` (~700-800MB)
+- 目标机要求：JetPack 6.x (TRT 10.3 兼容)，CUDA 12.6，host 上有 `/usr/lib/aarch64-linux-gnu/nvidia`、`/lib/aarch64-linux-gnu`、`/usr/local/cuda/lib64`（标准 JP 装的就行）
+- 加载: `docker load < v34-slim.tar.gz`
+- 起 container: 见上文 prod compose / 或本文档第 6 节 Orin Nano example
+- **不**自包含 — 仍要 host 提供 CUDA/TRT runtime 库做 bind mount
+
+## 11. 已知 image 列表 (orin-nx)
+
+| Tag | Size | 状态 |
+|---|---|---|
+| **v3.4-slim** | **1.49GB** | **当前 prod** |
+| v3.4-slim-flat | 1.49GB | v3.4-slim 的 flat parent，**不要删** |
+| v3.4-librosa-no-transformers | 2.34GB | 旧 prod，留作回退 |
+| v3.3-no-transformers | 2.02GB | 旧版（命名误导 transformers 没真卸） |
+| v3.5-clean | 18.2GB | TRT ABI 不兼容，可 docker rmi 删 |
