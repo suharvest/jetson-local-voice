@@ -13,13 +13,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 libsndfile1 sox patchelf \
     && rm -rf /var/lib/apt/lists/*
 
-# FastAPI stack (use PyPI explicitly; base image may set a custom index)
+# FastAPI stack + runtime deps (use PyPI explicitly; base image may set a custom index)
 RUN pip3 install --no-cache-dir --index-url https://pypi.org/simple \
     fastapi \
     "uvicorn[standard]" \
     soundfile \
     python-multipart \
-    numpy
+    numpy \
+    tokenizers \
+    "transformers<5" \
+    librosa \
+    "webrtcvad-wheels>=2.0.14" \
+    "cuda-python>=12,<13"
 
 # Qwen3-TTS/ASR TensorRT backend for multilanguage mode
 # Install from GitHub release (includes prebuilt .so for Jetson Orin)
