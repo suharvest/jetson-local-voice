@@ -781,14 +781,52 @@ class Qwen3ASRBackend(ASRBackend):
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 
-        logger.info("Loading encoder...")
+        # A2 Path A: opt-in ORT TensorRT EP for encoder.
+        # Set ASR_ENCODER_BACKEND=ort_trt to switch from CUDA EP to TRT EP.
+        # Default ort_cuda preserves the proven-stable path.
+        encoder_backend = os.environ.get("ASR_ENCODER_BACKEND", "ort_cuda").lower()
+        if encoder_backend == "ort_trt":
+            available = ort.get_available_providers()
+            if "TensorrtExecutionProvider" not in available:
+                logger.warning(
+                    "ASR_ENCODER_BACKEND=ort_trt requested but TensorrtExecutionProvider "
+                    "not available (have %s); falling back to CUDA EP", available)
+            else:
+                trt_cache_dir = os.environ.get(
+                    "ASR_TRT_CACHE_DIR", os.path.join(_BASE, "trt_cache"))
+                try:
+                    os.makedirs(trt_cache_dir, exist_ok=True)
+                except OSError as e:
+                    logger.warning("Cannot create TRT cache dir %s: %s", trt_cache_dir, e)
+                providers = [
+                    "TensorrtExecutionProvider",
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
+                ]
+                provider_options = [
+                    {
+                        "device_id": 0,
+                        "trt_fp16_enable": True,
+                        "trt_engine_cache_enable": True,
+                        "trt_engine_cache_path": trt_cache_dir,
+                        "trt_max_workspace_size": 2147483648,
+                    },
+                    {"device_id": 0, "user_compute_stream": _get_asr_cuda_stream_handle()},
+                    {},
+                ]
+                logger.info(
+                    "ASR encoder using TensorRT EP (cache=%s, fp16=on, ws=2GB)",
+                    trt_cache_dir)
+
+        logger.info("Loading encoder (backend=%s)...", encoder_backend)
         for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
             enc_path = os.path.join(_BASE, enc_name)
             if os.path.exists(enc_path):
                 self._encoder = ort.InferenceSession(
                     enc_path, so, providers=providers, provider_options=provider_options
                 )
-                logger.info("Encoder loaded: %s", enc_name)
+                actual_provs = self._encoder.get_providers()
+                logger.info("Encoder loaded: %s providers=%s", enc_name, actual_provs)
                 break
 
         # ── 2. Embed tokens ──
@@ -955,19 +993,28 @@ class Qwen3ASRBackend(ASRBackend):
         # 4. Prefill + decode
         t0 = time.perf_counter()
         output_ids = []
+        prefill_ms = 0.0
+        decode_loop_ms = 0.0
+        d2h_ms = 0.0
 
         # === TRT prefill path (fast, preferred) ===
         if self._decoder and seq_len <= getattr(self, '_trt_max_seq', 500):
+            t_pf = time.perf_counter()
             result = self._decoder.prefill(input_embeds)
             logits = result["logits"]  # [1, S, vocab_size]
+            prefill_ms = (time.perf_counter() - t_pf) * 1000
 
+            t_dec_loop = time.perf_counter()
             for step in range(200):
+                t_d2h = time.perf_counter()
                 next_token = int(np.argmax(logits[0, -1, :]))
+                d2h_ms += (time.perf_counter() - t_d2h) * 1000
                 if next_token in EOS_IDS:
                     break
                 output_ids.append(next_token)
                 embeds = self._embed_tokens[next_token].astype(np.float32)[np.newaxis, np.newaxis, :]
                 logits = self._decoder.decode_step(embeds, 151936)
+            decode_loop_ms = (time.perf_counter() - t_dec_loop) * 1000 - d2h_ms
 
         # === ORT fallback path ===
         elif self._decoder_ort:
@@ -1027,10 +1074,12 @@ class Qwen3ASRBackend(ASRBackend):
         decode_ms = (time.perf_counter() - t0) * 1000
         total_ms = (time.perf_counter() - t_total) * 1000
 
-        # A0 instrumentation: per-call enc / prefill+decode split for offline path
+        # B0 instrumentation: per-call enc / prefill / decode-loop / d2h split
         logger.info(
-            "offline transcribe: enc=%.0fms prefill+dec=%.0fms tokens=%d audio=%.2fs",
-            enc_ms, decode_ms, len(output_ids), len(audio) / 16000,
+            "offline transcribe: enc=%.1fms prefill=%.1fms decode=%.1fms d2h=%.2fms "
+            "tokens=%d seq_len=%d audio=%.2fs",
+            enc_ms, prefill_ms, decode_loop_ms, d2h_ms,
+            len(output_ids), seq_len, len(audio) / 16000,
         )
 
         # Decode text
