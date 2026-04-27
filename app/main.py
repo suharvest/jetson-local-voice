@@ -49,9 +49,15 @@ _asr_backend = None
 # observes a cold CUDA per-thread context for the C++ TRT engine, which
 # inflates streaming prefill from ~16ms (warm) to 33-122ms (cold) under
 # any concurrency. Pinning streaming TTS to a single worker keeps the
-# CUDA context warm across all requests. ASR continues to use the
-# default executor (asyncio.to_thread).
+# CUDA context warm across all requests.
 _tts_stream_executor: ThreadPoolExecutor | None = None
+
+# Dedicated single-thread executor for streaming ASR.  Without this,
+# concurrent WS connections dispatch ASR work to separate IO threads,
+# each racing on _ASR_CUDA_STREAM (process-global singleton) leading to
+# CUDA Graph capture failures.  One worker serialises all ASR ops on a
+# consistent thread with a warm CUDA context.
+_asr_executor: ThreadPoolExecutor | None = None
 
 
 def _get_asr_backend():
@@ -65,6 +71,15 @@ def _get_tts_stream_executor() -> ThreadPoolExecutor:
             max_workers=1, thread_name_prefix="tts-stream"
         )
     return _tts_stream_executor
+
+
+def _get_asr_executor() -> ThreadPoolExecutor:
+    global _asr_executor
+    if _asr_executor is None:
+        _asr_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="asr-stream"
+        )
+    return _asr_executor
 
 @app.on_event("startup")
 async def startup():
@@ -93,6 +108,23 @@ async def startup():
         _asr_backend.preload()
         logger.info("ASR backend: %s (capabilities: %s)",
                      _asr_backend.name, [c.value for c in _asr_backend.capabilities])
+
+        # Warm up ASR executor thread so its CUDA per-thread context is
+        # initialised before the first streaming request.  Without this the
+        # very first accept_waveform pays a cold-context tax on encoder.
+        _asyncio = __import__("asyncio")
+        _executor = _get_asr_executor()
+
+        def _warm_asr():
+            try:
+                import numpy as _np
+                silence = _np.zeros(16000, dtype=_np.float32)
+                _asr_backend.transcribe_audio(silence)
+                logger.info("ASR streaming executor warmed up (1 thread, CUDA primed).")
+            except Exception as exc:
+                logger.warning("ASR warm-up failed: %s", exc)
+
+        await _asyncio.get_event_loop().run_in_executor(_executor, _warm_asr)
     except Exception as e:
         logger.warning("ASR backend failed: %s", e)
 
@@ -487,7 +519,8 @@ async def _asr_stream_backend(
                     })
                     logger.debug("ASR stream reset by client command (backend=%s)", asr_be.name)
                 elif cmd.get("command") == "end_utterance":
-                    final_text = await asyncio.to_thread(stream.force_endpoint)
+                    _loop = asyncio.get_event_loop()
+                    final_text = await _loop.run_in_executor(_get_asr_executor(), stream.force_endpoint)
                     await ws.send_json({
                         "type": "final",
                         "text": final_text,
@@ -505,8 +538,9 @@ async def _asr_stream_backend(
 
             if len(data) == 0:
                 # End of audio — pre-encode tail, then decode
-                await asyncio.to_thread(stream.prepare_finalize)
-                final_text = await asyncio.to_thread(stream.finalize)
+                _loop = asyncio.get_event_loop()
+                await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
+                final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
                 await ws.send_json({
                     "type": "final",
                     "text": final_text,
@@ -517,7 +551,8 @@ async def _asr_stream_backend(
 
             # Buffer audio (run in thread to avoid blocking event loop)
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            await asyncio.to_thread(stream.accept_waveform, sample_rate, samples)
+            _loop = asyncio.get_event_loop()
+            await _loop.run_in_executor(_get_asr_executor(), stream.accept_waveform, sample_rate, samples)
 
             # Check for partial results
             partial_text, is_endpoint = stream.get_partial()

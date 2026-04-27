@@ -29,18 +29,25 @@ async def test_asr(wav_path):
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=0.05)
                 r = json.loads(msg)
-                t = r.get("text", "")
-                if t:
-                    print(f"  partial: {t}")
+                if r.get("type") == "partial":
+                    t = r.get("text", "")
+                    if t:
+                        print(f"  partial: {t}")
             except asyncio.TimeoutError:
                 pass
 
         await ws.send(b"")
-        msg = await asyncio.wait_for(ws.recv(), timeout=10)
-        r = json.loads(msg)
-        result = r.get("text", "")
-        print(f"  FINAL: {result}")
-        return result
+        # Consume messages until we get type=final (skip reset/empty messages)
+        result = ""
+        while True:
+            msg = await asyncio.wait_for(ws.recv(), timeout=10)
+            r = json.loads(msg)
+            t = r.get("type")
+            if t == "final":
+                result = r.get("text", "")
+                print(f"  FINAL: {result}")
+                return result
+            # type=reset or missing type → skip, keep waiting
 
 wavs = sys.argv[1:] if len(sys.argv) > 1 else ["/tmp/ref_output.wav", "/tmp/test_en2.wav"]
 for wav in wavs:
