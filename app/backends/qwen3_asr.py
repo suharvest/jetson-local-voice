@@ -734,6 +734,40 @@ class Qwen3StreamingASRStream(ASRStream):
         return result
 
 
+class _TRTEncoderAdapter:
+    """Wraps qwen3_speech_engine.TRTASREncoder to mimic ORT InferenceSession.run()
+    so all downstream call sites (warmup, transcribe, streaming) need no change."""
+
+    def __init__(self, trt_encoder):
+        self._enc = trt_encoder
+
+    def get_providers(self):
+        return ["TRT_NATIVE"]
+
+    def get_inputs(self):  # pragma: no cover — only used for diagnostics
+        class _I:
+            name = "mel"
+            type = "tensor(float)"
+            shape = [1, 128, "T"]
+        return [_I()]
+
+    def get_outputs(self):  # pragma: no cover
+        class _O:
+            name = "audio_features"
+            type = "tensor(float)"
+            shape = [1, "Tp", 1024]
+        return [_O()]
+
+    def run(self, output_names, feeds):
+        mel = feeds["mel"]
+        if mel.dtype != np.float32:
+            mel = mel.astype(np.float32)
+        if not mel.flags["C_CONTIGUOUS"]:
+            mel = np.ascontiguousarray(mel)
+        out = self._enc.run(mel)
+        return [out]
+
+
 class Qwen3ASRBackend(ASRBackend):
 
     def __init__(self):
@@ -760,6 +794,18 @@ class Qwen3ASRBackend(ASRBackend):
         return self._ready
 
     def preload(self) -> None:
+        def _meminfo(tag):
+            try:
+                with open("/proc/self/status") as f:
+                    s = {l.split(":")[0]: l.split(":")[1].strip() for l in f if ":" in l}
+                with open("/proc/meminfo") as f:
+                    sys_avail = next((l for l in f if l.startswith("MemAvailable:")), "?").strip()
+                logger.info("[MEM:%s] RSS=%s HWM=%s | sys %s", tag,
+                            s.get("VmRSS","?"), s.get("VmHWM","?"), sys_avail)
+            except Exception as e:
+                logger.warning("[MEM:%s] failed: %s", tag, e)
+
+        _meminfo("asr_start")
         logger.info("Loading Qwen3-ASR from %s", _BASE)
         t0 = time.time()
 
@@ -819,30 +865,51 @@ class Qwen3ASRBackend(ASRBackend):
                     trt_cache_dir)
 
         logger.info("Loading encoder (backend=%s)...", encoder_backend)
-        for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
-            enc_path = os.path.join(_BASE, enc_name)
-            if os.path.exists(enc_path):
-                self._encoder = ort.InferenceSession(
-                    enc_path, so, providers=providers, provider_options=provider_options
-                )
-                actual_provs = self._encoder.get_providers()
-                logger.info("Encoder loaded: %s providers=%s", enc_name, actual_provs)
-                break
+        # P1: native TRT encoder (lowest memory; opt-in via ASR_ENCODER_BACKEND=trt_native)
+        if encoder_backend == "trt_native":
+            trt_enc_path = os.path.join(_BASE, "asr_encoder_fp16.engine")
+            if os.path.exists(trt_enc_path):
+                try:
+                    import qwen3_speech_engine
+                    trt_enc = qwen3_speech_engine.TRTASREncoder(
+                        trt_enc_path, 3000, 750, 1024)
+                    self._encoder = _TRTEncoderAdapter(trt_enc)
+                    logger.info("Encoder loaded (TRT native): %s", trt_enc_path)
+                except Exception as e:
+                    logger.warning("TRT native encoder failed: %s; falling back to ORT", e)
+                    self._encoder = None
+            else:
+                logger.warning("trt_native requested but %s missing; falling back to ORT", trt_enc_path)
+
+        # ORT path (default + fallback when trt_native unavailable / failed)
+        if self._encoder is None:
+            for enc_name in ["encoder_fp16.onnx", "encoder.onnx"]:
+                enc_path = os.path.join(_BASE, enc_name)
+                if os.path.exists(enc_path):
+                    self._encoder = ort.InferenceSession(
+                        enc_path, so, providers=providers, provider_options=provider_options
+                    )
+                    actual_provs = self._encoder.get_providers()
+                    logger.info("Encoder loaded: %s providers=%s", enc_name, actual_provs)
+                    break
+        _meminfo("after_encoder")
 
         # ── 2. Embed tokens ──
         emb_path = os.path.join(_BASE, "embed_tokens.bin")
         if os.path.exists(emb_path):
-            self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024).astype(np.float32)
+            self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024)
+        _meminfo("after_embed")
 
         # ── 3. TRT decoder (preferred — supports prefill + decode_step) ──
         if engine_path:
             try:
                 import qwen3_speech_engine
                 self._decoder = qwen3_speech_engine.TRTDecoder(
-                    engine_path, 28, 1024, 8, 128, 151936, 500)
-                self._trt_max_seq = 500
+                    engine_path, 28, 1024, 8, 128, 151936, 200)
+                self._trt_max_seq = 200
                 self._decoder.enable_cuda_graph(True)
                 logger.info("TRT decoder loaded (CUDA Graph enabled): %s", engine_path)
+                _meminfo("after_decoder")
             except Exception as e:
                 logger.warning("TRT decoder %s failed: %s", engine_path, e)
 
@@ -874,7 +941,11 @@ class Qwen3ASRBackend(ASRBackend):
                      time.time() - t0, offline_backend)
 
         # ── 6. Warm-up ──
-        if self._encoder and (self._decoder or self._decoder_ort):
+        # SKIP_ASR_WARMUP=1 also skips this (CUDA Graph capture costs ~250 MB on iGPU);
+        # cold first request takes 200-500ms instead of 16ms, but enables Nano fit.
+        if os.environ.get("SKIP_ASR_WARMUP", "").lower() in ("1", "true", "yes"):
+            logger.info("ASR backend warmup skipped (SKIP_ASR_WARMUP set).")
+        elif self._encoder and (self._decoder or self._decoder_ort):
             logger.info("Warming up encoder + decoder...")
             t_warm = time.time()
             try:
@@ -898,10 +969,12 @@ class Qwen3ASRBackend(ASRBackend):
                     valid = {n: v for n, v in warm_in.items() if n in valid_names}
                     sess.run(None, valid)
                 logger.info("Warm-up done in %.1fs", time.time() - t_warm)
+                _meminfo("after_warmup")
             except Exception as e:
                 logger.warning("Warm-up failed: %s", e)
 
         self._ready = True
+        _meminfo("asr_ready")
 
     def create_stream(self, language: str = "auto") -> ASRStream:
         if not self._ready:
