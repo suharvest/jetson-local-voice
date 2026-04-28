@@ -112,19 +112,25 @@ async def startup():
         # Warm up ASR executor thread so its CUDA per-thread context is
         # initialised before the first streaming request.  Without this the
         # very first accept_waveform pays a cold-context tax on encoder.
-        _asyncio = __import__("asyncio")
-        _executor = _get_asr_executor()
+        # SKIP_ASR_WARMUP=1 skips this on memory-constrained devices (Nano 8GB):
+        # saves ~300-400 MB at startup, costs ~100ms one-time cold-context tax
+        # on the very first ASR request.
+        if os.environ.get("SKIP_ASR_WARMUP", "").lower() in ("1", "true", "yes"):
+            logger.info("ASR streaming warmup skipped (SKIP_ASR_WARMUP set).")
+        else:
+            _asyncio = __import__("asyncio")
+            _executor = _get_asr_executor()
 
-        def _warm_asr():
-            try:
-                import numpy as _np
-                silence = _np.zeros(16000, dtype=_np.float32)
-                _asr_backend.transcribe_audio(silence)
-                logger.info("ASR streaming executor warmed up (1 thread, CUDA primed).")
-            except Exception as exc:
-                logger.warning("ASR warm-up failed: %s", exc)
+            def _warm_asr():
+                try:
+                    import numpy as _np
+                    silence = _np.zeros(16000, dtype=_np.float32)
+                    _asr_backend.transcribe_audio(silence)
+                    logger.info("ASR streaming executor warmed up (1 thread, CUDA primed).")
+                except Exception as exc:
+                    logger.warning("ASR warm-up failed: %s", exc)
 
-        await _asyncio.get_event_loop().run_in_executor(_executor, _warm_asr)
+            await _asyncio.get_event_loop().run_in_executor(_executor, _warm_asr)
     except Exception as e:
         logger.warning("ASR backend failed: %s", e)
 
@@ -179,6 +185,8 @@ async def health():
         result["asr"] = asr_be.is_ready() if asr_be else False
         result["asr_backend"] = asr_be.name if asr_be and asr_be.is_ready() else None
         result["asr_capabilities"] = [c.value for c in asr_be.capabilities] if asr_be and asr_be.is_ready() else []
+        if asr_be and asr_be.is_ready() and hasattr(asr_be, "providers"):
+            result["asr_providers"] = asr_be.providers
     except Exception:
         result["asr"] = False
         result["asr_backend"] = None
@@ -193,11 +201,14 @@ async def asr_capabilities():
     asr_be = _get_asr_backend()
     if not asr_be or not asr_be.is_ready():
         return JSONResponse({"error": "ASR not ready"}, status_code=503)
-    return {
+    caps = {
         "backend": asr_be.name,
         "capabilities": [c.value for c in asr_be.capabilities],
         "sample_rate": asr_be.sample_rate,
     }
+    if hasattr(asr_be, "providers"):
+        caps["providers"] = asr_be.providers
+    return caps
 
 
 @app.get("/tts/capabilities")

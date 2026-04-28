@@ -71,6 +71,29 @@ class Qwen3TRTBackend(TTSBackend):
 
     def preload(self) -> None:
         """Load C++ TRT engine + tokenizer. Models stay resident."""
+        def _meminfo(tag):
+            try:
+                with open("/proc/self/status") as f:
+                    s = {l.split(":")[0]: l.split(":")[1].strip() for l in f if ":" in l}
+                with open("/proc/meminfo") as f:
+                    sys_avail = next((l for l in f if l.startswith("MemAvailable:")), "?").strip()
+                logger.info("[MEM:%s] RSS=%s HWM=%s | sys %s", tag,
+                            s.get("VmRSS","?"), s.get("VmHWM","?"), sys_avail)
+            except Exception as e:
+                logger.warning("[MEM:%s] failed: %s", tag, e)
+
+        # Background sampler: every 500ms during heavy load, prints RSS + sys avail
+        import threading
+        _stop = threading.Event()
+        def _sampler():
+            i = 0
+            while not _stop.wait(0.5):
+                _meminfo(f"tts_load_t{i*500}ms")
+                i += 1
+        sampler = threading.Thread(target=_sampler, daemon=True)
+
+        _meminfo("tts_start")
+
         # Verify files
         for path, desc in [
             (QWEN3_TALKER_ENGINE, "talker engine"),
@@ -83,17 +106,23 @@ class Qwen3TRTBackend(TTSBackend):
 
         # Load tokenizer
         self._load_tokenizer()
+        _meminfo("tts_after_tokenizer")
 
         # Load C++ engine (this is the heavy part: ~25s for model loading + embed table)
         logger.info("Loading Qwen3 TRT engine (this takes ~25s)...")
         t0 = time.time()
 
-        import qwen3_speech_engine
-        self._engine = qwen3_speech_engine.Pipeline(
-            QWEN3_MODEL_DIR, QWEN3_SHERPA_DIR,
-            QWEN3_TALKER_ENGINE, QWEN3_CP_ENGINE,
-        )
+        sampler.start()
+        try:
+            import qwen3_speech_engine
+            self._engine = qwen3_speech_engine.Pipeline(
+                QWEN3_MODEL_DIR, QWEN3_SHERPA_DIR,
+                QWEN3_TALKER_ENGINE, QWEN3_CP_ENGINE,
+            )
+        finally:
+            _stop.set()
         logger.info("Qwen3 TRT engine loaded in %.1fs", time.time() - t0)
+        _meminfo("tts_after_pipeline")
 
         # Enable cached CUDA Graph for talker decode:
         # First request populates cache (~10ms extra per unique seq_len),
@@ -105,6 +134,7 @@ class Qwen3TRTBackend(TTSBackend):
             logger.warning("CUDA Graph enable failed (non-fatal): %s", e)
 
         self._ready = True
+        _meminfo("tts_ready")
 
     def _load_tokenizer(self):
         vocab_path = os.path.join(QWEN3_TOKENIZER_DIR, "vocab.json")
