@@ -63,6 +63,13 @@ AUDIO_PAD = 151676
 ASR_TEXT = 151704
 EOS_IDS = {151643, 151645}
 
+# Vocab pruning indirection (Phase C: Python-only orig↔red mapping)
+# ASR_VOCAB_PRUNED=1 loads pruned embed/engine and maps token IDs at boundaries.
+ASR_VOCAB_PRUNED = os.environ.get("ASR_VOCAB_PRUNED", "0") == "1"
+ASR_TOKEN_MAP_PATH = os.environ.get("ASR_TOKEN_MAP_PATH", os.path.join(_BASE, "token_map.bin"))
+ASR_PRUNED_ENGINE_NAME = os.environ.get("ASR_PRUNED_ENGINE_NAME", "asr_decoder_pruned_bf16_padded.engine")
+ASR_PRUNED_EMBED_NAME = os.environ.get("ASR_PRUNED_EMBED_NAME", "embed_tokens_pruned.bin")
+
 # ── True streaming parameters ──
 CHUNK_SIZE_SEC = 0.4           # 400ms chunks (reduce partial frequency vs latency)
 LEFT_CONTEXT_SEC = 1.0         # left-context audio ring buffer
@@ -604,7 +611,11 @@ class Qwen3StreamingASRStream(ASRStream):
         embed_tokens = self._backend._embed_tokens
         input_embeds = np.zeros((1, seq_len, 1024), dtype=np.float32)
         for i, tid in enumerate(prompt_ids):
-            input_embeds[0, i] = embed_tokens[tid]
+            if self._backend._asr_vocab_pruned:
+                rid = int(self._backend._orig2red[tid])
+                input_embeds[0, i] = embed_tokens[rid]
+            else:
+                input_embeds[0, i] = embed_tokens[tid]
         audio_end = min(audio_offset + audio_len, seq_len)
         input_embeds[0, audio_offset:audio_end] = (
             all_embd[0, :audio_end - audio_offset].astype(np.float32)
@@ -616,15 +627,20 @@ class Qwen3StreamingASRStream(ASRStream):
         if trt_dec and seq_len <= getattr(self._backend, '_trt_max_seq', 500):
             result = trt_dec.prefill(input_embeds)
             logits = result["logits"]
+            eos_set = self._backend._eos_red_ids if self._backend._asr_vocab_pruned else EOS_IDS
+            vocab_sz = self._backend._engine_vocab_size if self._backend._asr_vocab_pruned else 151936
             for _step in range(max_tokens):
                 next_token = int(np.argmax(logits[0, -1, :]))
-                if next_token in EOS_IDS:
+                if next_token in eos_set:
                     break
-                output_ids.append(next_token)
+                if self._backend._asr_vocab_pruned:
+                    output_ids.append(int(self._backend._red2orig[next_token]))
+                else:
+                    output_ids.append(next_token)
                 embeds = embed_tokens[next_token].astype(np.float32)[
                     np.newaxis, np.newaxis, :
                 ]
-                logits = trt_dec.decode_step(embeds, 151936)
+                logits = trt_dec.decode_step(embeds, vocab_sz)
 
         # ── ORT fallback ──
         elif ort_dec:
@@ -777,6 +793,12 @@ class Qwen3ASRBackend(ASRBackend):
         self._embed_tokens = None
         self._tokenizer = None
         self._ready = False
+        self._asr_vocab_pruned = False   # set True in preload() if env + files ok
+        self._red2orig = None            # np.ndarray[uint32]; red_id → orig_id
+        self._orig2red = None            # np.ndarray[int32]; orig_id → red_id (or -1)
+        self._reduced_vocab_size = 151936  # embed table rows (may include input-only extras)
+        self._engine_vocab_size = 151936   # engine output logits dim
+        self._eos_red_ids: set[int] = set()
 
     @property
     def name(self) -> str:
@@ -811,11 +833,23 @@ class Qwen3ASRBackend(ASRBackend):
 
         # Find TRT engine path
         engine_path = None
-        for engine_name in ["asr_decoder_bf16.engine", "asr_decoder_fp16.engine"]:
-            p = os.path.join(_BASE, engine_name)
-            if os.path.exists(p):
-                engine_path = p
-                break
+        self._asr_vocab_pruned = ASR_VOCAB_PRUNED
+        if ASR_VOCAB_PRUNED:
+            pruned_path = os.path.join(_BASE, ASR_PRUNED_ENGINE_NAME)
+            if os.path.exists(pruned_path):
+                engine_path = pruned_path
+                logger.info("Vocab pruning: using pruned decoder engine %s", pruned_path)
+            else:
+                logger.warning(
+                    "ASR_VOCAB_PRUNED=1 but %s not found; disabling pruned mode",
+                    pruned_path)
+                self._asr_vocab_pruned = False
+        if engine_path is None:
+            for engine_name in ["asr_decoder_bf16.engine", "asr_decoder_fp16.engine"]:
+                p = os.path.join(_BASE, engine_name)
+                if os.path.exists(p):
+                    engine_path = p
+                    break
 
         # ── 1. ORT encoder (CUDA EP) — load before TRT to avoid CUDA state pollution ──
         import onnxruntime as ort
@@ -894,18 +928,65 @@ class Qwen3ASRBackend(ASRBackend):
                     break
         _meminfo("after_encoder")
 
+        # ── 2a. Token map (vocab pruning indirection) ──
+        if self._asr_vocab_pruned:
+            map_path = ASR_TOKEN_MAP_PATH
+            if os.path.exists(map_path):
+                red2orig = np.fromfile(map_path, dtype=np.uint32)
+                self._red2orig = red2orig
+                n_red = len(red2orig)
+                orig2red = np.full(151936, -1, dtype=np.int32)
+                orig2red[red2orig] = np.arange(n_red, dtype=np.int32)
+                self._orig2red = orig2red
+                self._reduced_vocab_size = n_red
+                # Engine output vocab = first N entries of token_map (rest are
+                # input-only prompt specials appended after build). Override
+                # via env or sidecar file (engine_vocab_size.txt next to engine).
+                env_engine_vocab = os.environ.get("ASR_ENGINE_VOCAB_SIZE")
+                sidecar = os.path.join(_BASE, "engine_vocab_size.txt")
+                if env_engine_vocab:
+                    self._engine_vocab_size = int(env_engine_vocab)
+                elif os.path.exists(sidecar):
+                    self._engine_vocab_size = int(open(sidecar).read().strip())
+                else:
+                    self._engine_vocab_size = n_red
+                self._eos_red_ids = {int(rid) for eid in EOS_IDS
+                                     for rid in [orig2red[eid]] if rid >= 0}
+                logger.info("Vocab pruning: token map loaded (embed=%d engine=%d EOS red=%s)",
+                            n_red, self._engine_vocab_size, sorted(self._eos_red_ids))
+            else:
+                logger.warning(
+                    "ASR_VOCAB_PRUNED=1 but %s not found; disabling pruned mode",
+                    map_path)
+                self._asr_vocab_pruned = False
+
         # ── 2. Embed tokens ──
-        emb_path = os.path.join(_BASE, "embed_tokens.bin")
+        if self._asr_vocab_pruned:
+            emb_path = os.path.join(_BASE, ASR_PRUNED_EMBED_NAME)
+            if not os.path.exists(emb_path):
+                logger.warning(
+                    "ASR_VOCAB_PRUNED=1 but %s not found; disabling pruned mode",
+                    emb_path)
+                self._asr_vocab_pruned = False
+                emb_path = os.path.join(_BASE, "embed_tokens.bin")
+        else:
+            emb_path = os.path.join(_BASE, "embed_tokens.bin")
         if os.path.exists(emb_path):
             self._embed_tokens = np.fromfile(emb_path, dtype=np.float16).reshape(-1, 1024)
+        if self._asr_vocab_pruned:
+            nrows = self._embed_tokens.shape[0]
+            assert nrows == self._reduced_vocab_size, (
+                f"Pruned embed rows {nrows} != reduced vocab {self._reduced_vocab_size}"
+            )
         _meminfo("after_embed")
 
         # ── 3. TRT decoder (preferred — supports prefill + decode_step) ──
         if engine_path:
             try:
                 import qwen3_speech_engine
+                dec_vocab = self._engine_vocab_size if self._asr_vocab_pruned else 151936
                 self._decoder = qwen3_speech_engine.TRTDecoder(
-                    engine_path, 28, 1024, 8, 128, 151936, 200)
+                    engine_path, 28, 1024, 8, 128, dec_vocab, 200)
                 self._trt_max_seq = 200
                 self._decoder.enable_cuda_graph(True)
                 logger.info("TRT decoder loaded (CUDA Graph enabled): %s", engine_path)
@@ -913,8 +994,8 @@ class Qwen3ASRBackend(ASRBackend):
             except Exception as e:
                 logger.warning("TRT decoder %s failed: %s", engine_path, e)
 
-        # ── 4. ORT decoder fallback (only if TRT decoder not available) ──
-        if self._decoder is None:
+        # ── 4. ORT decoder fallback (skip when pruned — only TRT is compatible) ──
+        if self._decoder is None and not self._asr_vocab_pruned:
             so_dec = ort.SessionOptions()
             so_dec.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             for dec_name in ["decoder_unified.onnx", "decoder_step.onnx"]:
@@ -928,6 +1009,12 @@ class Qwen3ASRBackend(ASRBackend):
                         break
                     except Exception as e:
                         logger.warning("ORT decoder %s failed: %s", dec_name, e)
+
+        # Fail closed: pruned mode requires TRT decoder
+        if self._asr_vocab_pruned and self._decoder is None:
+            raise RuntimeError(
+                "ASR_VOCAB_PRUNED=1 but no TRT decoder loaded. "
+                "Vocab pruning requires a TRT decoder engine.")
 
         # ── 5. Tokenizer ──
         tok_path = os.path.join(_BASE, "tokenizer.json")
@@ -1059,7 +1146,11 @@ class Qwen3ASRBackend(ASRBackend):
         # 3. Build input_embeds
         input_embeds = np.zeros((1, seq_len, 1024), dtype=np.float32)
         for i, tid in enumerate(prompt_ids):
-            input_embeds[0, i] = self._embed_tokens[tid]
+            if self._asr_vocab_pruned:
+                rid = int(self._orig2red[tid])
+                input_embeds[0, i] = self._embed_tokens[rid]
+            else:
+                input_embeds[0, i] = self._embed_tokens[tid]
         audio_end = min(audio_offset + audio_len, seq_len)
         input_embeds[0, audio_offset:audio_end] = enc_out[0, :audio_end - audio_offset]
 
@@ -1078,15 +1169,21 @@ class Qwen3ASRBackend(ASRBackend):
             prefill_ms = (time.perf_counter() - t_pf) * 1000
 
             t_dec_loop = time.perf_counter()
+            dec_eos_set = self._eos_red_ids if self._asr_vocab_pruned else EOS_IDS
+            dec_vocab_sz = self._engine_vocab_size if self._asr_vocab_pruned else 151936
             for step in range(200):
                 t_d2h = time.perf_counter()
                 next_token = int(np.argmax(logits[0, -1, :]))
                 d2h_ms += (time.perf_counter() - t_d2h) * 1000
-                if next_token in EOS_IDS:
+                if next_token in dec_eos_set:
                     break
-                output_ids.append(next_token)
+                if self._asr_vocab_pruned:
+                    orig_id = int(self._red2orig[next_token])
+                    output_ids.append(orig_id)
+                else:
+                    output_ids.append(next_token)
                 embeds = self._embed_tokens[next_token].astype(np.float32)[np.newaxis, np.newaxis, :]
-                logits = self._decoder.decode_step(embeds, 151936)
+                logits = self._decoder.decode_step(embeds, dec_vocab_sz)
             decode_loop_ms = (time.perf_counter() - t_dec_loop) * 1000 - d2h_ms
 
         # === ORT fallback path ===
