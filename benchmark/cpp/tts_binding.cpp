@@ -482,4 +482,24 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
       .def_property_readonly("hidden_dim", &ASRPipeline::hidden_dim)
       .def_property_readonly("vocab_size", &ASRPipeline::vocab_size)
       .def_property_readonly("n_layers", &ASRPipeline::n_layers);
+
+  // ── TRT ASR Encoder ──
+  py::class_<TRTASREncoder>(m, "TRTASREncoder")
+      .def(py::init<const std::string&, int, int, int>(),
+           py::arg("engine_path"), py::arg("max_mel_frames"),
+           py::arg("max_out_frames"), py::arg("hidden_dim") = 1024)
+      .def("run", [](TRTASREncoder& self,
+                     py::array_t<float, py::array::c_style | py::array::forcecast> mel) {
+          auto buf = mel.request();
+          if (buf.ndim != 3 || buf.shape[0] != 1 || buf.shape[1] != 128) {
+              throw std::runtime_error("mel must be [1, 128, T] float32");
+          }
+          int n_frames = (int)buf.shape[2];
+          int out_T = 0;
+          auto vec = self.Run((const float*)buf.ptr, n_frames, out_T);
+          // return numpy [1, out_T, hidden_dim]
+          py::array_t<float> arr({(ssize_t)1, (ssize_t)out_T, (ssize_t)1024});
+          std::memcpy(arr.mutable_data(), vec.data(), vec.size() * sizeof(float));
+          return arr;
+      }, py::arg("mel"));
 }

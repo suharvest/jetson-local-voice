@@ -704,3 +704,36 @@ class TRTASRPrefillEngine {
 
   cudaEvent_t ev_done_ = nullptr;
 };
+
+// ---------------------------------------------------------------------------
+// TRT ASR Encoder Engine — converts mel [1,128,T] → audio_features [1,Tp,1024]
+// ---------------------------------------------------------------------------
+class TRTASREncoder {
+ public:
+  TRTASREncoder(const std::string& engine_path,
+                int max_mel_frames, int max_out_frames, int hidden_dim = 1024);
+  ~TRTASREncoder();
+
+  // mel: host pointer to FP32 mel of shape [1, 128, n_frames]
+  // returns: features as flat std::vector<float>, sets out_T to actual output time dim
+  std::vector<float> Run(const float* mel, int n_frames, int& out_T);
+
+  bool loaded() const { return engine_ != nullptr; }
+
+ private:
+  TRTLogger logger_;
+  std::unique_ptr<nvinfer1::IRuntime> runtime_;
+  std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> ctx_;
+  cudaStream_t stream_ = nullptr;
+
+  int max_mel_frames_;
+  int max_out_frames_;
+  int hidden_dim_;
+
+  std::string mel_name_;
+  std::string out_name_;
+
+  void* d_mel_ = nullptr;     // [1 * 128 * max_mel_frames] FP32
+  void* d_out_ = nullptr;     // [1 * max_out_frames * hidden_dim] FP32
+};

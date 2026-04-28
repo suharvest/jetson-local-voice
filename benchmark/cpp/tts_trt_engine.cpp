@@ -10,9 +10,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #define CHECK_CUDA(call)                                                  \
@@ -61,6 +64,57 @@ static std::vector<char> LoadEngineFile(const std::string& path) {
   return data;
 }
 
+// FileStreamReader: feeds an engine file to TRT via IStreamReader, avoiding
+// a full in-memory copy of the engine blob during deserialization.
+class FileStreamReader final : public nvinfer1::IStreamReader {
+ public:
+  explicit FileStreamReader(const std::string& path) {
+    fd_ = open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+      throw std::runtime_error(std::string("FileStreamReader: open failed: ") +
+                               strerror(errno));
+    }
+    struct stat st;
+    if (fstat(fd_, &st) < 0) {
+      close(fd_);
+      fd_ = -1;
+      throw std::runtime_error(std::string("FileStreamReader: stat failed: ") +
+                               strerror(errno));
+    }
+    size_ = st.st_size;
+  }
+
+  ~FileStreamReader() override {
+    if (fd_ >= 0) close(fd_);
+  }
+
+  int64_t read(void* destination, int64_t nbBytes) noexcept override {
+    if (failed_ || fd_ < 0) return -1;
+    int64_t remaining = size_ - pos_;
+    if (remaining <= 0) return 0;
+    int64_t to_read = std::min(nbBytes, remaining);
+    ssize_t n = pread(fd_, destination, to_read, pos_);
+    if (n <= 0) {
+      failed_ = true;
+      return -1;
+    }
+    pos_ += n;
+    return n;
+  }
+
+ private:
+  int fd_ = -1;
+  int64_t size_ = 0;
+  int64_t pos_ = 0;
+  bool failed_ = false;
+};
+
+static nvinfer1::ICudaEngine* LoadEngineStreaming(
+    nvinfer1::IRuntime* runtime, const std::string& path) {
+  FileStreamReader reader(path);
+  return runtime->deserializeCudaEngine(reader);
+}
+
 // Helper: get element size for TRT data type
 static size_t TrtDtypeSize(nvinfer1::DataType dtype) {
   switch (dtype) {
@@ -91,9 +145,8 @@ TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
       head_dim_(head_dim),
       vocab_size_(vocab_size),
       max_seq_(max_seq) {
-  auto data = LoadEngineFile(engine_path);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  engine_.reset(runtime_->deserializeCudaEngine(data.data(), data.size()));
+  engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
   assert(engine_ && "Failed to deserialize talker engine");
   CHECK_CUDA(cudaStreamCreate(&stream_));
 
@@ -272,10 +325,9 @@ void TRTTalkerEngine::ResetCapturedEvents() {
 void TRTTalkerEngine::LoadPrefillEngine(const std::string& prefill_engine_path) {
   std::cout << "  Loading prefill engine: " << prefill_engine_path << std::endl;
 
-  auto data = LoadEngineFile(prefill_engine_path);
   prefill_runtime_.reset(nvinfer1::createInferRuntime(prefill_logger_));
   prefill_engine_.reset(
-      prefill_runtime_->deserializeCudaEngine(data.data(), data.size()));
+      LoadEngineStreaming(prefill_runtime_.get(), prefill_engine_path));
   if (!prefill_engine_) {
     std::cerr << "  ERROR: Failed to deserialize prefill engine!" << std::endl;
     return;
@@ -1093,9 +1145,8 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
 TRTCPEngine::TRTCPEngine(const std::string& engine_path, int hidden_dim,
                          int cp_vocab, int max_ctx_len)
     : hidden_dim_(hidden_dim), cp_vocab_(cp_vocab) {
-  auto data = LoadEngineFile(engine_path);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  engine_.reset(runtime_->deserializeCudaEngine(data.data(), data.size()));
+  engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
   assert(engine_ && "Failed to deserialize CP engine");
   context_trt_.reset(engine_->createExecutionContext());
   CHECK_CUDA(cudaStreamCreate(&stream_));
@@ -1262,9 +1313,8 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
                               int cp_vocab, int cp_out_groups, int /*max_past*/)
     : n_cp_layers_(n_cp_layers), hidden_dim_(hidden_dim), n_heads_(n_heads),
       head_dim_(head_dim), cp_vocab_(cp_vocab), cp_out_groups_(cp_out_groups) {
-  auto data = LoadEngineFile(engine_path);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  engine_.reset(runtime_->deserializeCudaEngine(data.data(), data.size()));
+  engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
   if (!engine_) {
     std::cerr << "[CPKV] Failed to deserialize engine: " << engine_path << std::endl;
     std::abort();
@@ -2408,9 +2458,8 @@ void TRTCPKVEnginePool::EnableProfiling(bool enable) {
 TRTVocoderEngine::TRTVocoderEngine(const std::string& engine_path,
                                    int max_frames, int max_samples)
     : max_frames_(max_frames), max_samples_(max_samples) {
-  auto data = LoadEngineFile(engine_path);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  engine_.reset(runtime_->deserializeCudaEngine(data.data(), data.size()));
+  engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
   if (!engine_) {
     std::cerr << "[Vocoder] Failed to deserialize engine: " << engine_path
               << std::endl;
@@ -2544,9 +2593,8 @@ TRTASRPrefillEngine::TRTASRPrefillEngine(const std::string& engine_path,
                                          int vocab_size, int max_seq)
     : n_layers_(n_layers), hidden_dim_(hidden_dim), n_heads_(n_heads),
       head_dim_(head_dim), vocab_size_(vocab_size), max_seq_(max_seq) {
-  auto data = LoadEngineFile(engine_path);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  engine_.reset(runtime_->deserializeCudaEngine(data.data(), data.size()));
+  engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
   if (!engine_) {
     std::cerr << "[ASRPrefill] Failed to deserialize engine: " << engine_path
               << std::endl;
@@ -2785,4 +2833,84 @@ void TRTASRPrefillEngine::SeedDecoder(TRTTalkerEngine* decoder, int seq_len) {
   decoder->SeedKV(kv_ptrs.data(), 2 * n_layers_, seq_len);
   std::cout << "[ASRPrefill] Seeded decoder KV cache, seq_len=" << seq_len
             << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// TRT ASR Encoder
+// ---------------------------------------------------------------------------
+TRTASREncoder::TRTASREncoder(const std::string& engine_path,
+                              int max_mel_frames, int max_out_frames, int hidden_dim)
+    : max_mel_frames_(max_mel_frames), max_out_frames_(max_out_frames), hidden_dim_(hidden_dim) {
+  runtime_.reset(nvinfer1::createInferRuntime(logger_));
+  engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
+  if (!engine_) {
+    std::cerr << "[ASREncoder] Failed to deserialize engine: " << engine_path << std::endl;
+    std::abort();
+  }
+  ctx_.reset(engine_->createExecutionContext());
+  CHECK_CUDA(cudaStreamCreate(&stream_));
+
+  // Detect I/O tensor names
+  int n_io = engine_->getNbIOTensors();
+  for (int i = 0; i < n_io; ++i) {
+    const char* name = engine_->getIOTensorName(i);
+    auto mode = engine_->getTensorIOMode(name);
+    if (mode == nvinfer1::TensorIOMode::kINPUT) {
+      mel_name_ = name;
+    } else {
+      out_name_ = name;
+    }
+  }
+
+  // Allocate max-size GPU buffers
+  CHECK_CUDA(cudaMalloc(&d_mel_, (size_t)1 * 128 * max_mel_frames_ * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_out_, (size_t)1 * max_out_frames_ * hidden_dim_ * sizeof(float)));
+
+  std::cout << "  TRTASREncoder loaded: mel[1,128," << max_mel_frames_
+            << "] -> out[1," << max_out_frames_ << "," << hidden_dim_
+            << "], input=\"" << mel_name_ << "\", output=\"" << out_name_
+            << "\"" << std::endl;
+}
+
+TRTASREncoder::~TRTASREncoder() {
+  if (d_mel_) cudaFree(d_mel_);
+  if (d_out_) cudaFree(d_out_);
+  if (stream_) cudaStreamDestroy(stream_);
+}
+
+std::vector<float> TRTASREncoder::Run(const float* mel, int n_frames, int& out_T) {
+  if (n_frames > max_mel_frames_) {
+    throw std::runtime_error("TRTASREncoder: n_frames (" + std::to_string(n_frames) +
+                             ") exceeds max_mel_frames (" + std::to_string(max_mel_frames_) + ")");
+  }
+
+  // Set input shape for dynamic T dimension
+  ctx_->setInputShape(mel_name_.c_str(), nvinfer1::Dims3{1, 128, n_frames});
+
+  // H2D copy
+  size_t mel_bytes = (size_t)1 * 128 * n_frames * sizeof(float);
+  CHECK_CUDA(cudaMemcpyAsync(d_mel_, mel, mel_bytes, cudaMemcpyHostToDevice, stream_));
+
+  // Bind tensor addresses
+  ctx_->setTensorAddress(mel_name_.c_str(), d_mel_);
+  ctx_->setTensorAddress(out_name_.c_str(), d_out_);
+
+  // Launch TRT inference
+  bool ok = ctx_->enqueueV3(stream_);
+  if (!ok) {
+    std::cerr << "[ASREncoder] enqueueV3 failed!" << std::endl;
+    std::abort();
+  }
+
+  // Get actual output shape
+  auto out_dims = ctx_->getTensorShape(out_name_.c_str());
+  out_T = out_dims.d[1];  // [1, Tp, hidden_dim]
+
+  // D2H copy
+  size_t out_bytes = (size_t)1 * out_T * hidden_dim_ * sizeof(float);
+  std::vector<float> result(out_T * hidden_dim_);
+  CHECK_CUDA(cudaMemcpyAsync(result.data(), d_out_, out_bytes, cudaMemcpyDeviceToHost, stream_));
+  CHECK_CUDA(cudaStreamSynchronize(stream_));
+
+  return result;
 }
