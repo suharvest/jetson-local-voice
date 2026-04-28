@@ -1,17 +1,20 @@
 #!/bin/bash
-# Build Qwen3-ASR decoder TRT engine with configurable max_seq.
-# Usage: MAX_SEQ=200 ./build_asr_decoder_engine.sh
+# Build Qwen3-ASR decoder BF16 TRT engine. TensorRT 10.3 / Jetson.
 #
-# Default max_seq=200 (down from 500) to fit on Orin Nano 8GB.
-# ASR sequences in practice rarely exceed 50 tokens; 200 has plenty of headroom.
+# Per-device profile (override via env):
+#   Nano 8GB  (default): MAX_SEQ=200 WS=256
+#   NX 16GB           :  MAX_SEQ=500 WS=2048
+#   AGX 32GB          :  MAX_SEQ=1000 WS=4096
 #
-# Run on Jetson with TensorRT 10.3.
+# ASR sequences in practice rarely exceed 50 tokens; even MAX_SEQ=200 has plenty
+# of headroom. Cross-device cubin compatibility verified for Ampere SM 8.7.
 
 set -euo pipefail
 
 ONNX_PATH="${ONNX_PATH:-/home/harvest/qwen3-asr-v2/decoder_step.onnx}"
 MAX_SEQ="${MAX_SEQ:-200}"
 OPT_SEQ="${OPT_SEQ:-30}"
+WS="${WS:-256}"
 OUT_DIR="${OUT_DIR:-/home/harvest/qwen3-asr-v2}"
 ENGINE_NAME="${ENGINE_NAME:-asr_decoder_bf16_max${MAX_SEQ}.engine}"
 
@@ -39,6 +42,7 @@ echo "OUT:        $OUT_ENGINE"
 echo "MIN seq:    0"
 echo "OPT seq:    $OPT_SEQ"
 echo "MAX seq:    $MAX_SEQ"
+echo "Workspace:  ${WS}MiB"
 echo
 
 TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
@@ -47,7 +51,7 @@ TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
     --onnx="$ONNX_PATH" \
     --saveEngine="$OUT_ENGINE" \
     --bf16 \
-    --memPoolSize=workspace:512MiB \
+    --memPoolSize=workspace:"${WS}MiB" \
     --minShapes="$MIN_SHAPES" \
     --optShapes="$OPT_SHAPES" \
     --maxShapes="$MAX_SHAPES" \
