@@ -38,7 +38,6 @@ VOCOS_ENGINE = os.environ.get(
 )
 LEXICON_PATH = os.environ.get("LEXICON_PATH", os.path.join(_MODEL_BASE, "lexicon.txt"))
 TOKENS_PATH = os.environ.get("TOKENS_PATH", os.path.join(_MODEL_BASE, "tokens.txt"))
-DATA_DIR = os.environ.get("ESPEAK_DATA_DIR", os.path.join(_MODEL_BASE, "espeak-ng-data"))
 
 # Audio constants
 SAMPLE_RATE = 16000
@@ -225,80 +224,32 @@ class MatchaTRTBackend(TTSBackend):
     STRESS_MARKS = "ˈˌː"  # Primary stress, secondary stress, length mark
 
     def _phonemize_english(self, text: str) -> list[str]:
-        """Phonemize English text using piper-phonemize (same as sherpa-onnx).
-
-        Falls back to subprocess espeak-ng if piper-phonemize is unavailable.
-        """
-        # Try piper-phonemize first (same library as sherpa-onnx)
-        try:
-            import piper_phonemize
-            # phonemize_espeak returns List[List[str]] (sentences of phonemes)
-            sentences = piper_phonemize.phonemize_espeak(text, "en-us")
-            if not sentences:
-                logger.warning("piper-phonemize returned empty for: %r", text)
-                return self._phonemize_english_subprocess(text)
-
-            # Flatten and process phonemes
-            out = []
-            for phoneme_list in sentences:
-                for ph in phoneme_list:
-                    if ph == " ":  # Space between words
-                        continue
-                    # Strip stress marks
-                    ph_stripped = ph.lstrip(self.STRESS_MARKS)
-                    if not ph_stripped:
-                        continue
-                    # Try whole phoneme first, then single chars
-                    if ph_stripped in self._token_to_id:
-                        out.append(ph_stripped)
-                    else:
-                        for ch in ph_stripped:
-                            if ch in self._token_to_id:
-                                out.append(ch)
-                            else:
-                                logger.warning("Unknown phoneme: %r (from %r)", ch, ph)
-            return out
-        except ImportError:
-            logger.info("piper-phonemize not available, falling back to espeak-ng subprocess")
-            return self._phonemize_english_subprocess(text)
-        except Exception as e:
-            logger.warning("piper-phonemize failed: %s, falling back to subprocess", e)
-            return self._phonemize_english_subprocess(text)
-
-    def _phonemize_english_subprocess(self, text: str) -> list[str]:
-        """Fallback: use espeak-ng subprocess for English IPA with --ipa=1."""
-        import subprocess
-        try:
-            cmd = ["espeak-ng", "--ipa=1", "-v", "en-us", "-q", "--", text]
-            env = os.environ.copy()
-            if os.path.isdir(DATA_DIR):
-                env["ESPEAK_DATA_PATH"] = DATA_DIR
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=env)
-            if result.returncode != 0:
-                logger.warning("espeak-ng rc=%d stderr=%r", result.returncode, result.stderr)
-                return []
-            raw = result.stdout.strip()
-            # --ipa=1 outputs phonemes separated by underscore, e.g. "h_ə_l_ˈoʊ"
-            out = []
-            for ph in raw.split("_"):
-                if not ph:
+        """Phonemize English via piper-phonemize (same lib as sherpa-onnx)."""
+        import piper_phonemize
+        sentences = piper_phonemize.phonemize_espeak(text, "en-us")
+        if not sentences:
+            logger.warning("piper-phonemize returned empty for: %r", text)
+            return []
+        out = []
+        for phoneme_list in sentences:
+            for ph in phoneme_list:
+                if ph == " ":
                     continue
-                # Strip leading stress marks
                 ph_stripped = ph.lstrip(self.STRESS_MARKS)
-                # Try full phoneme first (e.g. "oʊ"), then fallback to single chars
+                if not ph_stripped:
+                    continue
                 if ph_stripped in self._token_to_id:
                     out.append(ph_stripped)
                 else:
                     for ch in ph_stripped:
                         if ch in self._token_to_id:
                             out.append(ch)
-            return out
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            logger.warning("espeak failed: %s", e)
-            return []
+                        else:
+                            logger.warning("Unknown phoneme: %r (from %r)", ch, ph)
+        return out
 
     def _text_to_tokens(self, text: str) -> list[int]:
-        """Convert text to token IDs via lexicon + espeak."""
+        """Convert text to token IDs via lexicon (zh) + piper-phonemize (en)."""
         import re
         tokens = []
 
