@@ -58,9 +58,10 @@ TOKENS_PATH = os.environ.get(
     os.path.join(PARAFORMER_MODEL_DIR, "tokens.txt"),
 )
 
-# Streaming parameters
-CHUNK_SIZE_SEC = 0.4       # 400ms per chunk
-LEFT_CONTEXT_SEC = 1.0     # 1s left context for FSMN 11-tap conv (~100 frames covers receptive field)
+# Streaming parameters — match sherpa-onnx training distribution
+# (https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en)
+CHUNK_SIZE_SEC = 0.67      # 67 fbank frames per chunk
+LEFT_CONTEXT_SEC = 2.68    # 4 prior chunks of left context (encoder_chunk_look_back=4)
 
 # FBank parameters (kaldi-compatible)
 SAMPLE_RATE = 16000
@@ -69,6 +70,7 @@ WINDOW_SIZE = 400           # 25ms at 16kHz
 HOP_SIZE = 160              # 10ms at 16kHz
 NUM_MEL_BINS = 80
 NUM_STACKED = 7
+NUM_STRIDE = 6   # LFR stride (downsample 10ms -> 60ms)
 PRE_EMPH = 0.97
 LOW_FREQ = 20
 HIGH_FREQ = 8000
@@ -170,20 +172,24 @@ def compute_fbank(audio: np.ndarray) -> np.ndarray:
 
 
 def stack_frames(feats: np.ndarray) -> np.ndarray:
-    """Stack 7 consecutive frames into 560-dim features.
+    """Apply Paraformer LFR (low-frame-rate): stack 7 frames with stride 6.
 
-    Each output frame t is concat(feats[t-6], ..., feats[t]).
-    First 6 frames are padded by repeating frame 0.
+    Downsamples 10ms fbank frames to 60ms LFR frames. Output length =
+    ceil(N / 6). Last partial window is padded by repeating the last frame.
 
     Returns:
-        stacked: [num_frames, 560] float32
+        stacked: [ceil(N/6), 560] float32
     """
     n, d = feats.shape
-    pad = np.repeat(feats[:1], NUM_STACKED - 1, axis=0)
-    padded = np.concatenate([pad, feats], axis=0)
-    stacked = np.zeros((n, d * NUM_STACKED), dtype=np.float32)
-    for i in range(n):
-        stacked[i] = padded[i:i + NUM_STACKED].ravel()
+    out_n = (n + NUM_STRIDE - 1) // NUM_STRIDE
+    needed = (out_n - 1) * NUM_STRIDE + NUM_STACKED
+    if needed > n:
+        pad = np.repeat(feats[-1:], needed - n, axis=0)
+        feats = np.concatenate([feats, pad], axis=0)
+    stacked = np.zeros((out_n, d * NUM_STACKED), dtype=np.float32)
+    for i in range(out_n):
+        start = i * NUM_STRIDE
+        stacked[i] = feats[start:start + NUM_STACKED].ravel()
     return stacked
 
 
@@ -420,8 +426,9 @@ class ParaformerTRTStream(ASRStream):
         feats_pre = all_feats[-enc_window_frames:]
         hist_frames = enc_window_frames - new_frames
 
-        feats = stack_frames(feats_pre)          # [enc_window_frames, 560]
-        hist_stacked = hist_frames
+        feats = stack_frames(feats_pre)          # LFR-downsampled
+        # Convert raw-fbank frame counts to LFR-stacked counts
+        hist_stacked = (hist_frames + NUM_STRIDE - 1) // NUM_STRIDE
         new_stacked = feats.shape[0] - hist_stacked
 
         # 3. Encoder TRT inference (on full stacked features for FSMN context)
@@ -517,7 +524,7 @@ class ParaformerTRTStream(ASRStream):
                 hist_frames = enc_window_frames - new_frames
 
                 feats = stack_frames(feats_pre)
-                hist_stacked = hist_frames
+                hist_stacked = (hist_frames + NUM_STRIDE - 1) // NUM_STRIDE
                 new_stacked = feats.shape[0] - hist_stacked
             else:
                 feats = None
