@@ -60,7 +60,7 @@ TOKENS_PATH = os.environ.get(
 
 # Streaming parameters
 CHUNK_SIZE_SEC = 0.4       # 400ms per chunk
-LEFT_CONTEXT_SEC = 0.0     # No explicit left context for v1 (handled by 7-frame stacking pad)
+LEFT_CONTEXT_SEC = 1.0     # 1s left context for FSMN 11-tap conv (~100 frames covers receptive field)
 
 # FBank parameters (kaldi-compatible)
 SAMPLE_RATE = 16000
@@ -331,6 +331,14 @@ class ParaformerTRTStream(ASRStream):
         self._audio_buf = np.array([], dtype=np.float32)
         self._processed_chunks = 0
 
+        # History audio for feature normalization continuity (Bug G fix)
+        left_ctx_samples = int(LEFT_CONTEXT_SEC * SAMPLE_RATE)  # 16000
+        self._history_audio = np.array([], dtype=np.float32)
+        self._left_ctx_samples = left_ctx_samples
+        # Full utterance audio for CMVN (matches offline normalization)
+        self._all_audio = np.array([], dtype=np.float32)
+        self._prev_total_frames = 0
+
         # Per-utterance state
         self._all_token_ids: list[int] = []
         self._partial_text: str = ""
@@ -347,6 +355,22 @@ class ParaformerTRTStream(ASRStream):
         self._chunk_count = 0
         self._total_enc_ms = 0.0
         self._total_dec_ms = 0.0
+
+    def _reset_utterance_state(self) -> None:
+        self._audio_buf = np.array([], dtype=np.float32)
+        self._processed_chunks = 0
+        self._all_token_ids = []
+        self._partial_text = ""
+        self._is_endpoint = False
+        self._carry_weight = 0.0
+        self._carry_embed = np.zeros(512, dtype=np.float32)
+        self._cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
+        self._chunk_count = 0
+        self._total_enc_ms = 0.0
+        self._total_dec_ms = 0.0
+        self._history_audio = np.array([], dtype=np.float32)
+        self._all_audio = np.array([], dtype=np.float32)
+        self._prev_total_frames = 0
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if samples.dtype != np.float32:
@@ -371,29 +395,59 @@ class ParaformerTRTStream(ASRStream):
             self._process_one_chunk(chunk_audio)
 
     def _process_one_chunk(self, audio: np.ndarray) -> None:
-        """Process a single 400ms chunk: fbank -> encoder -> CIF -> decoder."""
+        """Process a single 400ms chunk: fbank -> encoder -> CIF -> decoder.
+
+        Bug G fix: concat history_audio before fbank to get utterance-level CMVN
+        across chunks. Only process new frames (skip history_frames).
+        """
         t0 = time.perf_counter()
 
-        # 1. FBank extraction + stacking
-        feats = compute_fbank(audio)       # [40, 80]
-        feats = stack_frames(feats)        # [40, 560]
+        # 1. Accumulate full-utterance audio (Bug G fix: full-utterance CMVN
+        # matches offline normalization, fixes alpha scale drift).
+        self._all_audio = np.concatenate([self._all_audio, audio])
 
-        # 2. Encoder TRT inference
+        # 2. FBank+CMVN over FULL utterance, then slice (history+new) for encoder
+        all_feats = compute_fbank(self._all_audio)
+        cur_total_frames = all_feats.shape[0]
+        new_frames = cur_total_frames - self._prev_total_frames
+        if new_frames <= 0:
+            return
+        self._prev_total_frames = cur_total_frames
+
+        # Encoder window = last (LEFT_CONTEXT + new) frames for FSMN context
+        left_ctx_frames = int(LEFT_CONTEXT_SEC * SAMPLE_RATE / HOP_SIZE)
+        enc_window_frames = min(cur_total_frames, left_ctx_frames + new_frames)
+        feats_pre = all_feats[-enc_window_frames:]
+        hist_frames = enc_window_frames - new_frames
+
+        feats = stack_frames(feats_pre)          # [enc_window_frames, 560]
+        hist_stacked = hist_frames
+        new_stacked = feats.shape[0] - hist_stacked
+
+        # 3. Encoder TRT inference (on full stacked features for FSMN context)
         t1 = time.perf_counter()
         enc, alphas = self._backend._run_encoder(feats)
         enc_time = (time.perf_counter() - t1) * 1000
         self._total_enc_ms += enc_time
+
+        logger.debug(
+            f'[paraformer-stream] enc_call frames_total={feats.shape[0]} '
+            f'new_frames={new_stacked} history_frames={hist_stacked}'
+        )
 
         if enc is None or alphas is None:
             logger.warning("Encoder returned None for chunk %d", self._chunk_count)
             self._chunk_count += 1
             return
 
-        # 3. CIF: alphas -> acoustic_embeds
-        # ONNX encoder already outputs sigmoid-activated CIF weights [0, 1].
-        # Do NOT apply sigmoid again — that would inflate every frame to ~0.5+.
+        # 4. CIF: only on NEW frames (skip history)
         enc_t = enc[0]       # [feats_len, 512]
         alphas_t = alphas[0]  # [feats_len]
+
+        # Skip history frames for CIF/decoder — they were already processed
+        if hist_stacked > 0:
+            enc_t = enc_t[hist_stacked:]
+            alphas_t = alphas_t[hist_stacked:]
 
         acoustic_embeds, self._carry_weight, self._carry_embed = cif(
             enc_t, alphas_t,
@@ -405,10 +459,12 @@ class ParaformerTRTStream(ASRStream):
             self._chunk_count += 1
             return
 
-        # 4. Decoder ORT-CUDA inference
+        # 6. Decoder ORT-CUDA inference (only NEW-frame encoder slice;
+        # cache + CIF state advance over non-overlapping time span)
+        enc_new = enc[:, hist_stacked:, :] if hist_stacked > 0 else enc
         t2 = time.perf_counter()
         sample_ids = self._backend._run_decoder(
-            enc, alphas.shape[1],
+            enc_new, enc_new.shape[1],
             acoustic_embeds, len(acoustic_embeds),
             self._cache,
         )
@@ -419,7 +475,7 @@ class ParaformerTRTStream(ASRStream):
         if sample_ids is None:
             return
 
-        # 5. Decode token IDs
+        # 7. Decode token IDs
         new_ids = sample_ids.tolist()
         self._all_token_ids.extend(new_ids)
         old_len = len(self._partial_text)
@@ -433,31 +489,83 @@ class ParaformerTRTStream(ASRStream):
             )
 
     def get_partial(self) -> tuple[str, bool]:
-        return self._partial_text, self._is_endpoint
+        text = self._partial_text
+        is_endpoint = self._is_endpoint
+        if is_endpoint:
+            self._reset_utterance_state()
+        return text, is_endpoint
 
     def finalize(self) -> str:
-        """Process remaining audio tail + flush CIF -> final text."""
-        if len(self._audio_buf) >= HOP_SIZE:
-            pad_len = int(CHUNK_SIZE_SEC * SAMPLE_RATE) - len(self._audio_buf)
-            if pad_len > 0:
-                chunk = np.pad(self._audio_buf, (0, pad_len))
+        """Process remaining audio tail + flush CIF -> final text.
+
+        Bug G fix: full-utterance CMVN, slice (history+new) for encoder.
+        """
+        residual_audio = self._audio_buf
+        if len(residual_audio) > 0:
+            self._all_audio = np.concatenate([self._all_audio, residual_audio])
+
+        if len(self._all_audio) >= WINDOW_SIZE:
+            all_feats = compute_fbank(self._all_audio)
+            cur_total_frames = all_feats.shape[0]
+            new_frames = cur_total_frames - self._prev_total_frames
+
+            if new_frames > 0:
+                self._prev_total_frames = cur_total_frames
+                left_ctx_frames = int(LEFT_CONTEXT_SEC * SAMPLE_RATE / HOP_SIZE)
+                enc_window_frames = min(cur_total_frames, left_ctx_frames + new_frames)
+                feats_pre = all_feats[-enc_window_frames:]
+                hist_frames = enc_window_frames - new_frames
+
+                feats = stack_frames(feats_pre)
+                hist_stacked = hist_frames
+                new_stacked = feats.shape[0] - hist_stacked
             else:
-                chunk = self._audio_buf[:int(CHUNK_SIZE_SEC * SAMPLE_RATE)]
-            self._process_one_chunk(chunk)
+                feats = None
+
+            enc, alphas = (self._backend._run_encoder(feats)
+                           if feats is not None else (None, None))
+            if enc is not None and alphas is not None:
+                logger.debug(
+                    f'[paraformer-stream] finalize enc_call frames_total={feats.shape[0]} '
+                    f'new_frames={new_stacked} history_frames={hist_stacked}'
+                )
+                enc_t = enc[0]
+                alphas_t = alphas[0]
+                if hist_stacked > 0:
+                    enc_t = enc_t[hist_stacked:]
+                    alphas_t = alphas_t[hist_stacked:]
+
+                acoustic_embeds, self._carry_weight, self._carry_embed = cif(
+                    enc_t, alphas_t,
+                    carry_weight=self._carry_weight,
+                    carry_embed=self._carry_embed,
+                )
+
+                if len(acoustic_embeds) > 0:
+                    enc_new = enc[:, hist_stacked:, :] if hist_stacked > 0 else enc
+                    sample_ids = self._backend._run_decoder(
+                        enc_new, enc_new.shape[1],
+                        acoustic_embeds, len(acoustic_embeds),
+                        self._cache,
+                    )
+                    if sample_ids is not None:
+                        self._all_token_ids.extend(sample_ids.tolist())
+                        self._partial_text = decode_ids(self._all_token_ids, self._tokens)
+
         self._audio_buf = np.array([], dtype=np.float32)
 
         self._flush_cif_tail()
 
         text = self._partial_text
+        chunk_count = self._chunk_count
+        total_enc_ms = self._total_enc_ms
+        total_dec_ms = self._total_dec_ms
         self._is_endpoint = True
-        self._partial_text = ""
-        self._all_token_ids = []
-        self._carry_weight = 0.0
-        self._carry_embed = np.zeros(512, dtype=np.float32)
+        self._reset_utterance_state()
 
         logger.info(
             "Paraformer finalize: %d chunks, enc=%.0fms dec=%.0fms, text='%s'",
-            self._chunk_count, self._total_enc_ms, self._total_dec_ms, text,
+            chunk_count, total_enc_ms, total_dec_ms, text,
         )
         return text
 
@@ -482,10 +590,7 @@ class ParaformerTRTStream(ASRStream):
         self._flush_cif_tail()
         text = self._partial_text
         self._is_endpoint = True
-        self._partial_text = ""
-        self._all_token_ids = []
-        self._carry_weight = 0.0
-        self._carry_embed = np.zeros(512, dtype=np.float32)
+        self._reset_utterance_state()
         return text
 
 
@@ -504,6 +609,7 @@ class ParaformerTRTBackend(ASRBackend):
         self._enc_provider = "trt"  # "trt" or "ort_cuda"
         self._tokens: list[str] = []
         self._ready = False
+        self._enc_active_profile: Optional[int] = None
 
     # -- Properties ----------------------------------------------------------
 
@@ -826,6 +932,11 @@ class ParaformerTRTBackend(ASRBackend):
         """
         ctx = self._contexts["enc"]
         n_frames = feats.shape[0]
+        n_profiles = getattr(self._engines["enc"], "num_optimization_profiles", 1)
+        # Profile 1 covers 40..400 frames and matches streaming-with-history
+        # (~140) plus offline chunks. Skip profile 0 to avoid TRT single-context
+        # profile-switch races; pad short inputs up to profile 1 min instead.
+        profile_idx = 1 if n_profiles > 1 else 0
         enc_min_frames = 40
 
         # Pad to engine min shape if needed
@@ -835,11 +946,36 @@ class ParaformerTRTBackend(ASRBackend):
             feats = np.pad(feats, ((0, pad_len), (0, 0)), mode="edge")
             n_frames = enc_min_frames
 
-        key = f"enc_{n_frames}"
+        key = f"enc_p{profile_idx}_{n_frames}"
         if key not in self._bindings:
             self._bindings[key] = self._alloc_enc_buffers(n_frames)
 
         bufs = self._bindings[key]
+
+        # Execute on a fresh CUDA stream. Profile changes are asynchronous in
+        # TRT 10, so synchronize the previous work before switching and the
+        # profile-switch stream before setting dynamic input shapes.
+        err, stream = cudart.cudaStreamCreate()
+        if self._cuda_err(err) != 0:
+            logger.error("cudaStreamCreate failed: %s", err)
+            return None, None
+
+        if self._enc_active_profile != profile_idx:
+            cudart.cudaDeviceSynchronize()
+            if hasattr(ctx, "set_optimization_profile_async"):
+                success = ctx.set_optimization_profile_async(profile_idx, stream)
+                if not success:
+                    logger.error(
+                        "Encoder TRT set_optimization_profile_async failed "
+                        "(profile=%d, n_frames=%d)",
+                        profile_idx, n_frames,
+                    )
+                    cudart.cudaStreamDestroy(stream)
+                    return None, None
+                cudart.cudaStreamSynchronize(stream)
+            elif hasattr(ctx, "active_optimization_profile"):
+                ctx.active_optimization_profile = profile_idx
+            self._enc_active_profile = profile_idx
 
         # TRT 10.x: register tensor addresses
         ctx.set_tensor_address("speech", bufs["speech"])
@@ -859,6 +995,7 @@ class ParaformerTRTBackend(ASRBackend):
             cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
         )
         if self._cuda_err(err) != 0:
+            cudart.cudaStreamDestroy(stream)
             return None, None
 
         speech_len = np.array([n_frames], dtype=np.int32)
@@ -867,12 +1004,7 @@ class ParaformerTRTBackend(ASRBackend):
             cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
         )
         if self._cuda_err(err) != 0:
-            return None, None
-
-        # Execute asynchronously and synchronize
-        err, stream = cudart.cudaStreamCreate()
-        if self._cuda_err(err) != 0:
-            logger.error("cudaStreamCreate failed: %s", err)
+            cudart.cudaStreamDestroy(stream)
             return None, None
 
         success = ctx.execute_async_v3(stream)
