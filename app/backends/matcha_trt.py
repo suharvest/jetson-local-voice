@@ -231,12 +231,26 @@ class MatchaTRTBackend(TTSBackend):
             self.synthesize(t)
         logger.info("Warmup: %.1fs", time.time() - start)
 
-    def _phonemize_english(self, text: str) -> list[str]:
-        """Phonemize English via piper-phonemize (same lib as sherpa-onnx).
+    # English IPA → tokens.txt phoneme replacement table.
+    # Mirrors sherpa-onnx matcha-tts-lexicon.cc:44-57 (MatchaTtsLexicon for zh+en).
+    # Applied as ordered string replace BEFORE per-codepoint token lookup.
+    # Diphthongs map to ASCII letters that exist in tokens.txt as single tokens.
+    _IPA_REPLACEMENTS = [
+        ("eɪ", "A"), ("aɪ", "I"), ("ɔɪ", "Y"),
+        ("oʊ", "O"), ("əʊ", "O"), ("aʊ", "W"),
+        ("tʃ", "ʧ"), ("dʒ", "ʤ"),
+        ("ɝ", "ɜɹ"), ("ɚ", "əɹ"),
+        ("g", "ɡ"), ("r", "ɹ"), ("e", "ɛ"),
+        ("ː", ""),  # length mark deleted (not in vocab)
+    ]
 
-        Preserves stress marks (ˈˌ), length mark (ː), and word-boundary
-        spaces — all are real tokens in tokens.txt. Stripping them strips
-        prosody information the acoustic model was trained to consume.
+    def _phonemize_english(self, text: str) -> list[str]:
+        """Phonemize English via piper-phonemize, then sherpa replacement table.
+
+        sherpa-onnx MatchaTtsLexicon (matcha-tts-lexicon.cc) joins IPA
+        codepoints, applies _IPA_REPLACEMENTS, then splits per Unicode
+        codepoint and looks up each in tokens.txt (silently skip unknowns).
+        Stress marks ˈˌ are NOT in the table — kept and looked up directly.
         """
         import piper_phonemize
         sentences = piper_phonemize.phonemize_espeak(text, "en-us")
@@ -246,27 +260,31 @@ class MatchaTRTBackend(TTSBackend):
         out = []
         for sent_idx, phoneme_list in enumerate(sentences):
             if sent_idx > 0 and " " in self._token_to_id:
-                out.append(" ")  # sentence separator
-            for ph in phoneme_list:
-                if ph in self._token_to_id:
-                    out.append(ph)
-                else:
-                    # Multi-char phoneme: split into single chars
-                    for ch in ph:
-                        if ch in self._token_to_id:
-                            out.append(ch)
-                        else:
-                            logger.warning("Unknown phoneme: %r (from %r)", ch, ph)
+                out.append(" ")
+            joined = "".join(p for p in phoneme_list if p)
+            for src, dst in self._IPA_REPLACEMENTS:
+                joined = joined.replace(src, dst)
+            for cp in joined:
+                if cp in self._token_to_id:
+                    out.append(cp)
+                # else: silently skip (sherpa behavior)
         return out
 
     def _text_to_tokens(self, text: str) -> list[int]:
-        """Convert text to token IDs via lexicon (zh) + piper-phonemize (en)."""
+        """Convert text to token IDs via lexicon (zh) + piper-phonemize (en).
+
+        Inserts space token between consecutive English words (sherpa
+        matcha-tts-lexicon.cc:283-287 inserts ' ' before next word when
+        previous word started with ASCII alpha).
+        """
         import re
-        tokens = []
+        tokens: list[int] = []
+        space_id = self._token_to_id.get(" ")
+        prev_was_english = False
 
         segments = re.findall(
             r'[一-鿿]+|[A-Za-z][A-Za-z\' ]*[A-Za-z]|[A-Za-z]|[^一-鿿A-Za-z]+',
-            text
+            text,
         )
 
         for seg in segments:
@@ -276,12 +294,18 @@ class MatchaTRTBackend(TTSBackend):
 
             if re.match(r'^[一-鿿]+$', seg):
                 tokens.extend(self._chinese_to_tokens(seg))
+                prev_was_english = False
             elif re.match(r'^[A-Za-z]', seg):
+                if prev_was_english and space_id is not None:
+                    tokens.append(space_id)
                 phonemes = self._phonemize_english(seg)
                 for p in phonemes:
-                    tokens.append(self._token_to_id[p])
+                    tid = self._token_to_id.get(p)
+                    if tid is not None:
+                        tokens.append(tid)
                 if not phonemes:
                     logger.warning("Empty phonemes for English seg %r", seg)
+                prev_was_english = True
 
         return tokens
 
