@@ -15,6 +15,22 @@
 // Simple JSON parser for config.json (avoids external dependency)
 #include "json_minimal.h"
 
+// Memory checkpoint helper for OOM diagnosis. Reads /proc/meminfo and prints
+// MemAvailable in MB. Used to bisect TRT engine deserialization peaks on
+// memory-constrained Jetson devices (Orin NX 8 GB nvmap shared pool).
+static void TTSPipelineMemLog(const char* tag) {
+  std::ifstream f("/proc/meminfo");
+  std::string line;
+  long avail = 0;
+  while (std::getline(f, line)) {
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      std::sscanf(line.c_str(), "MemAvailable: %ld", &avail);
+      break;
+    }
+  }
+  std::cout << "  [MEM:" << tag << "] sys MemAvail=" << (avail / 1024) << " MB" << std::endl;
+}
+
 // ---------------------------------------------------------------------------
 // TTSConfig
 // ---------------------------------------------------------------------------
@@ -54,13 +70,34 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     skip_early.skip_cp_embed = std::ifstream(sherpa_dir + "/cp_embed_fp32.bin").good();
     skip_early.skip_codec_embed = std::ifstream(sherpa_dir + "/codec_embed_fp32.bin").good();
     std::cout << "Loading ORT models (embed table first)..." << std::endl;
+    TTSPipelineMemLog("before_ort_load");
     ort_ = std::make_unique<ORTModels>(model_dir, sherpa_dir, skip_early, device_id);
+    TTSPipelineMemLog("after_ort_load");
   }
 
-  std::cout << "Loading TRT engines..." << std::endl;
+  // Load Talker engine weights FIRST (largest contiguous allocation),
+  // but DEFER execution context creation to avoid overlapping workspace
+  // memory with CP/Vocoder deserialization peaks.
+  std::cout << "Loading TRT engines (Talker weights first, contexts deferred)..."
+            << std::endl;
+  TTSPipelineMemLog("before_talker_weights");
   talker_ = std::make_unique<TRTTalkerEngine>(
       talker_engine_path, cfg_.num_hidden_layers, cfg_.hidden_dim, cfg_.n_heads,
-      cfg_.head_dim, cfg_.vocab_size);
+      cfg_.head_dim, cfg_.vocab_size, 32, /*defer_context=*/true);
+  TTSPipelineMemLog("after_talker_weights");
+
+  // Create Talker execution context NOW, while 1+ GB is still available.
+  // Deferring past CP/Vocoder loads leaves only ~80 MB — not enough for the
+  // 150-200 MB context + I/O buffer allocation.
+  TTSPipelineMemLog("before_talker_init");
+  talker_->Init();
+  TTSPipelineMemLog("after_talker_init");
+
+  // Load cp_embed CPU table now (120 MB) while 628+ MB is still available.
+  // GPU upload is deferred until after cp_kv_pool_ is created below.
+  TTSPipelineMemLog("before_cp_embed_cpu");
+  LoadCPEmbedTable(sherpa_dir);
+  TTSPipelineMemLog("after_cp_embed_cpu");
 
   // Auto-detect engines: look in the same directory as the decode engine.
   bool trt_prefill_loaded = false;
@@ -72,37 +109,10 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     } else {
       engine_dir = ".";
     }
-    // Try to load CP KV cache engine FIRST (cp_unified_bf16.engine).
-    // Must be detected before deciding whether to load the old CP engine.
-    std::string cp_kv_path = engine_dir + "/cp_unified_bf16.engine";
-    std::ifstream cp_kv_test(cp_kv_path);
-    if (cp_kv_test.good()) {
-      cp_kv_test.close();
-      std::cout << "  Found CP KV engine: " << cp_kv_path << std::endl;
-      cp_kv_pool_ = std::make_unique<TRTCPKVEnginePool>(
-          cp_kv_path,
-          5,                      // n_cp_layers
-          cfg_.hidden_dim,        // 1024
-          cfg_.n_heads,           // 8
-          cfg_.head_dim,          // 128
-          cfg_.cp_vocab,          // 2048
-          cfg_.num_code_groups - 1  // 15 output groups
-      );
-    }
-
-    // Load old CP engine only when no CP KV pool is available.
-    if (!cp_kv_pool_) {
-      cp_ = std::make_unique<TRTCPEngine>(cp_engine_path, cfg_.hidden_dim,
-                                          cfg_.cp_vocab);
-      std::cout << "  No CP KV engine — loaded old context-copy CP" << std::endl;
-    } else {
-      std::cout << "  CP KV engine active — skipped old CP engine (saves ~332MB)" << std::endl;
-    }
 
     // Load separate prefill engine only when the decode engine lacks dual profiles.
     // Dual-profile engines handle batch prefill via Profile 0 internally.
     if (!talker_->has_dual_profiles()) {
-      // Prefer BF16 (no SIGSEGV), fall back to FP16, then iterative
       std::vector<std::string> prefill_candidates = {
           engine_dir + "/talker_prefill_bf16.engine",
           engine_dir + "/talker_prefill_fp16.engine",
@@ -125,15 +135,69 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
       std::cout << "  Dual-profile decode engine — skipped separate prefill (saves ~861MB)" << std::endl;
     }
 
-    // Try to load vocoder TRT engine
+    // Load vocoder TRT engine BEFORE CP KV.
+    // Vocoder weights-only deserialization peak (~450 MB) needs more headroom
+    // than is left after CP KV load + graph capture (~135 MB). Loading at
+    // this point (~415 MB available) avoids the CP KV peak overlap.
     std::string voc_engine_path = engine_dir + "/vocoder_fp16.engine";
     std::ifstream voc_test(voc_engine_path);
     if (voc_test.good()) {
       voc_test.close();
       std::cout << "  Found vocoder TRT engine: " << voc_engine_path << std::endl;
-      trt_vocoder_ = std::make_unique<TRTVocoderEngine>(voc_engine_path, 200, 24000 * 20);
+      TTSPipelineMemLog("before_vocoder_weights");
+      trt_vocoder_ = std::make_unique<TRTVocoderEngine>(voc_engine_path, 200,
+                                                         24000 * 20,
+                                                         /*defer_context=*/true);
+      TTSPipelineMemLog("after_vocoder_weights");
     } else {
-      std::cout << "  No vocoder TRT engine found â using ORT fallback" << std::endl;
+      std::cout << "  No vocoder TRT engine found — using ORT fallback" << std::endl;
+    }
+
+    // Load CP KV cache engine LAST.
+    // Its deserialization peak is smaller (~400 MB) and fits in the remaining
+    // memory after vocoder. GPU embed upload and CUDA Graph warmup are deferred
+    // to avoid pushing the peak over the limit.
+    std::string cp_kv_path = engine_dir + "/cp_unified_bf16.engine";
+    std::ifstream cp_kv_test(cp_kv_path);
+    if (cp_kv_test.good()) {
+      cp_kv_test.close();
+      std::cout << "  Found CP KV engine: " << cp_kv_path << std::endl;
+      TTSPipelineMemLog("before_cp_kv_load");
+      cp_kv_pool_ = std::make_unique<TRTCPKVEnginePool>(
+          cp_kv_path,
+          5,                      // n_cp_layers
+          cfg_.hidden_dim,        // 1024
+          cfg_.n_heads,           // 8
+          cfg_.head_dim,          // 128
+          cfg_.cp_vocab,          // 2048
+          cfg_.num_code_groups - 1  // 15 output groups
+      );
+      TTSPipelineMemLog("after_cp_kv_load");
+
+      // GPU embed upload SKIPPED: use_gpu_sample=false in RunFrameAutoregressive
+      // always uses the CPU-side embed_table pointer for per-step H2D upload of
+      // single embeddings. The GPU table (d_embed_table_) is only needed for
+      // the GPU sampling path (RunFrameGPU), which is permanently disabled.
+      // Skipping cudaMalloc(~40MB) + cudaMemcpy avoids OOM on 8 GB devices.
+      // If GPU sampling is ever re-enabled, uncomment:
+      // if (cp_kv_pool_ && !cp_embed_table_.empty()) {
+      //   cp_kv_pool_->LoadEmbedTable(cp_embed_table_.data(), cp_embed_n_layers_,
+      //                               cp_embed_vocab_, cfg_.hidden_dim);
+      // }
+    }
+
+    // Load old CP engine only when no CP KV pool is available.
+    if (!cp_kv_pool_) {
+      cp_ = std::make_unique<TRTCPEngine>(cp_engine_path, cfg_.hidden_dim,
+                                          cfg_.cp_vocab);
+      std::cout << "  No CP KV engine — loaded old context-copy CP" << std::endl;
+
+      if (cp_ && !cp_embed_table_.empty()) {
+        cp_->LoadEmbedTable(cp_embed_table_.data(), cp_embed_n_layers_,
+                            cp_embed_vocab_, cfg_.hidden_dim);
+      }
+    } else {
+      std::cout << "  CP KV engine active — skipped old CP engine (saves ~332MB)" << std::endl;
     }
   }
 
@@ -141,11 +205,13 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
   // Nothing to do here.
   (void)trt_prefill_loaded;  // suppress unused-variable warning
 
-  // Try to load cp_embed table on GPU for fast lookup
-  LoadCPEmbedTable(sherpa_dir);
+  // cp_embed table already loaded earlier (after talker_init) and
+  // uploaded to GPU after cp_kv_pool_ creation.
 
   // Pre-compute codec_embed table for O(1) lookup in decode loop
+  TTSPipelineMemLog("before_codec_embed");
   LoadCodecEmbedTable(sherpa_dir);
+  TTSPipelineMemLog("after_codec_embed");
 
   std::cout << "Pipeline ready." << std::endl;
 }
@@ -856,13 +922,11 @@ void TTSPipeline::LoadCPEmbedTableINT8(const std::string& sherpa_dir) {
 
   cp_embed_use_int8_ = true;
 
-  // Only free FP32 table if cp_kv_pool_ is NOT in use.
-  // cp_kv_pool_ RunFrameAutoregressive takes cp_embed_table_.data() as a CPU pointer;
-  // if cp_kv_pool_ exists, we keep FP32 for its use. INT8 is used for direct lookups only.
-  if (!cp_kv_pool_) {
-    cp_embed_table_.clear();
-    cp_embed_table_.shrink_to_fit();
-  }
+  // Keep FP32 table for RunFrameAutoregressive which passes cp_embed_table_.data()
+  // as the CPU embed_table pointer. cp_kv_pool_ is always null when LoadCPEmbedTable
+  // runs (pool created later in the constructor), so the old !cp_kv_pool_ guard
+  // always cleared FP32 → nullptr embed_table → zero embeddings → garbage output.
+  // INT8 costs only ~11 MB extra; the combined 51 MB is worth correctness.
 
   std::cout << "  INT8 cp_embed loaded: " << (n_layers * vocab * D) / (1024*1024)
             << "MB INT8 + " << (n_layers * vocab * 4) / 1024 << "KB scales"

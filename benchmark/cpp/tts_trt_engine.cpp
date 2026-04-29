@@ -138,7 +138,8 @@ static size_t TrtDtypeSize(nvinfer1::DataType dtype) {
 // ===========================================================================
 TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
                                  int hidden_dim, int n_heads, int head_dim,
-                                 int vocab_size, int max_seq)
+                                 int vocab_size, int max_seq,
+                                 bool defer_context)
     : n_layers_(n_layers),
       hidden_dim_(hidden_dim),
       n_heads_(n_heads),
@@ -155,31 +156,59 @@ TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
   kv_elem_bytes_ = TrtDtypeSize(kv_dtype);
   kv_is_bf16_ = (kv_dtype == nvinfer1::DataType::kBF16);
 
-  // Check for dual-profile engine (Profile 0 = prefill, Profile 1 = decode).
-  // A dual-profile engine has exactly 2 profiles and avoids the TRT 10.3
-  // SIGSEGV bug when both seq_len and past_len are dynamic in the same profile.
+  // Detect I/O tensor dtypes (needed for buffer sizes in AllocateBuffers)
+  {
+    std::string emb_tname = "inputs_embeds";
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "input_embeds") { emb_tname = "input_embeds"; break; }
+    }
+    auto logits_dtype = engine_->getTensorDataType("logits");
+    logits_elem_bytes_ = TrtDtypeSize(logits_dtype);
+    logits_is_bf16_ = (logits_dtype == nvinfer1::DataType::kBF16);
+
+    has_last_hidden_ = false;
+    hidden_elem_bytes_ = 4;
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+      std::string tn = engine_->getIOTensorName(i);
+      if (tn == "last_hidden") {
+        has_last_hidden_ = true;
+        auto hidden_dtype = engine_->getTensorDataType("last_hidden");
+        hidden_elem_bytes_ = TrtDtypeSize(hidden_dtype);
+        hidden_is_bf16_ = (hidden_dtype == nvinfer1::DataType::kBF16);
+        break;
+      }
+    }
+  }
+
+  // Check for dual-profile engine
   int n_profiles = engine_->getNbOptimizationProfiles();
-  if (n_profiles >= 2) {
-    has_dual_profiles_ = true;
-    // Profile 0: prefill — seq_len dynamic, past_len=0
-    ctx_prefill_.reset(engine_->createExecutionContext());
-    ctx_prefill_->setOptimizationProfileAsync(0, nullptr);
-    // Profile 1: decode — seq_len=1, past_len dynamic
+  has_dual_profiles_ = (n_profiles >= 2);
+
+  // Defer context creation + buffer allocation to Init() if requested.
+  // This saves ~200-300 MB of peak memory during loading by avoiding
+  // overlapping execution context workspace with other engine deserializations.
+  if (!defer_context) {
+    Init();
+  }
+}
+
+void TRTTalkerEngine::Init() {
+  if (has_dual_profiles_) {
+    // Create decode context (Profile 1) immediately — needed for DecodeStep.
+    // Prefill context (Profile 0) is lazily created on first Prefill() call
+    // to avoid its ~150 MB workspace overlapping with other engine deserializations.
     ctx_decode_.reset(engine_->createExecutionContext());
     ctx_decode_->setOptimizationProfileAsync(1, nullptr);
-    // Keep context_ pointing to decode context for backward compat
-    context_.reset();  // not used in dual-profile mode
-    std::cout << "  TRTTalkerEngine: DUAL-PROFILE engine detected ("
-              << n_profiles << " profiles)" << std::endl;
+    context_.reset();
+    std::cout << "  TRTTalkerEngine: DUAL-PROFILE engine (prefill ctx lazy)" << std::endl;
   } else {
-    has_dual_profiles_ = false;
     context_.reset(engine_->createExecutionContext());
     std::cout << "  TRTTalkerEngine: single-profile engine" << std::endl;
   }
 
   AllocateBuffers();
 
-  // Create CUDA events for profiling (always created, zero cost when unused)
   CHECK_CUDA(cudaEventCreate(&ev_start_));
   CHECK_CUDA(cudaEventCreate(&ev_h2d_done_));
   CHECK_CUDA(cudaEventCreate(&ev_kernel_done_));
@@ -703,6 +732,12 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
   // === Batch prefill path (decode engine with dynamic seq_len) ===
   // Dual-profile engine: use Profile 0 context (ctx_prefill_).
   // Single-profile engine: use context_ (which must support dynamic seq_len).
+  // Lazy-create prefill context on first use to defer its ~150 MB workspace
+  // past the memory-critical engine loading phase.
+  if (has_dual_profiles_ && !ctx_prefill_) {
+    ctx_prefill_.reset(engine_->createExecutionContext());
+    ctx_prefill_->setOptimizationProfileAsync(0, nullptr);
+  }
   auto* ctx = has_dual_profiles_ ? ctx_prefill_.get() : context_.get();
 
   if (first_step_) {
@@ -2351,7 +2386,7 @@ TRTCPKVEnginePool::TRTCPKVEnginePool(const std::string& engine_path, int n_cp_la
   }
 
   const char* env_pool_size = std::getenv("CP_POOL_SIZE");
-  pool_size_ = 2;  // default
+  pool_size_ = 1;  // default: 1 slot saves ~62MB vs 2 on 8GB devices
   if (env_pool_size) {
     try {
       int parsed = std::stoi(env_pool_size);
@@ -2456,7 +2491,8 @@ void TRTCPKVEnginePool::EnableProfiling(bool enable) {
 // TRTVocoderEngine
 // ===========================================================================
 TRTVocoderEngine::TRTVocoderEngine(const std::string& engine_path,
-                                   int max_frames, int max_samples)
+                                   int max_frames, int max_samples,
+                                   bool defer_context)
     : max_frames_(max_frames), max_samples_(max_samples) {
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
   engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
@@ -2465,16 +2501,9 @@ TRTVocoderEngine::TRTVocoderEngine(const std::string& engine_path,
               << std::endl;
     std::abort();
   }
-  context_.reset(engine_->createExecutionContext());
   CHECK_CUDA(cudaStreamCreate(&stream_));
-  CHECK_CUDA(cudaEventCreate(&ev_done_));
 
-  // Allocate GPU buffers
-  CHECK_CUDA(cudaMalloc(&d_codes_, (size_t)max_frames * 16 * sizeof(int64_t)));
-  CHECK_CUDA(cudaMalloc(&d_audio_values_, (size_t)max_samples * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&d_lengths_, sizeof(int64_t)));
-
-  // Detect output tensor names
+  // Detect output tensor names (engine metadata, no context needed)
   int n_io = engine_->getNbIOTensors();
   for (int i = 0; i < n_io; ++i) {
     std::string name = engine_->getIOTensorName(i);
@@ -2490,14 +2519,44 @@ TRTVocoderEngine::TRTVocoderEngine(const std::string& engine_path,
   if (audio_values_name_.empty()) audio_values_name_ = "audio_values";
   if (lengths_name_.empty()) lengths_name_ = "lengths";
 
-  std::cout << "  TRTVocoderEngine loaded: max_frames=" << max_frames
+  std::cout << "  TRTVocoderEngine weights loaded: max_frames=" << max_frames
             << " max_samples=" << max_samples
             << " out=[" << audio_values_name_ << "," << lengths_name_ << "]"
+            << (defer_context ? " (context deferred)" : "")
             << std::endl;
+
+  if (!defer_context) {
+    Init();
+  }
+}
+
+void TRTVocoderEngine::Init() {
+  if (init_done_) return;
+  context_.reset(engine_->createExecutionContext());
+  CHECK_CUDA(cudaEventCreate(&ev_done_));
+
+  // Allocate GPU buffers
+  CHECK_CUDA(cudaMalloc(&d_codes_, (size_t)max_frames_ * 16 * sizeof(int64_t)));
+  CHECK_CUDA(cudaMalloc(&d_audio_values_, (size_t)max_samples_ * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_lengths_, sizeof(int64_t)));
+
+  std::cout << "  TRTVocoderEngine context created (activation buffers allocated)"
+            << std::endl;
+
+  init_done_ = true;
 
   // Warm up common streaming shapes (first_chunk=5, chunk=25) so TRT tactic
   // selection happens at init time instead of on first request.
-  WarmupShapes({5, 25}, 16);
+  // OOM mitigation: warmup materializes activation buffers (~150-300 MB on Orin
+  // Nano 8 GB), tipping multilanguage TTS load over the limit. Default skip and
+  // accept first-request latency cost; opt-in via TTS_VOCODER_WARMUP=1.
+  const char* warmup_env = std::getenv("TTS_VOCODER_WARMUP");
+  if (warmup_env && warmup_env[0] == '1') {
+    WarmupShapes({5, 25}, 16);
+  } else {
+    std::cout << "  Vocoder warmup deferred (TTS_VOCODER_WARMUP unset; first "
+              << "synthesize will pay tactic-selection cost)" << std::endl;
+  }
 }
 
 void TRTVocoderEngine::WarmupShapes(const std::vector<int>& frame_sizes,
@@ -2537,6 +2596,8 @@ TRTVocoderEngine::~TRTVocoderEngine() {
 
 std::vector<float> TRTVocoderEngine::Run(const int64_t* codes, int n_frames,
                                           int n_groups) {
+  // Lazy init: create context + buffers on first call if deferred
+  if (!init_done_) Init();
   if (!context_) return {};
   if (n_frames <= 0 || n_frames > max_frames_) {
     std::cerr << "[Vocoder] Invalid n_frames=" << n_frames << std::endl;

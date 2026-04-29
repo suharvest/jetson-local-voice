@@ -127,11 +127,16 @@ class Qwen3TRTBackend(TTSBackend):
         # Enable cached CUDA Graph for talker decode:
         # First request populates cache (~10ms extra per unique seq_len),
         # subsequent requests replay cached graphs (~3ms vs 26ms baseline).
-        try:
-            self._engine.enable_cuda_graph(True)
-            logger.info("CUDA Graph enabled for talker decode (cached mode)")
-        except Exception as e:
-            logger.warning("CUDA Graph enable failed (non-fatal): %s", e)
+        # Memory-tight setups (Orin Nano 8GB multilanguage) can disable via
+        # TTS_TALKER_CUDA_GRAPH=0 to save ~150-300 MB graph cache during decode.
+        if os.environ.get("TTS_TALKER_CUDA_GRAPH", "1") == "1":
+            try:
+                self._engine.enable_cuda_graph(True)
+                logger.info("CUDA Graph enabled for talker decode (cached mode)")
+            except Exception as e:
+                logger.warning("CUDA Graph enable failed (non-fatal): %s", e)
+        else:
+            logger.info("CUDA Graph disabled for talker decode (TTS_TALKER_CUDA_GRAPH=0)")
 
         self._ready = True
         _meminfo("tts_ready")

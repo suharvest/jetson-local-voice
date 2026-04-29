@@ -113,8 +113,13 @@ class TRTLogger : public nvinfer1::ILogger {
 class TRTTalkerEngine {
  public:
   TRTTalkerEngine(const std::string& engine_path, int n_layers, int hidden_dim,
-                  int n_heads, int head_dim, int vocab_size, int max_seq = 200);
+                  int n_heads, int head_dim, int vocab_size, int max_seq = 200,
+                  bool defer_context = false);
   ~TRTTalkerEngine();
+
+  // Deferred context creation: call after engine weights are loaded.
+  // Avoids peak memory overlap with other engine deserializations.
+  void Init();
 
   // Load optional separate prefill engine (talker_prefill_fp16.engine).
   // When loaded, Prefill() uses batch execution instead of iterative decode.
@@ -613,12 +618,18 @@ class TRTVocoderEngine {
   // engine_path: path to vocoder_fp16.engine
   // max_frames: maximum T dimension (audio_codes [1, T, 16])
   // max_samples: maximum output samples (default 192000)
+  // defer_context: defer execution context + buffer allocation to Init()
   TRTVocoderEngine(const std::string& engine_path, int max_frames = 100,
-                   int max_samples = 192000);
+                   int max_samples = 192000, bool defer_context = false);
   ~TRTVocoderEngine();
+
+  // Deferred context creation: call after engine weights are loaded.
+  // Avoids peak memory overlap with other engine deserializations.
+  void Init();
 
   // Run vocoder: codes [1, T, 16] int64 → audio [valid_samples] float32
   // Returns only the valid samples (trimmed using lengths output).
+  // Auto-Init if context was deferred and not yet created.
   std::vector<float> Run(const int64_t* codes, int n_frames, int n_groups);
 
   // Warm up TRT tactic selection for common shapes at init time.
@@ -637,6 +648,7 @@ class TRTVocoderEngine {
 
   int max_frames_;
   int max_samples_;
+  bool init_done_ = false;
 
   void* d_codes_ = nullptr;        // [1, max_frames, 16] int64
   void* d_audio_values_ = nullptr; // [max_samples] float32
