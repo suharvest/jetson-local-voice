@@ -24,17 +24,13 @@ logger = logging.getLogger(__name__)
 # Paths
 _LANGUAGE_MODE = os.environ.get("LANGUAGE_MODE", "zh_en")
 _MODEL_BASE = os.environ.get("MATCHA_MODEL_BASE", "/opt/models/matcha-icefall-zh-en")
-MATCHA_ENCODER_ENGINE = os.environ.get(
-    "MATCHA_ENCODER_ENGINE",
-    os.path.join(_MODEL_BASE, "engines", "matcha_encoder_bf16.engine")
-)
-MATCHA_ESTIMATOR_ENGINE = os.environ.get(
-    "MATCHA_ESTIMATOR_ENGINE",
-    os.path.join(_MODEL_BASE, "engines", "matcha_estimator_n3_bf16.engine")
-)
 VOCOS_ENGINE = os.environ.get(
     "VOCOS_ENGINE",
-    os.path.join(_MODEL_BASE, "engines", "vocos_fp16.engine")
+    os.path.join(_MODEL_BASE, "engines", "vocos_fp16.engine")  # actually BF16 — kept filename for compat
+)
+ACOUSTIC_ONNX = os.environ.get(
+    "ACOUSTIC_ONNX",
+    os.path.join(_MODEL_BASE, "model-steps-3.onnx")
 )
 LEXICON_PATH = os.environ.get("LEXICON_PATH", os.path.join(_MODEL_BASE, "lexicon.txt"))
 TOKENS_PATH = os.environ.get("TOKENS_PATH", os.path.join(_MODEL_BASE, "tokens.txt"))
@@ -47,13 +43,6 @@ HOP_LENGTH = 256
 # Model constants
 MAX_MEL_FRAMES = 600
 MEL_DIM = 80
-TIME_EMB_DIM = 256
-N_TIME_BLOCKS = 6
-N_ODE_STEPS = 3
-ODE_DT = 1.0 / N_ODE_STEPS
-
-MEL_SIGMA = 5.446792
-MEL_MEAN = -2.9521978
 
 
 def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -74,67 +63,56 @@ def _samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def _compute_time_embedding(t: float, dim: int = TIME_EMB_DIM) -> np.ndarray:
-    """Compute sinusoidal time embedding for ODE step."""
-    half_dim = dim // 2
-    emb = np.log(10000.0) / (half_dim - 1)
-    emb = np.exp(np.arange(half_dim, dtype=np.float32) * -emb)
-    emb = t * emb
-    emb = np.concatenate([np.sin(emb), np.cos(emb)], dtype=np.float32)
-    return emb.reshape(1, dim, 1)
-
-
-# Periodic Hann window matches torch.hann_window(N_FFT, periodic=True) exactly.
-_HANN_PERIODIC = np.hanning(N_FFT + 1)[:-1].astype(np.float32)
+_HANN_PERIODIC = np.hanning(N_FFT + 1)[:-1].astype(np.float32)  # periodic Hann, matches sherpa vocos-vocoder.cc:92-140
 
 
 def _istft(mag: np.ndarray, x: np.ndarray, y: np.ndarray, length: Optional[int] = None) -> np.ndarray:
-    """torch.istft-equivalent NumPy ISTFT (center=True, periodic Hann, COLA).
+    """ISTFT matching sherpa-onnx vocos pipeline (knf::StftConfig center=1).
 
-    mag/x/y: [513, T] float32 (Vocos outputs).
+    mag/x/y: [513, T] float32 (Vocos outputs). complex = mag * (cos + j sin).
+    center=True: trim N_FFT//2 from each end of OLA output (matches sherpa
+    vocos-vocoder.cc:161-172).
     """
-    spec = (mag * (x + 1j * y)).astype(np.complex64)  # [F, T]
-    n_frames = spec.shape[1]
-    # IRFFT per time frame: [F, T] -> [N_FFT, T]
-    frames = np.fft.irfft(spec, n=N_FFT, axis=0).astype(np.float32)
-    # Apply window in time domain
-    frames = frames * _HANN_PERIODIC[:, None]
-    sq_window = (_HANN_PERIODIC ** 2).astype(np.float32)
-
-    # OLA reconstruction
+    complex_spec = (mag * (x + 1j * y)).astype(np.complex64)  # [F, T]
+    n_frames = complex_spec.shape[1]
     output_len = (n_frames - 1) * HOP_LENGTH + N_FFT
+
     audio = np.zeros(output_len, dtype=np.float32)
     win_sum = np.zeros(output_len, dtype=np.float32)
+    sq_window = (_HANN_PERIODIC ** 2).astype(np.float32)
     for i in range(n_frames):
+        frame = np.fft.irfft(complex_spec[:, i], n=N_FFT).astype(np.float32) * _HANN_PERIODIC
         start = i * HOP_LENGTH
-        audio[start:start + N_FFT] += frames[:, i]
+        audio[start:start + N_FFT] += frame
         win_sum[start:start + N_FFT] += sq_window
-    audio = audio / np.maximum(win_sum, 1e-11)
+    audio = audio / np.maximum(win_sum, 1e-8)
 
-    # center=True: trim N_FFT//2 from each side
+    # center=True: trim N_FFT//2 padding from each end
     pad = N_FFT // 2
-    audio = audio[pad:output_len - pad]
+    audio = audio[pad:-pad] if pad > 0 and len(audio) > 2 * pad else audio
 
     if length is not None:
         if len(audio) > length:
             audio = audio[:length]
         elif len(audio) < length:
             audio = np.pad(audio, (0, length - len(audio)))
-
     return audio
 
 
 class MatchaTRTBackend(TTSBackend):
-    """Matcha TTS via TensorRT (encoder + estimator + vocos)."""
+    """Matcha TTS — ORT-CPU acoustic (model-steps-3.onnx) + TRT vocos.
+
+    The original split (encoder TRT + estimator TRT + ODE loop) produced
+    subtly wrong mel due to time_emb npy mismatch with current model
+    variant. We use the baked acoustic ONNX via ORT-CPU directly
+    (sherpa-equivalent path), then BF16 TRT vocos for final audio.
+    """
 
     def __init__(self):
-        self._encoder_engine = None
-        self._encoder_ctx = None
-        self._estimator_engine = None
-        self._estimator_ctx = None
+        self._acoustic_ort = None
         self._vocos_engine = None
         self._vocos_ctx = None
-        self._cuda_pool = None  # CudaMemoryPool instance
+        self._cuda_pool = None
         self._lexicon = None
         self._token_to_id = None
         self._ready = False
@@ -156,9 +134,22 @@ class MatchaTRTBackend(TTSBackend):
 
     def preload(self) -> None:
         self._load_lexicon()
+        self._load_acoustic_ort()
         self._load_engines()
         self._warmup()
         self._ready = True
+
+    def _load_acoustic_ort(self):
+        """Load baked model-steps-3.onnx via ORT-CPU.
+
+        Bypasses split TRT estimator due to time_emb npy mismatch with
+        current model variant. Acoustic ~600ms on CPU (one ORT call vs
+        TRT split ~10ms) — accuracy > speed.
+        """
+        import onnxruntime as ort
+        path = os.path.join(_MODEL_BASE, "model-steps-3.onnx")
+        self._acoustic_ort = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        logger.info("Acoustic ORT loaded (CPU): %s", path)
 
     def _load_lexicon(self):
         """Load lexicon.txt and tokens.txt."""
@@ -204,23 +195,11 @@ class MatchaTRTBackend(TTSBackend):
                 engine = runtime.deserialize_cuda_engine(f.read())
             return engine
 
-        # Load TRT engines first (this initializes CUDA context via runtime API)
-        t0 = time.time()
-        self._encoder_engine = load_engine(MATCHA_ENCODER_ENGINE)
-        self._encoder_ctx = self._encoder_engine.create_execution_context()
-        logger.info("Encoder loaded: %s (%.1fs)", MATCHA_ENCODER_ENGINE, time.time() - t0)
-
-        t0 = time.time()
-        self._estimator_engine = load_engine(MATCHA_ESTIMATOR_ENGINE)
-        self._estimator_ctx = self._estimator_engine.create_execution_context()
-        logger.info("Estimator loaded: %s (%.1fs)", MATCHA_ESTIMATOR_ENGINE, time.time() - t0)
-
         t0 = time.time()
         self._vocos_engine = load_engine(VOCOS_ENGINE)
         self._vocos_ctx = self._vocos_engine.create_execution_context()
         logger.info("Vocos loaded: %s (%.1fs)", VOCOS_ENGINE, time.time() - t0)
 
-        # Now initialize CUDA memory pool (after TRT has initialized CUDA)
         self._cuda_pool = CudaMemoryPool()
 
     def _warmup(self):
@@ -360,92 +339,34 @@ class MatchaTRTBackend(TTSBackend):
             return _samples_to_wav(silence, SAMPLE_RATE), {"duration": 0.1, "inference_time": 0.0}
 
         num_tokens = min(len(tokens), 80)
-        x = np.zeros((1, 80), dtype=np.int32)
-        x[0, :num_tokens] = tokens[:num_tokens]
-        x_length = np.array([num_tokens], dtype=np.int32)
-        noise_scale = np.array([0.667], dtype=np.float32)
+        # Use ORT-CPU acoustic (baked model-steps-3.onnx) — sherpa-equivalent.
+        # TRT split estimator is bypassed because rkvoice-extracted time_emb npy
+        # is from a different model variant; using it produces correct-shape but
+        # subtly wrong mel ("字串"/字错位 in listening tests).
+        t0 = time.time()
+        x = np.array([tokens[:num_tokens]], dtype=np.int64)
+        x_length = np.array([num_tokens], dtype=np.int64)
+        noise_scale = np.array([1.0], dtype=np.float32)
         length_scale = np.array([1.0 / speed], dtype=np.float32)
-        z0 = np.random.randn(1, 80, 600).astype(np.float32) * noise_scale[0]
+        ao = self._acoustic_ort.run(None, {
+            "x": x, "x_length": x_length,
+            "noise_scale": noise_scale, "length_scale": length_scale,
+        })
+        mel = ao[0]  # [1, 80, T_mel] already denormalized (denorm baked into graph)
+        encoder_ms = (time.time() - t0) * 1000
+        estimator_ms = 0.0
+        mel_frames = mel.shape[2]
+        # Pad to MAX_MEL_FRAMES for vocos engine compat (drop excess if any)
+        if mel.shape[2] > MAX_MEL_FRAMES:
+            mel = mel[:, :, :MAX_MEL_FRAMES]
+            mel_frames = MAX_MEL_FRAMES
+        mask = None
+        mask_valid = mel_frames
 
-        # Allocate and copy
         def alloc(arr):
             ptr = pool.allocate(arr.nbytes)
             pool.copy_htod(arr, ptr)
             return ptr
-
-        t0 = time.time()
-        d_noise = alloc(noise_scale)
-        d_len = alloc(length_scale)
-        d_z0 = alloc(z0)
-        d_x = alloc(x)
-        d_xlen = alloc(x_length)
-
-        mu = np.zeros((1, 80, 600), dtype=np.float32)
-        mask = np.zeros((1, 1, 600), dtype=np.float32)
-        z = np.zeros((1, 80, 600), dtype=np.float32)
-
-        d_mu = pool.allocate(mu.nbytes)
-        d_mask = pool.allocate(mask.nbytes)
-        d_z_out = pool.allocate(z.nbytes)
-
-        # Encoder
-        self._encoder_ctx.set_tensor_address("noise_scale", d_noise)
-        self._encoder_ctx.set_tensor_address("length_scale", d_len)
-        self._encoder_ctx.set_tensor_address("z0_noise", d_z0)
-        self._encoder_ctx.set_tensor_address("x", d_x)
-        self._encoder_ctx.set_tensor_address("x_length", d_xlen)
-        self._encoder_ctx.set_tensor_address("/Transpose_3_output_0", d_mu)
-        self._encoder_ctx.set_tensor_address("/Cast_3_output_0", d_mask)
-        self._encoder_ctx.set_tensor_address("/decoder/Mul_output_0", d_z_out)
-        self._encoder_ctx.execute_async_v3(pool.stream_handle())
-        pool.synchronize()
-        pool.copy_dtoh(d_mu, mu)
-        pool.copy_dtoh(d_mask, mask)
-        pool.copy_dtoh(d_z_out, z)
-        encoder_ms = (time.time() - t0) * 1000
-
-        # Estimator ODE loop
-        t0 = time.time()
-        for step in range(N_ODE_STEPS):
-            t_val = step * ODE_DT
-            time_embs = [_compute_time_embedding(t_val + i * ODE_DT / N_TIME_BLOCKS)
-                         for i in range(N_TIME_BLOCKS)]
-
-            d_z_in = alloc(z)
-            d_mu_in = alloc(mu)
-            d_mask_in = alloc(mask)
-
-            self._estimator_ctx.set_tensor_address("z", d_z_in)
-            self._estimator_ctx.set_tensor_address("mu", d_mu_in)
-            self._estimator_ctx.set_tensor_address("mask", d_mask_in)
-
-            d_time_embs = [alloc(te) for te in time_embs]
-            for i, d_te in enumerate(d_time_embs):
-                self._estimator_ctx.set_tensor_address(f"time_emb_{i}", d_te)
-
-            velocity = np.zeros((1, 80, 600), dtype=np.float32)
-            d_vel = pool.allocate(velocity.nbytes)
-            self._estimator_ctx.set_tensor_address("velocity", d_vel)
-            self._estimator_ctx.execute_async_v3(pool.stream_handle())
-            pool.synchronize()
-            pool.copy_dtoh(d_vel, velocity)
-            z = z + ODE_DT * velocity
-
-        estimator_ms = (time.time() - t0) * 1000
-
-        # Denormalize + clip mel (matches rkvoice matcha.py:429-430)
-        mel = z * MEL_SIGMA + MEL_MEAN
-        mel = np.clip(mel, -25.0, 8.0)
-
-        # Derive mel_frames from encoder mask (1=valid, 0=padding).
-        # Heuristic 11.9·num_tokens+51 saturates at 600 for English long inputs.
-        mask_valid = int(mask[0, 0, :].astype(np.float32).sum() + 0.5)
-        if mask_valid <= 0:
-            est_frames = int((11.9 * num_tokens + 51) * length_scale[0] * 1.2 + 0.5)
-            mel_frames = min(est_frames, MAX_MEL_FRAMES)
-            logger.warning("matcha mask sum=0, falling back to heuristic mel_frames=%d", mel_frames)
-        else:
-            mel_frames = min(mask_valid, MAX_MEL_FRAMES)
         logger.debug("matcha frames: tokens=%d mask=%d mel_frames=%d (~%.2fs)",
                      num_tokens, mask_valid, mel_frames, mel_frames * HOP_LENGTH / SAMPLE_RATE)
 
@@ -478,8 +399,9 @@ class MatchaTRTBackend(TTSBackend):
         # ISTFT (length matches mel_frames * HOP_LENGTH)
         audio = _istft(mag[0], out_x[0], out_y[0], length=mel_frames * HOP_LENGTH)
 
-        if np.abs(audio).max() > 0:
-            audio = audio / np.abs(audio).max() * 0.95
+        # No peak normalize — sherpa returns raw ISTFT (offline-tts-impl.cc:88-102 only int16-scales).
+        # Clip to int16 range to prevent overflow on rare loud frames.
+        audio = np.clip(audio, -1.0, 1.0)
 
         elapsed = time.time() - t_start
         duration = len(audio) / SAMPLE_RATE
