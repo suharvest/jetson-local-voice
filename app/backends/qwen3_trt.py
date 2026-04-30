@@ -112,6 +112,10 @@ class Qwen3TRTBackend(TTSBackend):
         logger.info("Loading Qwen3 TRT engine (this takes ~25s)...")
         t0 = time.time()
 
+        # INT8 EOS compensation: subtract from EOS logit before sampling
+        # Set via TTS_INT8_EOS_LOGIT_OFFSET env var (negative = harder EOS)
+        os.environ.setdefault("TTS_INT8_EOS_LOGIT_OFFSET", "-10.0")
+
         sampler.start()
         try:
             import qwen3_speech_engine

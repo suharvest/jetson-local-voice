@@ -263,6 +263,11 @@ void TTSPipeline::LoadConfig(const std::string& sherpa_dir) {
   cfg_.codec_think_eos_id = j.GetInt("codec_think_eos_id");
   cfg_.codec_think_id = j.GetInt("codec_think_id", cfg_.codec_nothink_id);
 
+  // INT8 EOS compensation: negative offset subtracts from EOS logit
+  const char* eos_off = std::getenv("TTS_INT8_EOS_LOGIT_OFFSET");
+  if (eos_off) cfg_.eos_logit_offset = std::atof(eos_off);
+  std::cout << "Config: eos_logit_offset=" << cfg_.eos_logit_offset << std::endl;
+
   // Parse codec_language_id map
   auto lang_map = j.GetObject("codec_language_id");
   for (auto& [k, v] : lang_map) {
@@ -622,7 +627,7 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
   for (int step = 0; step < effective_max; ++step) {
     // Compute progressive EOS bias (delayed start)
-    float eos_bias = 0.0f;
+    float eos_bias = cfg_.eos_logit_offset;
     int steps_past_onset = step - bias_onset;
     if (steps_past_onset >= 0) {
       eos_bias = std::min(kEosBiasMax,
@@ -1223,7 +1228,7 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
 
   for (int step = 0; step < effective_max; ++step) {
     // Compute progressive EOS bias (delayed start)
-    float eos_bias = 0.0f;
+    float eos_bias = cfg_.eos_logit_offset;
     int steps_past_onset = step - bias_onset;
     if (steps_past_onset >= 0) {
       eos_bias = std::min(kEosBiasMax,

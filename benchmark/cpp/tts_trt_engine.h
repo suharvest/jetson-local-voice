@@ -246,6 +246,9 @@ class TRTTalkerEngine {
   bool has_position_ids_ = false;
   void* d_position_id_ = nullptr;
 
+  // attention_mask detection (not all engines have it)
+  bool has_attention_mask_ = false;
+
   // CUDA event profiling
   bool profiling_ = false;
   ProfilingStats stats_;
@@ -253,6 +256,13 @@ class TRTTalkerEngine {
   cudaEvent_t ev_h2d_done_ = nullptr;
   cudaEvent_t ev_kernel_done_ = nullptr;
   cudaEvent_t ev_d2h_done_ = nullptr;
+
+  // attention_mask buffer (not captured in graph, filled with ones)
+  void* d_attention_mask_ = nullptr;
+
+  // position_ids / attention_mask support for prefill engine
+  bool prefill_has_position_ids_ = false;
+  bool prefill_has_attention_mask_ = false;
 
   // Cached emb tensor name for binding (avoid re-detection)
   std::string emb_name_;

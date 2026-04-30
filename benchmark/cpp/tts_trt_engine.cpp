@@ -168,6 +168,7 @@ TRTTalkerEngine::TRTTalkerEngine(const std::string& engine_path, int n_layers,
     logits_is_bf16_ = (logits_dtype == nvinfer1::DataType::kBF16);
 
     has_last_hidden_ = false;
+  std::cout << "  TRTTalkerEngine logits dtype: " << (int)logits_dtype << " elem_bytes=" << logits_elem_bytes_ << std::endl;
     hidden_elem_bytes_ = 4;
     for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
       std::string tn = engine_->getIOTensorName(i);
@@ -290,12 +291,20 @@ void TRTTalkerEngine::AllocateBuffers() {
   CHECK_CUDA(cudaMalloc(&d_hidden_, 1 * max_seq_ * hidden_dim_ * hidden_elem_bytes_));
   CHECK_CUDA(cudaMalloc(&d_position_id_, max_seq_ * sizeof(int64_t)));
 
+  // Allocate attention_mask and fill with ones (causal masking handled internally)
+  CHECK_CUDA(cudaMalloc(&d_attention_mask_, 1 * max_seq_ * sizeof(int64_t)));
+  std::vector<int64_t> mask_data(max_seq_, 1);
+  CHECK_CUDA(cudaMemcpy(d_attention_mask_, mask_data.data(), mask_data.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+
   std::cout << "  TRTTalkerEngine dtypes: logits=" << logits_elem_bytes_
             << "B (bf16=" << logits_is_bf16_ << ") hidden=" << hidden_elem_bytes_
             << "B has_hidden=" << has_last_hidden_ << std::endl;
 }
 
 void TRTTalkerEngine::FreeBuffers() {
+  if (d_attention_mask_) cudaFree(d_attention_mask_);
+  d_attention_mask_ = nullptr;
+
   for (auto p : kv_a_)
     if (p) cudaFree(p);
   for (auto p : kv_b_)
@@ -367,6 +376,13 @@ void TRTTalkerEngine::LoadPrefillEngine(const std::string& prefill_engine_path) 
   }
   prefill_ctx_.reset(prefill_engine_->createExecutionContext());
 
+  // Detect optional inputs on prefill engine
+  for (int i = 0; i < prefill_engine_->getNbIOTensors(); ++i) {
+    std::string tn = prefill_engine_->getIOTensorName(i);
+    if (tn == "position_ids") { prefill_has_position_ids_ = true; }
+    if (tn == "attention_mask") { prefill_has_attention_mask_ = true; }
+  }
+
   // Allocate GPU output buffers for KV cache from prefill engine.
   // Each KV tensor: [1, n_heads, max_seq, head_dim] in FP16.
   // We reuse kv_elem_bytes_ from the decode engine (both are FP16).
@@ -401,7 +417,8 @@ void TRTTalkerEngine::LoadPrefillEngine(const std::string& prefill_engine_path) 
                         1 * max_seq_ * hidden_dim_ * hidden_elem));
 
   std::cout << "  Prefill engine loaded: " << n_kv << " KV output buffers, "
-            << "kv_bytes=" << kv_bytes << " each" << std::endl;
+            << "kv_bytes=" << kv_bytes << " each"
+            << " pos_ids=" << prefill_has_position_ids_ << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +442,21 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::RunPrefillEngine(
   // Bind inputs_embeds
   pctx->setInputShape("inputs_embeds", nvinfer1::Dims3{1, seq_len, hidden_dim_});
   pctx->setTensorAddress("inputs_embeds", d_prefill_emb_);
+  if (prefill_has_attention_mask_) {
+    pctx->setInputShape("attention_mask", nvinfer1::Dims2{1, seq_len});
+    pctx->setTensorAddress("attention_mask", d_attention_mask_);
+  }
+
+  // Bind position_ids if prefill engine has it
+  if (prefill_has_position_ids_) {
+    std::vector<int64_t> positions(seq_len);
+    for (int i = 0; i < seq_len; ++i) positions[i] = i;
+    CHECK_CUDA(cudaMemcpyAsync(d_position_id_, positions.data(),
+                               seq_len * sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream_));
+    pctx->setInputShape("position_ids", nvinfer1::Dims2{1, seq_len});
+    pctx->setTensorAddress("position_ids", d_position_id_);
+  }
 
   // Bind output: logits
   pctx->setTensorAddress("logits", d_prefill_logits_);
@@ -767,6 +799,10 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
   ctx->setInputShape(emb_name_.c_str(),
                      nvinfer1::Dims3{1, seq_len, hidden_dim_});
   ctx->setTensorAddress(emb_name_.c_str(), d_emb_);
+  if (has_attention_mask_) {
+    ctx->setInputShape("attention_mask", nvinfer1::Dims2{1, seq_len});
+    ctx->setTensorAddress("attention_mask", d_attention_mask_);
+  }
 
   auto& read = kv_a_;
   auto& write = kv_b_;
@@ -799,6 +835,7 @@ TRTTalkerEngine::PrefillResult TRTTalkerEngine::Prefill(
     }
   }
 
+  bool enq_ok = 
   ctx->enqueueV3(stream_);
 
   PrefillResult result;
@@ -964,15 +1001,21 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       }
       for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
         std::string tn = engine_->getIOTensorName(i);
-        if (tn == "position_ids") { has_position_ids_ = true; break; }
+        if (tn == "position_ids") { has_position_ids_ = true; }
+        if (tn == "attention_mask") { has_attention_mask_ = true; }
       }
       first_step_ = false;
     }
     // Bind static tensor addresses on decode context (done once per context)
     std::cout << "  TRT decode ctx init: emb_name=" << emb_name_
-              << " has_position_ids=" << has_position_ids_ << std::endl;
+              << " has_position_ids=" << has_position_ids_
+              << " has_attention_mask=" << has_attention_mask_ << std::endl;
     ctx->setInputShape(emb_name_.c_str(), nvinfer1::Dims3{1, 1, hidden_dim_});
     ctx->setTensorAddress(emb_name_.c_str(), d_emb_);
+    if (has_attention_mask_) {
+      ctx->setInputShape("attention_mask", nvinfer1::Dims2{1, (int32_t)seq_len_ + 1});
+      ctx->setTensorAddress("attention_mask", d_attention_mask_);
+    }
     ctx->setTensorAddress("logits", d_logits_);
     // "last_hidden" may not exist in ASR engine — bind only if present
     for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
@@ -1046,6 +1089,10 @@ void TRTTalkerEngine::DecodeStep(const float* inputs_embeds, float* logits,
       CaptureGuard capture_guard(stream_);
       // ThreadLocal (not Global): Global blocks cudaEventSynchronize on OTHER
       // streams from OTHER threads for entire capture duration — vocoder.Run
+      if (has_attention_mask_) {
+        ctx->setInputShape("attention_mask", nvinfer1::Dims2{1, (int32_t)seq_len_ + 1});
+        ctx->setTensorAddress("attention_mask", d_attention_mask_);
+      }
       // on another thread would crash. EndCapture MUST stay on this thread.
       CHECK_CUDA(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
       capture_guard.mark_active(nullptr);

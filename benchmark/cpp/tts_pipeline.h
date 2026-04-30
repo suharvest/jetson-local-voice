@@ -27,6 +27,9 @@ struct TTSConfig {
   // zero-filled. Runtime experiment knob — does NOT change model shapes.
   int cp_active_groups = 15;
 
+  // INT8 compensation: subtract from EOS logit (negative = harder to stop)
+  float eos_logit_offset = 0.0f;
+
   int tts_bos_token_id;
   int tts_eos_token_id;
   int tts_pad_token_id;

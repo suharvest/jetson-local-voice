@@ -170,9 +170,12 @@ def export_talker_prefill(model, output_dir, opset=14):
             super().__init__()
             self.talker = talker
 
-        def forward(self, inputs_embeds, attention_mask):
+        def forward(self, inputs_embeds, attention_mask, position_ids):
+            # position_ids: (1, T) → squeeze to (T,) for cache_position
+            cache_position = position_ids.squeeze(0)
             out = self.talker.model(inputs_embeds=inputs_embeds,
                                     attention_mask=attention_mask,
+                                    cache_position=cache_position,
                                     use_cache=True, return_dict=True)
             hidden = out.last_hidden_state
             logits = self.talker.codec_head(hidden[:, -1:, :])
@@ -183,16 +186,18 @@ def export_talker_prefill(model, output_dir, opset=14):
     T = 10
     dummy_e = torch.randn(1, T, D, device=model.device)
     dummy_m = torch.ones(1, T, dtype=torch.long, device=model.device)
+    dummy_pos = torch.arange(0, T, device=model.device).unsqueeze(0)  # (1, T)
 
     kv_names = []
     for i in range(N):
         kv_names += [f"past_key_{i}", f"past_value_{i}"]
 
-    torch.onnx.export(w, (dummy_e, dummy_m), f"{output_dir}/talker_prefill.onnx",
-                       input_names=["inputs_embeds", "attention_mask"],
+    torch.onnx.export(w, (dummy_e, dummy_m, dummy_pos), f"{output_dir}/talker_prefill.onnx",
+                       input_names=["inputs_embeds", "attention_mask", "position_ids"],
                        output_names=["logits", "last_hidden"] + kv_names,
                        dynamic_axes={
                            "inputs_embeds": {1: "T"}, "attention_mask": {1: "T"},
+                           "position_ids": {1: "T"},
                            "last_hidden": {1: "T"},
                            **{n: {2: "T"} for n in kv_names},
                        },
@@ -217,14 +222,17 @@ def export_talker_decode(model, output_dir, opset=14):
             self.talker = talker
             self.num_layers = num_layers
 
-        def forward(self, inputs_embeds, attention_mask, *past_kv_flat):
+        def forward(self, inputs_embeds, attention_mask, position_ids, *past_kv_flat):
             from transformers.cache_utils import DynamicCache
             cache = DynamicCache()
             for i in range(self.num_layers):
                 cache.update(past_kv_flat[2*i], past_kv_flat[2*i+1], i)
+            # position_ids: (1, seq_len) → squeeze to (seq_len,) for cache_position
+            cache_position = position_ids.squeeze(0)
             out = self.talker.model(inputs_embeds=inputs_embeds,
                                     attention_mask=attention_mask,
                                     past_key_values=cache,
+                                    cache_position=cache_position,
                                     use_cache=True, return_dict=True)
             hidden = out.last_hidden_state
             logits = self.talker.codec_head(hidden)
@@ -235,6 +243,7 @@ def export_talker_decode(model, output_dir, opset=14):
     T_past = 10
     dummy_e = torch.randn(1, 1, D, device=model.device)
     dummy_m = torch.ones(1, T_past + 1, dtype=torch.long, device=model.device)
+    dummy_pos = torch.arange(T_past, T_past + 1, device=model.device).unsqueeze(0)  # (1, 1)
     dummy_kv = [torch.randn(1, H, T_past, dh, device=model.device) for _ in range(N * 2)]
 
     in_kv = []; out_kv = []
@@ -242,13 +251,14 @@ def export_talker_decode(model, output_dir, opset=14):
         in_kv += [f"past_key_{i}", f"past_value_{i}"]
         out_kv += [f"new_past_key_{i}", f"new_past_value_{i}"]
 
-    torch.onnx.export(w, (dummy_e, dummy_m, *dummy_kv),
+    torch.onnx.export(w, (dummy_e, dummy_m, dummy_pos, *dummy_kv),
                        f"{output_dir}/talker_decode.onnx",
-                       input_names=["inputs_embeds", "attention_mask"] + in_kv,
+                       input_names=["inputs_embeds", "attention_mask", "position_ids"] + in_kv,
                        output_names=["logits", "last_hidden"] + out_kv,
                        dynamic_axes={
                            "inputs_embeds": {1: "seq_len"},
                            "attention_mask": {1: "full_len"},
+                           "position_ids": {1: "seq_len"},
                            "last_hidden": {1: "seq_len"},
                            **{n: {2: "past_len"} for n in in_kv},
                            **{n: {2: "new_len"} for n in out_kv},
