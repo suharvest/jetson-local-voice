@@ -89,6 +89,21 @@ Streaming is opt-in:
 }
 ```
 
+For service integrations that do not need a final WAV, use streaming-only PCM:
+
+```json
+{
+  "id": "1",
+  "text": "你好。",
+  "stream": true,
+  "stream_only": true,
+  "first_chunk_frames": 1,
+  "chunk_frames": 25,
+  "chunk_format": "pcm_s16le",
+  "chunk_transport": "base64"
+}
+```
+
 The worker emits chunk events before final `done`:
 
 ```json
@@ -97,7 +112,7 @@ The worker emits chunk events before final `done`:
 {"event":"done","output_file":"/tmp/out.wav","first_chunk_ms":...}
 ```
 
-File-based chunks are example-only. A production service can instead write raw PCM to a socket.
+File-based WAV chunks are example-only. The Jetson voice backend now uses inline base64 `pcm_s16le` chunks and yields raw PCM bytes from `/tts/stream`.
 
 ## Why This Matches EdgeLLM Direction
 
@@ -124,6 +139,16 @@ Streaming run, 1-frame first chunk, 8-frame follow-up chunks, resident worker:
 
 Cold first request still measured around `1150 ms` first chunk because TensorRT/Code2Wav first execution needs warmup. A conversational service should keep the worker resident and issue a warmup request before accepting user traffic.
 
+After adding `stream_only=true` and inline PCM chunks, the final full Code2Wav pass is skipped. With `first_chunk_frames=1` and `chunk_frames=25`, the hot resident run measured:
+
+```json
+{"event":"done","first_chunk_ms":638.2,"audio_s":1.76,"rtf":1.38}
+```
+
+The Python `TRTEdgeLLMTTSBackend.generate_streaming()` integration consumed the same protocol through the resident worker. In a two-request hot test, the second request yielded the first PCM chunk at `0.64 s`.
+
+The remaining RTF cost is mostly from synchronous Code2Wav chunking: the Talker waits while each chunk is vocoded. Moving Code2Wav to a separate CUDA stream/thread is the next major latency/RTF optimization.
+
 TTS correctness requires the special CodePredictor path on the current Nano runtime:
 
 ```bash
@@ -147,9 +172,9 @@ For dual-resident ASR + TTS on the 8GB Nano, the main memory gap is still fixed 
 
 ## Follow-Up Optimizations
 
-1. Avoid final full WAV generation when the caller only wants streaming.
-2. Add optional raw PCM callback in examples to avoid WAV chunk files.
-3. Warm common Code2Wav shapes (`1`, `8`, `25` frames) when memory allows.
+1. Move Code2Wav chunking to a separate CUDA stream/thread so Talker generation can continue while the previous chunk is vocoded.
+2. Add binary stdout or socket transport for PCM to avoid base64 expansion in high-throughput services.
+3. Warm common Code2Wav shapes (`1`, `25` frames) when memory allows.
 4. Reuse the special CodePredictor path by default when matching assets are present.
 5. Move chunk assembly into a reusable helper if more examples need it.
 6. Add CP graph cache / KV-zero optimizations from the old native runner after streaming correctness is stable.

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import base64
 from typing import Optional
 import importlib.util
 import uuid
@@ -169,8 +170,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def _worker_env(self) -> dict:
         env = os.environ.copy()
         env["EDGELLM_PLUGIN_PATH"] = PLUGIN_PATH
-        env.setdefault("EDGE_LLM_TTS_CUDA_GRAPH", "0")
-        env.setdefault("EDGE_LLM_TTS_LAZY_CODE2WAV", "1")
+        env.setdefault("EDGE_LLM_TTS_CUDA_GRAPH", "1")
+        env.setdefault("EDGE_LLM_TTS_LAZY_CODE2WAV", "0")
         if os.path.exists(TTS_SPECIAL_CP_ENGINE) and os.path.exists(TTS_SPECIAL_CP_EMBED_FP32):
             env.setdefault("QWEN3_TTS_CP_ENGINE", TTS_SPECIAL_CP_ENGINE)
             env.setdefault("QWEN3_TTS_CP_EMBED_FP32", TTS_SPECIAL_CP_EMBED_FP32)
@@ -255,6 +256,64 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "worker_init_ms": round(float(self._worker_ready_meta.get("init_ms", 0.0)), 1),
         }
         return wav_bytes, meta
+
+    def generate_streaming(self, text: str, **kwargs):
+        """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
+        req_id = uuid.uuid4().hex
+        request = {
+            "id": req_id,
+            "text": text,
+            "output_file": f"/tmp/trt_edgellm_tts_stream_{req_id}.wav",
+            "language": kwargs.get("language") or _detect_language(text),
+            "talker_temperature": _DEFAULT_TEMPERATURE,
+            "talker_top_k": _DEFAULT_TOP_K,
+            "talker_top_p": _DEFAULT_TOP_P,
+            "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+            "max_audio_length": kwargs.get("max_audio_length", _DEFAULT_MAX_AUDIO_LENGTH),
+            "stream": True,
+            "stream_only": True,
+            "first_chunk_frames": kwargs.get(
+                "first_chunk_frames",
+                int(os.environ.get("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", "1")),
+            ),
+            "chunk_frames": kwargs.get(
+                "chunk_frames",
+                int(os.environ.get("EDGE_LLM_TTS_CHUNK_FRAMES", "25")),
+            ),
+            "chunk_format": "pcm_s16le",
+            "chunk_transport": "base64",
+        }
+
+        with self._worker_lock:
+            self._ensure_worker()
+            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
+            self._worker.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            self._worker.stdin.flush()
+
+            while True:
+                line = self._worker.stdout.readline()
+                if not line:
+                    stderr = self._worker.stderr.read()[-2000:] if self._worker.stderr else ""
+                    self._worker = None
+                    raise RuntimeError(f"TTS worker exited during stream: {stderr}")
+                event = json.loads(line)
+                if not event.get("ok"):
+                    raise RuntimeError(f"TTS streaming worker failed: {event}")
+                if event.get("event") == "chunk":
+                    if event.get("chunk_transport") == "base64":
+                        yield base64.b64decode(event.get("audio_b64", ""))
+                    elif event.get("chunk_file"):
+                        with open(event["chunk_file"], "rb") as f:
+                            payload = f.read()
+                        try:
+                            os.unlink(event["chunk_file"])
+                        except OSError:
+                            pass
+                        if event.get("chunk_format") == "wav" and len(payload) > 44:
+                            payload = payload[44:]
+                        yield payload
+                elif event.get("event") == "done":
+                    break
 
     def synthesize(
         self,
