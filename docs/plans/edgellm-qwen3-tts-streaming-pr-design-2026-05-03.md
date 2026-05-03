@@ -147,7 +147,15 @@ After adding `stream_only=true` and inline PCM chunks, the final full Code2Wav p
 
 The Python `TRTEdgeLLMTTSBackend.generate_streaming()` integration consumed the same protocol through the resident worker. In a two-request hot test, the second request yielded the first PCM chunk at `0.64 s`.
 
-The remaining RTF cost is mostly from synchronous Code2Wav chunking: the Talker waits while each chunk is vocoded. Moving Code2Wav to a separate CUDA stream/thread is the next major latency/RTF optimization.
+The remaining RTF cost is mostly from Code2Wav itself. A background Code2Wav queue with a separate CUDA stream was tested as an experimental `async_code2wav` path, but it did not materially improve Nano hot metrics:
+
+```json
+{"event":"done","first_chunk_ms":667.2,"audio_s":1.76,"rtf":1.38}
+```
+
+This suggests Talker/CP and Code2Wav do not overlap effectively on the Nano GPU, or Code2Wav dominates scheduling enough that a second stream cannot hide it. The async path should remain opt-in for now.
+
+`Code2WavRunner::generateWaveformChunk()` was also tightened so short streaming windows copy only the newly emitted samples back to host, instead of materializing a complete CPU waveform and slicing it. This keeps the API cleaner and reduces host-copy overhead, but the measured hot RTF remained around `1.38`, confirming that the TensorRT vocoder enqueue is the dominant cost.
 
 TTS correctness requires the special CodePredictor path on the current Nano runtime:
 
@@ -172,9 +180,10 @@ For dual-resident ASR + TTS on the 8GB Nano, the main memory gap is still fixed 
 
 ## Follow-Up Optimizations
 
-1. Move Code2Wav chunking to a separate CUDA stream/thread so Talker generation can continue while the previous chunk is vocoded.
-2. Add binary stdout or socket transport for PCM to avoid base64 expansion in high-throughput services.
-3. Warm common Code2Wav shapes (`1`, `25` frames) when memory allows.
-4. Reuse the special CodePredictor path by default when matching assets are present.
-5. Move chunk assembly into a reusable helper if more examples need it.
-6. Add CP graph cache / KV-zero optimizations from the old native runner after streaming correctness is stable.
+1. Rebuild/tune Code2Wav engine profiles for small streaming windows (`1`, `25`, `50` frames); current per-call cost is about `575 ms`.
+2. Reduce vocoder call count for longer replies by using `first_chunk_frames=1` and larger follow-up chunks when acceptable.
+3. Add binary stdout or socket transport for PCM to avoid base64 expansion in high-throughput services.
+4. Warm common Code2Wav shapes (`1`, `25` frames) when memory allows.
+5. Reuse the special CodePredictor path by default when matching assets are present.
+6. Move chunk assembly into a reusable helper if more examples need it.
+7. Add CP graph cache / KV-zero optimizations from the old native runner after streaming correctness is stable.
