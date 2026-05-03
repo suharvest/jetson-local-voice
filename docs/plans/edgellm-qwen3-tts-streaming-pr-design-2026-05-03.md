@@ -191,6 +191,32 @@ The existing `audio_build` tool already supports Code2Wav profile knobs:
 
 On the 8GB Nano this build was interrupted after about 35 minutes because TensorRT was still tactic-searching and repeatedly skipping tactics that requested `4.5GB` to `13.5GB` of device memory while only about `3.6GB` was available. The next Code2Wav profile rebuild should run on Orin NX or another device with more available memory, or use stricter builder memory/tactic limits if we add those to `audio_build`.
 
+An Orin NX rebuild with `EDGE_LLM_TRT_WORKSPACE_MB=2048` succeeded for the tighter streaming profile:
+
+```bash
+./examples/multimodal/audio_build \
+  --onnxDir=/home/harvest/qwen3-tts-trt-edge-llm-export/tokenizer_decoder \
+  --engineDir=/home/harvest/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav_stream100_nx_ws2048 \
+  --minCodeLen=1 \
+  --optCodeLen=50 \
+  --maxCodeLen=100
+```
+
+Build time was about `64.6 min`. TensorRT reported peak builder allocator usage of about `9.0GB` GPU and `2.9GB` CPU. The produced engine was copied back to the Nano at:
+
+```text
+/home/harvest/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav_stream100_nx_ws2048/code2wav
+```
+
+However, this tighter profile should not become the default yet. On the same Nano prompt, the old `min=1,opt=300,max=1000` engine was faster:
+
+```json
+{"engine":"old_opt300_max1000","first_chunk_ms":636.0,"audio_s":6.96,"code2wav_ms":2309.7,"rtf":1.045}
+{"engine":"new_opt50_max100","first_chunk_ms":642.4,"audio_s":6.96,"code2wav_ms":2900.6,"rtf":1.132}
+```
+
+The regression came from larger streaming chunks: the new profile ran the 75-frame chunk at about `1158 ms`, while the old engine handled the same shape at about `578 ms`. Keep the old Code2Wav engine for the runtime path until profile/tactic selection is understood.
+
 TTS correctness requires the special CodePredictor path on the current Nano runtime:
 
 ```bash
@@ -214,9 +240,9 @@ For dual-resident ASR + TTS on the 8GB Nano, the main memory gap is still fixed 
 
 ## Follow-Up Optimizations
 
-1. Rebuild/tune Code2Wav engine profiles for small streaming windows (`1`, `25`, `50` frames) on NX or a less memory-constrained builder; current per-call cost is about `575 ms`.
-2. Add builder memory/tactic-limit options to `audio_build` so Nano can build streaming Code2Wav profiles without spending tens of minutes on impossible tactics.
-3. Keep adaptive chunks enabled by default for the service path: `1 -> 25 -> 50 -> 75 -> 100`.
+1. Investigate Code2Wav tactic selection for small profiles; the `opt=50,max=100` engine builds successfully but is slower than the old `opt=300,max=1000` engine on 75-frame chunks.
+2. Keep adaptive chunks enabled by default for the service path while using the old Code2Wav engine: `1 -> 25 -> 50 -> 75 -> 100`.
+3. Add more builder controls to `audio_build` if needed, beyond `EDGE_LLM_TRT_WORKSPACE_MB`, so Nano/NX can avoid pathological tactics deterministically.
 4. Add binary stdout or socket transport for PCM to avoid base64 expansion in high-throughput services.
 5. Warm common Code2Wav shapes (`1`, `25` frames) when memory allows.
 6. Reuse the special CodePredictor path by default when matching assets are present.
