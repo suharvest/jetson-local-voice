@@ -179,6 +179,16 @@ A follow-up sweep on the old `min=1,opt=300,max=1000` Code2Wav engine showed tha
 
 Keeping `first_chunk_frames=1` preserved the `~0.64s` TTFT. Changing only the first chunk size from `1` to `5/10/15/25` did not materially change total RTF, but delayed TTFT to `0.86s/1.15s/1.44s/2.00s`. The service default should therefore keep `first_chunk_frames=1` and use `chunk_growth_frames=50,max_chunk_frames=150` with the old Code2Wav engine.
 
+There is a separate playback-continuity tradeoff. `first_chunk_frames=1` gives the lowest TTFT, but the first chunk contains only `80 ms` of audio, so a naive player will underrun before the next chunk arrives. A smoother mode can use a larger first chunk:
+
+```json
+{"mode":"first10_growth15","first_chunk_ms":1147.6,"audio_s":6.96,"rtf":1.129}
+{"mode":"first15_growth20","first_chunk_ms":1433.1,"audio_s":6.96,"rtf":1.045}
+{"mode":"first20_growth30","first_chunk_ms":1714.8,"audio_s":6.96,"rtf":0.962}
+```
+
+For V2V latency reporting, keep two metrics: first emitted audio (`~0.64s` in low-TTFT mode) and first self-sustaining playback buffer (`~1.7s` with `first_chunk_frames=20`). The former is useful for immediate feedback; the latter better predicts whether playback will sound continuous without client-side buffering.
+
 The remaining RTF cost is mostly from Code2Wav itself. A background Code2Wav queue with a separate CUDA stream was tested as an experimental `async_code2wav` path, but it did not materially improve Nano hot metrics:
 
 ```json
@@ -188,6 +198,8 @@ The remaining RTF cost is mostly from Code2Wav itself. A background Code2Wav que
 This suggests Talker/CP and Code2Wav do not overlap effectively on the Nano GPU, or Code2Wav dominates scheduling enough that a second stream cannot hide it. The async path should remain opt-in for now.
 
 `Code2WavRunner::generateWaveformChunk()` was also tightened so short streaming windows copy only the newly emitted samples back to host, instead of materializing a complete CPU waveform and slicing it. This keeps the API cleaner and reduces host-copy overhead, but the measured hot RTF remained around `1.38`, confirming that the TensorRT vocoder enqueue is the dominant cost.
+
+An attempted Code2Wav CUDA Graph cache for fixed `seqLen` shapes did not improve Nano performance. On the same hot prompt, graph disabled measured `first_chunk_ms=636.3, rtf=0.962`, while graph enabled measured `first_chunk_ms=637.5, rtf=0.964`. Keep this out of the default path unless a future TensorRT/JetPack build shows a measurable benefit.
 
 The existing `audio_build` tool already supports Code2Wav profile knobs:
 
@@ -256,6 +268,7 @@ For dual-resident ASR + TTS on the 8GB Nano, the main memory gap is still fixed 
 3. Add more builder controls to `audio_build` if needed, beyond `EDGE_LLM_TRT_WORKSPACE_MB`, so Nano/NX can avoid pathological tactics deterministically.
 4. Add binary stdout or socket transport for PCM to avoid base64 expansion in high-throughput services.
 5. Warm common Code2Wav shapes (`1`, `25` frames) when memory allows.
-6. Reuse the special CodePredictor path by default when matching assets are present.
-7. Move chunk assembly into a reusable helper if more examples need it.
-8. Add CP graph cache / KV-zero optimizations from the old native runner after streaming correctness is stable.
+6. Add a playback-aware mode that sets `first_chunk_frames=20` for smoother local playback when TTFT below one second is less important than avoiding underrun.
+7. Reuse the special CodePredictor path by default when matching assets are present.
+8. Move chunk assembly into a reusable helper if more examples need it.
+9. Add CP graph cache / KV-zero optimizations from the old native runner after streaming correctness is stable.
