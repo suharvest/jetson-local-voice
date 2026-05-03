@@ -287,11 +287,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             ),
             "max_chunk_frames": kwargs.get(
                 "max_chunk_frames",
-                int(os.environ.get("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", "100")),
+                int(os.environ.get("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", "150")),
             ),
             "chunk_growth_frames": kwargs.get(
                 "chunk_growth_frames",
-                int(os.environ.get("EDGE_LLM_TTS_CHUNK_GROWTH_FRAMES", "25")),
+                int(os.environ.get("EDGE_LLM_TTS_CHUNK_GROWTH_FRAMES", "50")),
             ),
             "chunk_format": "pcm_s16le",
             "chunk_transport": "base64",

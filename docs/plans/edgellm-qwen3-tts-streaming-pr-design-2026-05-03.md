@@ -168,6 +168,17 @@ On a longer Chinese test sentence, hot resident metrics improved:
 
 This is the current best default for conversational streaming: one tiny first chunk for TTFT, then larger chunks to amortize the roughly fixed Code2Wav invocation cost.
 
+A follow-up sweep on the old `min=1,opt=300,max=1000` Code2Wav engine showed that faster chunk growth is better for the Nano runtime:
+
+```json
+{"mode":"fixed_25","first_chunk_ms":636.7,"audio_s":6.96,"code2wav_ms":2877.3,"rtf":1.128}
+{"mode":"adaptive_25_50_100","first_chunk_ms":638.7,"audio_s":6.96,"code2wav_ms":2306.3,"rtf":1.047}
+{"mode":"adaptive_25_75_150","first_chunk_ms":636.1,"audio_s":6.96,"code2wav_ms":1726.2,"rtf":0.962}
+{"mode":"adaptive_50_100_200","first_chunk_ms":635.9,"audio_s":6.96,"code2wav_ms":1729.6,"rtf":0.963}
+```
+
+Keeping `first_chunk_frames=1` preserved the `~0.64s` TTFT. Changing only the first chunk size from `1` to `5/10/15/25` did not materially change total RTF, but delayed TTFT to `0.86s/1.15s/1.44s/2.00s`. The service default should therefore keep `first_chunk_frames=1` and use `chunk_growth_frames=50,max_chunk_frames=150` with the old Code2Wav engine.
+
 The remaining RTF cost is mostly from Code2Wav itself. A background Code2Wav queue with a separate CUDA stream was tested as an experimental `async_code2wav` path, but it did not materially improve Nano hot metrics:
 
 ```json
@@ -241,7 +252,7 @@ For dual-resident ASR + TTS on the 8GB Nano, the main memory gap is still fixed 
 ## Follow-Up Optimizations
 
 1. Investigate Code2Wav tactic selection for small profiles; the `opt=50,max=100` engine builds successfully but is slower than the old `opt=300,max=1000` engine on 75-frame chunks.
-2. Keep adaptive chunks enabled by default for the service path while using the old Code2Wav engine: `1 -> 25 -> 50 -> 75 -> 100`.
+2. Keep adaptive chunks enabled by default for the service path while using the old Code2Wav engine: `1 -> 25 -> 75 -> 150`.
 3. Add more builder controls to `audio_build` if needed, beyond `EDGE_LLM_TRT_WORKSPACE_MB`, so Nano/NX can avoid pathological tactics deterministically.
 4. Add binary stdout or socket transport for PCM to avoid base64 expansion in high-throughput services.
 5. Warm common Code2Wav shapes (`1`, `25` frames) when memory allows.
