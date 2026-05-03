@@ -261,18 +261,26 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
         req_id = uuid.uuid4().hex
         streaming_profile = str(
-            kwargs.get("streaming_profile", os.environ.get("EDGE_LLM_TTS_STREAMING_PROFILE", "low_latency"))
+            kwargs.get("streaming_profile", os.environ.get("EDGE_LLM_TTS_STREAMING_PROFILE", "continuous_playback"))
         ).lower()
-        if streaming_profile in ("playback", "smooth"):
-            default_first_chunk_frames = 20
-            default_chunk_frames = 20
-            default_chunk_growth_frames = 30
-            default_max_chunk_frames = 120
-        else:
+        if streaming_profile in ("instant_feedback", "low_latency"):
             default_first_chunk_frames = 1
             default_chunk_frames = 25
             default_chunk_growth_frames = 50
             default_max_chunk_frames = 150
+            default_adaptive_chunks = True
+        elif streaming_profile in ("playback", "smooth", "buffered"):
+            default_first_chunk_frames = 20
+            default_chunk_frames = 20
+            default_chunk_growth_frames = 30
+            default_max_chunk_frames = 120
+            default_adaptive_chunks = True
+        else:
+            default_first_chunk_frames = 25
+            default_chunk_frames = 25
+            default_chunk_growth_frames = 0
+            default_max_chunk_frames = 25
+            default_adaptive_chunks = False
         request = {
             "id": req_id,
             "text": text,
@@ -295,7 +303,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             ),
             "adaptive_chunks": kwargs.get(
                 "adaptive_chunks",
-                os.environ.get("EDGE_LLM_TTS_ADAPTIVE_CHUNKS", "1").lower()
+                os.environ.get("EDGE_LLM_TTS_ADAPTIVE_CHUNKS", "1" if default_adaptive_chunks else "0").lower()
                 not in ("0", "false", "no"),
             ),
             "max_chunk_frames": kwargs.get(

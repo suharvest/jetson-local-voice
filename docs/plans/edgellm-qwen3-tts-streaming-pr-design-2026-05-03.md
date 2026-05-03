@@ -177,7 +177,7 @@ A follow-up sweep on the old `min=1,opt=300,max=1000` Code2Wav engine showed tha
 {"mode":"adaptive_50_100_200","first_chunk_ms":635.9,"audio_s":6.96,"code2wav_ms":1729.6,"rtf":0.963}
 ```
 
-Keeping `first_chunk_frames=1` preserved the `~0.64s` TTFT. Changing only the first chunk size from `1` to `5/10/15/25` did not materially change total RTF, but delayed TTFT to `0.86s/1.15s/1.44s/2.00s`. The service default should therefore keep `first_chunk_frames=1` and use `chunk_growth_frames=50,max_chunk_frames=150` with the old Code2Wav engine.
+Keeping `first_chunk_frames=1` preserved the `~0.64s` TTFT. Changing only the first chunk size from `1` to `5/10/15/25` did not materially change total RTF, but delayed TTFT to `0.86s/1.15s/1.44s/2.00s`. This is useful for an "instant feedback" profile, but it is not the right default for conversational playback because the first chunk contains too little audio to bridge to the next chunk.
 
 There is a separate playback-continuity tradeoff. `first_chunk_frames=1` gives the lowest TTFT, but the first chunk contains only `80 ms` of audio, so a naive player will underrun before the next chunk arrives. A smoother mode can use a larger first chunk:
 
@@ -187,14 +187,17 @@ There is a separate playback-continuity tradeoff. `first_chunk_frames=1` gives t
 {"mode":"first20_growth30","first_chunk_ms":1714.8,"audio_s":6.96,"rtf":0.962}
 ```
 
-For V2V latency reporting, keep two metrics: first emitted audio (`~0.64s` in low-TTFT mode) and first self-sustaining playback buffer (`~1.7s` with `first_chunk_frames=20`). The former is useful for immediate feedback; the latter better predicts whether playback will sound continuous without client-side buffering.
+For V2V latency reporting, keep two metrics: first emitted audio and playable start time. Playable start time is the first chunk arrival time from which a client can begin playback without underrunning before the next chunk arrives. On the current Nano worker, `first=1,chunk=25,growth=50,max=150` emits audio early but does not become self-sustaining until about `4.1s`. The best measured continuous-playback policy was `first=25,chunk=25,adaptive=false`, with first usable playback at about `2.34s`.
 
 The Python backend exposes this as `EDGE_LLM_TTS_STREAMING_PROFILE`:
 
 ```text
-low_latency: first=1, chunk=25, growth=50, max=150
-playback:    first=20, chunk=20, growth=30, max=120
+continuous_playback: first=25, chunk=25, adaptive=false
+instant_feedback:    first=1,  chunk=25, growth=50, max=150
+playback/smooth:     first=20, chunk=20, growth=30, max=120
 ```
+
+`continuous_playback` is now the default for the service path. `instant_feedback` remains available when a caller wants the lowest first-byte/first-audio time and will buffer client-side before real playback.
 
 The remaining RTF cost is mostly from Code2Wav itself. A background Code2Wav queue with a separate CUDA stream was tested as an experimental `async_code2wav` path, but it did not materially improve Nano hot metrics:
 
@@ -274,6 +277,33 @@ docker run --rm --runtime nvidia --network host \
 ```
 
 Steady-state CUDA EP timing with zero RVQ codes was about `548 ms` per invocation for `1/5/10/20/25/50/75/100/150` input frames, and the ONNX output tensor stayed at `8.0 s` of audio. This means the old ORT path is effectively a fixed-cost full decoder call for this exported model. It can match the rough `~0.55 s` Code2Wav floor, but it does not directly provide a `100 ms` first-vocoder path.
+
+The old native streaming parameters were also replayed on EdgeLLM. The old runtime used `left_context=25`, `first_chunk_frames=10` originally, a planned `first_chunk_frames=5`, and `chunk_frames=25`; its TRT wrapper used `max_frames=100` for `vocoder_fp16.engine`. On the current EdgeLLM worker, switching only to those old chunk parameters did not improve latency:
+
+```json
+{"mode":"oldlike_first5_fixed25_oldeng","first_chunk_ms":1143.0,"audio_s":5.92,"code2wav_ms":2452.3,"rtf":1.157}
+{"mode":"oldlike_first10_fixed25_oldeng","first_chunk_ms":1463.7,"audio_s":5.92,"code2wav_ms":2398.1,"rtf":1.164}
+{"mode":"current_first1_adapt25_50_150_oldeng","first_chunk_ms":876.2,"audio_s":5.92,"code2wav_ms":1932.0,"rtf":1.050}
+```
+
+The already-built `min=1,opt=50,max=100` Code2Wav engine also did not reproduce the old `~100 ms` vocoder behavior:
+
+```json
+{"mode":"oldlike_first5_fixed25_max100eng","first_chunk_ms":1155.3,"audio_s":5.92,"code2wav_ms":2452.2,"rtf":1.161}
+{"mode":"current_first1_adapt25_50_150_max100eng","first_chunk_ms":888.8,"audio_s":5.92,"code2wav_ms":2549.0,"rtf":1.159}
+```
+
+For playable start time rather than first emitted audio, the measured policy comparison was:
+
+```json
+{"mode":"oldlike_first5_fixed25_oldeng","first_chunk_ms":1102.0,"playable_start_ms":5122.0}
+{"mode":"oldlike_first10_fixed25_oldeng","first_chunk_ms":1478.7,"playable_start_ms":5506.3}
+{"mode":"current_first1_adapt25_50_150_oldeng","first_chunk_ms":845.4,"playable_start_ms":6202.7}
+{"mode":"playback_first20_adapt20_30_120_oldeng","first_chunk_ms":2025.0,"playable_start_ms":6299.4}
+{"mode":"fixed_first25_chunk25_oldeng","first_chunk_ms":2324.9,"playable_start_ms":4340.4}
+```
+
+Because `fixed_first25_chunk25` has a 2s first buffer, the next chunk arrives only about `15.6 ms` after that buffer would end. With a small client-side safety buffer, it can be treated as playable from roughly `2.34s`. Conclusion: do not switch EdgeLLM defaults back to the old `first=5/10,fixed25` policy. Use `first=25,fixed25` for conversational playback and keep `first=1,adaptive` only for instant feedback. The missing deeper piece is still the old native `vocoder_fp16.engine`/wrapper behavior, or a different export/profile that actually specializes the short streaming shapes.
 
 Current conclusion: keep EdgeLLM TRT Code2Wav as the default PR path, keep `async_code2wav` opt-in, and treat sub-500ms V2V as a pipeline problem rather than a simple vocoder backend swap. The useful next optimizations are:
 

@@ -38,6 +38,7 @@ class CloneStreamRequest(BaseModel):
     text: str
     speaker_embedding_b64: str  # base64-encoded speaker embedding
     language: str | None = None
+    streaming_profile: str | None = None
     first_chunk_frames: int | None = None
     chunk_frames: int | None = None
 
@@ -412,16 +413,20 @@ async def tts_clone_stream(req: CloneStreamRequest):
         yield struct.pack("<I", sr)
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        stream_kwargs = {
+            "speaker_embedding": speaker_embedding,
+            "language": req.language,
+        }
+        if req.first_chunk_frames is not None:
+            stream_kwargs["first_chunk_frames"] = req.first_chunk_frames
+        if req.chunk_frames is not None:
+            stream_kwargs["chunk_frames"] = req.chunk_frames
+        if req.streaming_profile is not None:
+            stream_kwargs["streaming_profile"] = req.streaming_profile
 
         def _run():
             try:
-                for chunk in backend.generate_streaming(
-                    req.text,
-                    speaker_embedding=speaker_embedding,
-                    language=req.language,
-                    first_chunk_frames=req.first_chunk_frames or 10,
-                    chunk_frames=req.chunk_frames or 25,
-                ):
+                for chunk in backend.generate_streaming(req.text, **stream_kwargs):
                     loop.call_soon_threadsafe(queue.put_nowait, chunk)
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -599,5 +604,3 @@ async def _asr_stream_backend(
             await ws.close()
         except Exception:
             pass
-
-
