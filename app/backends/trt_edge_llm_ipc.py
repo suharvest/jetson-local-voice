@@ -42,9 +42,17 @@ TTS_BINARY = os.environ.get(
     "EDGE_LLM_TTS_BIN",
     os.path.join(_EDGE_LLM_BUILD, "examples/omni/qwen3_tts_inference"),
 )
+TTS_WORKER_BINARY = os.environ.get(
+    "EDGE_LLM_TTS_WORKER_BIN",
+    os.path.join(_EDGE_LLM_BUILD, "examples/omni/qwen3_tts_worker"),
+)
 ASR_BINARY = os.environ.get(
     "EDGE_LLM_ASR_BIN",
     os.path.join(_EDGE_LLM_BUILD, "examples/llm/llm_inference"),
+)
+ASR_WORKER_BINARY = os.environ.get(
+    "EDGE_LLM_ASR_WORKER_BIN",
+    os.path.join(_EDGE_LLM_BUILD, "examples/llm/qwen3_asr_worker"),
 )
 PLUGIN_PATH = os.environ.get(
     "EDGELLM_PLUGIN_PATH",
@@ -52,25 +60,51 @@ PLUGIN_PATH = os.environ.get(
 )
 
 # TTS engine directories
+_TTS_FIXED_RUNTIME = os.path.expanduser("~/qwen3-tts-edgellm-runtime")
+_TTS_DEFAULT_ROOT = (
+    _TTS_FIXED_RUNTIME
+    if os.path.exists(os.path.join(_TTS_FIXED_RUNTIME, "engines", "talker", "llm.engine"))
+    else os.path.expanduser("~/qwen3-tts-trt-edge-llm-export")
+)
 TTS_TALKER_DIR = os.environ.get(
     "EDGE_LLM_TTS_TALKER_DIR",
-    os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/talker"),
+    os.path.join(_TTS_DEFAULT_ROOT, "engines", "talker"),
 )
 TTS_CODE2WAV_DIR = os.environ.get(
     "EDGE_LLM_TTS_CODE2WAV_DIR",
-    os.path.expanduser(
-        "~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav"
-    ),
+    os.path.join(_TTS_DEFAULT_ROOT, "engines", "code2wav")
+    if os.path.exists(os.path.join(_TTS_DEFAULT_ROOT, "engines", "code2wav"))
+    else os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav"),
 )
 TTS_TOKENIZER_DIR = os.environ.get(
     "EDGE_LLM_TTS_TOKENIZER_DIR",
-    os.path.expanduser("~/qwen3-tts-trt-edge-llm-export"),
+    _TTS_DEFAULT_ROOT
+    if os.path.exists(os.path.join(_TTS_DEFAULT_ROOT, "processed_chat_template.json"))
+    else os.path.expanduser("~/qwen3-tts-trt-edge-llm-export"),
+)
+TTS_SPECIAL_CP_ENGINE = os.environ.get(
+    "QWEN3_TTS_CP_ENGINE",
+    os.path.expanduser("~/voice_test/models/qwen3-tts/engines/cp_bf16.engine"),
+)
+TTS_SPECIAL_CP_EMBED_FP32 = os.environ.get(
+    "QWEN3_TTS_CP_EMBED_FP32",
+    os.path.expanduser("~/voice_test/models/qwen3-tts/onnx/cp_embed_fp32.bin"),
 )
 
 # ASR engine directories
+_ASR_PRUNED_ENGINE_DIR = os.path.expanduser(
+    "~/qwen3-asr-edgellm-runtime/engines/thinker_pruned35k_kv512"
+)
+_ASR_DIALOG_ENGINE_DIR = os.path.expanduser(
+    "~/qwen3-asr-edgellm-runtime/engines/thinker_kv512"
+)
 ASR_ENGINE_DIR = os.environ.get(
     "EDGE_LLM_ASR_ENGINE_DIR",
-    os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker"),
+    _ASR_PRUNED_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_PRUNED_ENGINE_DIR, "llm.engine"))
+    else _ASR_DIALOG_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_DIALOG_ENGINE_DIR, "llm.engine"))
+    else os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker"),
 )
 ASR_AUDIO_ENC_DIR = os.environ.get(
     "EDGE_LLM_ASR_AUDIO_ENC_DIR",
@@ -89,6 +123,9 @@ def _build_env() -> dict:
     """Return a copy of os.environ with EDGELLM_PLUGIN_PATH set."""
     env = os.environ.copy()
     env["EDGELLM_PLUGIN_PATH"] = PLUGIN_PATH
+    if os.path.exists(TTS_SPECIAL_CP_ENGINE) and os.path.exists(TTS_SPECIAL_CP_EMBED_FP32):
+        env.setdefault("QWEN3_TTS_CP_ENGINE", TTS_SPECIAL_CP_ENGINE)
+        env.setdefault("QWEN3_TTS_CP_EMBED_FP32", TTS_SPECIAL_CP_EMBED_FP32)
     return env
 
 
@@ -123,10 +160,6 @@ def run_binary(
             raise RuntimeError(
                 f"{os.path.basename(binary_path)} timed out after {timeout}s"
             ) from e
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"{os.path.basename(binary_path)} timed out after {timeout}s"
-        )
 
     if check and result.returncode != 0:
         stderr_snip = result.stderr[:1000] if result.stderr else "(empty)"
@@ -189,6 +222,7 @@ N_MELS = 128
 FMIN = 0.0
 FMAX = 8000.0
 MEL_FLOOR = 1e-10
+MIN_AUDIO_FRAMES = int(os.environ.get("EDGE_LLM_ASR_MIN_AUDIO_FRAMES", "100"))
 
 
 def _hz_to_mel(freq: np.ndarray) -> np.ndarray:
@@ -239,10 +273,13 @@ def audio_bytes_to_mel(
     """Convert WAV bytes to log-mel spectrogram.
 
     Returns float32 array of shape ``[1, 128, T]`` (batch, mel, time),
-    using Whisper-compatible parameters (n_fft=400, hop=160, 128 mel bins).
+    using librosa STFT + Slaney mel filterbank matching the old working
+    compute_whisper_log_mel() in voice_test/app_overlay/backends/whisper_mel.py.
 
-    Uses only scipy + numpy (no librosa or soundfile dependency).
+    Dynamic range clamp uses max-8dB (old working behavior) instead of the
+    fixed -4dB Whisper clamp (which was producing wrong mel for Qwen3 ASR).
     """
+    import librosa
     from scipy.io import wavfile
     from scipy import signal as scipy_signal
 
@@ -268,38 +305,45 @@ def audio_bytes_to_mel(
         new_len = int(round(len(audio) * target_sr / sr))
         audio = scipy_signal.resample(audio, new_len).astype(np.float32)
 
-    # -- STFT (Whisper-compatible: periodic Hann, centered, drop last frame) --
-    window = np.hanning(N_FFT + 1)[:-1].astype(np.float32)  # periodic
-    pad_len = N_FFT // 2
-    audio_padded = np.pad(audio, (pad_len, pad_len), mode="reflect")
-
-    _, _, stft = scipy_signal.stft(
-        audio_padded,
-        fs=target_sr,
-        window=window,
-        nperseg=N_FFT,
-        noverlap=N_FFT - HOP_LENGTH,
-        boundary=None,
-        padded=False,
+    # -- STFT via librosa (matches old working whisper_mel.py) --
+    stft = librosa.stft(
+        y=audio,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        win_length=N_FFT,
+        window="hann",
+        center=True,
+        dtype=np.complex64,
+        pad_mode="reflect",
     )
-    stft = stft[:, :-1]  # drop last frame (Whisper convention)
 
-    # -- Power spectrum --
-    power = np.abs(stft) ** 2  # [n_freq, T]
+    # Drop final frame (Whisper convention)
+    magnitudes = np.abs(stft[:, :-1]).astype(np.float32) ** 2.0
 
-    # -- Mel filterbank --
-    with np.errstate(all='ignore'):
-        mel_spec = _MEL_FILTERBANK @ power  # [128, T]
+    # -- Mel filterbank (librosa Slaney, matches old working behavior) --
+    mel_basis = librosa.filters.mel(
+        sr=target_sr,
+        n_fft=N_FFT,
+        n_mels=N_MELS,
+        fmin=FMIN,
+        fmax=FMAX,
+        htk=False,
+        norm="slaney",
+        dtype=np.float32,
+    )
 
-    # -- Log compression (Whisper-style) --
-    mel_spec = np.nan_to_num(mel_spec, nan=0.0)
-    mel_spec = np.maximum(mel_spec, MEL_FLOOR)
-    log_mel = np.log10(mel_spec)
-    log_mel = np.clip(log_mel, -4.0, None)
-    log_mel = (log_mel + 4.0) / 4.0
+    mel_spec = mel_basis @ magnitudes
 
-    # Add batch dimension
-    return np.expand_dims(log_mel, 0).astype(np.float32)  # [1, 128, T]
+    # -- Log compression (old working: max-8dB dynamic range) --
+    log_spec = np.log10(np.maximum(mel_spec, MEL_FLOOR))
+    log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+
+    if log_spec.shape[1] < MIN_AUDIO_FRAMES:
+        pad_width = MIN_AUDIO_FRAMES - log_spec.shape[1]
+        log_spec = np.pad(log_spec, ((0, 0), (0, pad_width)), mode="constant")
+
+    return log_spec[np.newaxis, :, :].astype(np.float32)  # [1, 128, T]
 
 
 # ---------------------------------------------------------------------------
