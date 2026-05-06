@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 import base64
+import io
+import wave
 from typing import Optional
 import importlib.util
 import uuid
@@ -26,11 +28,10 @@ from backends.trt_edge_llm_ipc import (
     TTS_BINARY,
     TTS_WORKER_BINARY,
     TTS_TALKER_DIR,
+    TTS_CODE_PREDICTOR_DIR,
     TTS_CODE2WAV_DIR,
     TTS_TOKENIZER_DIR,
     PLUGIN_PATH,
-    TTS_SPECIAL_CP_ENGINE,
-    TTS_SPECIAL_CP_EMBED_FP32,
     run_binary,
 )
 
@@ -50,12 +51,161 @@ def _detect_language(text: str) -> str:
     return "english"
 
 
+def _contains_cjk(text: str) -> bool:
+    for ch in text:
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF or 0xAC00 <= cp <= 0xD7AF:
+            return True
+    return False
+
+
+def _split_tts_text(text: str, max_chars: Optional[int] = None) -> list[str]:
+    """Split long TTS text into independently stable synthesis requests."""
+    normalized = " ".join(text.split()) if not _contains_cjk(text) else text.strip()
+    if not normalized:
+        return []
+
+    if max_chars is None:
+        env_name = "EDGE_LLM_TTS_CJK_SEGMENT_MAX_CHARS" if _contains_cjk(normalized) else "EDGE_LLM_TTS_SEGMENT_MAX_CHARS"
+        default_chars = "16" if _contains_cjk(normalized) else "120"
+        max_chars = int(os.environ.get(env_name, default_chars))
+    max_chars = max(8, max_chars)
+
+    hard_breaks = set("。！？!?；;\n")
+    soft_breaks = set("，,、：:")
+    segments: list[str] = []
+    current: list[str] = []
+    is_cjk = _contains_cjk(normalized)
+    max_overrun = max(2, min(8, max_chars // 2))
+    abbreviations = {
+        "mr.",
+        "mrs.",
+        "ms.",
+        "dr.",
+        "prof.",
+        "sr.",
+        "jr.",
+        "st.",
+        "vs.",
+        "etc.",
+        "e.g.",
+        "i.e.",
+    }
+
+    def is_nonterminal_period(buffer: str, next_ch: str) -> bool:
+        stripped = buffer.strip().lower()
+        if next_ch.isdigit() and len(stripped) >= 2 and stripped[-2].isdigit():
+            return True
+        return any(stripped.endswith(abbrev) for abbrev in abbreviations)
+
+    def flush() -> None:
+        part = "".join(current).strip()
+        current.clear()
+        if part:
+            segments.append(part)
+
+    for idx, ch in enumerate(normalized):
+        next_ch = normalized[idx + 1] if idx + 1 < len(normalized) else ""
+        current.append(ch)
+        if ch in hard_breaks:
+            if not is_cjk and ch == "." and is_nonterminal_period("".join(current), next_ch):
+                continue
+            flush()
+            continue
+        current_text = "".join(current).strip()
+        if len(current_text) >= max_chars:
+            text_so_far = "".join(current)
+            cut = max(text_so_far.rfind(p) for p in soft_breaks)
+            if cut >= max_chars // 3:
+                head = text_so_far[: cut + 1].strip()
+                tail = text_so_far[cut + 1 :].lstrip()
+                current.clear()
+                if head:
+                    segments.append(head)
+                if tail:
+                    current.extend(tail)
+            else:
+                if is_cjk and len(current_text) < max_chars + max_overrun:
+                    continue
+                flush()
+    flush()
+
+    if not is_cjk:
+        packed: list[str] = []
+        for part in segments:
+            if len(part) <= max_chars:
+                packed.append(part)
+                continue
+            words = part.split(" ")
+            buf: list[str] = []
+            for word in words:
+                candidate = " ".join(buf + [word]).strip()
+                if buf and len(candidate) > max_chars:
+                    packed.append(" ".join(buf))
+                    buf = [word]
+                else:
+                    buf.append(word)
+            if buf:
+                packed.append(" ".join(buf))
+        segments = packed
+
+    merged: list[str] = []
+    min_chars = max(4, min(12, max_chars // 3))
+    for part in segments:
+        if merged and all(ch in hard_breaks or ch in soft_breaks for ch in part):
+            merged[-1] = f"{merged[-1]}{part}"
+            continue
+        if merged and len(part) < min_chars and len(merged[-1]) + 1 + len(part) <= max_chars:
+            sep = "" if _contains_cjk(part + merged[-1]) else " "
+            merged[-1] = f"{merged[-1]}{sep}{part}"
+        else:
+            merged.append(part)
+    return merged
+
+
+def _concat_wav_bytes(parts: list[bytes]) -> bytes:
+    non_empty = [part for part in parts if part]
+    if not non_empty:
+        return b""
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    params = None
+    frames: list[bytes] = []
+    for part in non_empty:
+        with wave.open(io.BytesIO(part), "rb") as reader:
+            current = reader.getparams()
+            comparable = (current.nchannels, current.sampwidth, current.framerate, current.comptype, current.compname)
+            if params is None:
+                params = comparable
+            elif comparable != params:
+                raise RuntimeError(f"Cannot concatenate WAV segments with different formats: {comparable} != {params}")
+            frames.append(reader.readframes(reader.getnframes()))
+
+    nchannels, sampwidth, framerate, comptype, compname = params
+    out = io.BytesIO()
+    with wave.open(out, "wb") as writer:
+        writer.setnchannels(nchannels)
+        writer.setsampwidth(sampwidth)
+        writer.setframerate(framerate)
+        writer.setcomptype(comptype, compname)
+        for frame_bytes in frames:
+            writer.writeframes(frame_bytes)
+    return out.getvalue()
+
+
 # Default sampling parameters
 _DEFAULT_TEMPERATURE = float(os.environ.get("TTS_TALKER_TEMPERATURE", "0.9"))
 _DEFAULT_TOP_K = int(os.environ.get("TTS_TALKER_TOP_K", "50"))
 _DEFAULT_TOP_P = float(os.environ.get("TTS_TOP_P", "1.0"))
+_DEFAULT_PREDICTOR_TEMPERATURE = float(os.environ.get("TTS_PREDICTOR_TEMPERATURE", "0.9"))
+_DEFAULT_PREDICTOR_TOP_K = int(os.environ.get("TTS_PREDICTOR_TOP_K", "50"))
+_DEFAULT_PREDICTOR_TOP_P = float(os.environ.get("TTS_PREDICTOR_TOP_P", "1.0"))
 _DEFAULT_MAX_AUDIO_LENGTH = int(os.environ.get("TTS_MAX_AUDIO_LENGTH", "1024"))
+_DEFAULT_MIN_AUDIO_LENGTH = int(os.environ.get("TTS_MIN_AUDIO_LENGTH", "30"))
 _DEFAULT_REPETITION_PENALTY = float(os.environ.get("TTS_REPETITION_PENALTY", "1.05"))
+_DEFAULT_CODEC_EOS_LOGIT_OFFSET = float(os.environ.get("TTS_CODEC_EOS_LOGIT_OFFSET", "0"))
+_DEFAULT_SEGMENT_TEXT = os.environ.get("EDGE_LLM_TTS_SEGMENT_TEXT", "1").lower() not in ("0", "false", "no")
 
 
 class TRTEdgeLLMTTSBackend(TTSBackend):
@@ -172,9 +322,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         env["EDGELLM_PLUGIN_PATH"] = PLUGIN_PATH
         env.setdefault("EDGE_LLM_TTS_CUDA_GRAPH", "1")
         env.setdefault("EDGE_LLM_TTS_LAZY_CODE2WAV", "0")
-        if os.path.exists(TTS_SPECIAL_CP_ENGINE) and os.path.exists(TTS_SPECIAL_CP_EMBED_FP32):
-            env.setdefault("QWEN3_TTS_CP_ENGINE", TTS_SPECIAL_CP_ENGINE)
-            env.setdefault("QWEN3_TTS_CP_EMBED_FP32", TTS_SPECIAL_CP_EMBED_FP32)
         return env
 
     def _ensure_worker(self) -> None:
@@ -184,6 +331,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             TTS_WORKER_BINARY,
             "--talkerEngineDir",
             TTS_TALKER_DIR,
+            "--codePredictorEngineDir",
+            TTS_CODE_PREDICTOR_DIR,
             "--tokenizerDir",
             TTS_TOKENIZER_DIR,
             "--code2wavEngineDir",
@@ -221,7 +370,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "talker_top_k": _DEFAULT_TOP_K,
             "talker_top_p": _DEFAULT_TOP_P,
             "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+            "codec_eos_logit_offset": _DEFAULT_CODEC_EOS_LOGIT_OFFSET,
+            "predictor_temperature": _DEFAULT_PREDICTOR_TEMPERATURE,
+            "predictor_top_k": _DEFAULT_PREDICTOR_TOP_K,
+            "predictor_top_p": _DEFAULT_PREDICTOR_TOP_P,
             "max_audio_length": kwargs.get("max_audio_length", _DEFAULT_MAX_AUDIO_LENGTH),
+            "min_audio_length": kwargs.get("min_audio_length", _DEFAULT_MIN_AUDIO_LENGTH),
         }
         with self._worker_lock:
             self._ensure_worker()
@@ -259,6 +413,19 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     def generate_streaming(self, text: str, **kwargs):
         """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
+        if _DEFAULT_SEGMENT_TEXT and kwargs.get("segment_text", True):
+            segments = _split_tts_text(text, kwargs.get("segment_max_chars"))
+            if len(segments) > 1:
+                segment_kwargs = dict(kwargs)
+                segment_kwargs["segment_text"] = False
+                for segment in segments:
+                    yield from self.generate_streaming(segment, **segment_kwargs)
+                return
+
+        yield from self._generate_streaming_single(text, **kwargs)
+
+    def _generate_streaming_single(self, text: str, **kwargs):
+        """Yield raw PCM int16 chunks for one already-bounded TTS request."""
         req_id = uuid.uuid4().hex
         streaming_profile = str(
             kwargs.get("streaming_profile", os.environ.get("EDGE_LLM_TTS_STREAMING_PROFILE", "continuous_playback"))
@@ -290,7 +457,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "talker_top_k": _DEFAULT_TOP_K,
             "talker_top_p": _DEFAULT_TOP_P,
             "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+            "codec_eos_logit_offset": _DEFAULT_CODEC_EOS_LOGIT_OFFSET,
+            "predictor_temperature": _DEFAULT_PREDICTOR_TEMPERATURE,
+            "predictor_top_k": _DEFAULT_PREDICTOR_TOP_K,
+            "predictor_top_p": _DEFAULT_PREDICTOR_TOP_P,
             "max_audio_length": kwargs.get("max_audio_length", _DEFAULT_MAX_AUDIO_LENGTH),
+            "min_audio_length": kwargs.get("min_audio_length", _DEFAULT_MIN_AUDIO_LENGTH),
             "stream": True,
             "stream_only": True,
             "first_chunk_frames": kwargs.get(
@@ -365,6 +537,63 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         """
         if not self._ready:
             raise RuntimeError("TTS backend not preloaded")
+        if _DEFAULT_SEGMENT_TEXT and kwargs.get("segment_text", True):
+            segments = _split_tts_text(text, kwargs.get("segment_max_chars"))
+            if len(segments) > 1:
+                segment_kwargs = dict(kwargs)
+                segment_kwargs["segment_text"] = False
+                wav_parts: list[bytes] = []
+                segment_meta: list[dict] = []
+                total_elapsed = 0.0
+                total_duration = 0.0
+                total_samples = 0
+                for segment in segments:
+                    wav, meta = self.synthesize(
+                        segment,
+                        speaker_id=speaker_id,
+                        speed=speed,
+                        pitch_shift=pitch_shift,
+                        language=language,
+                        **segment_kwargs,
+                    )
+                    wav_parts.append(wav)
+                    segment_meta.append({"text": segment, **meta})
+                    total_elapsed += float(meta.get("inference_time_s", 0.0))
+                    total_duration += float(meta.get("duration_s", 0.0))
+                    total_samples += int(meta.get("samples", 0))
+
+                wav_bytes = _concat_wav_bytes(wav_parts)
+                meta = {
+                    "inference_time_s": round(total_elapsed, 3),
+                    "sample_rate": self.sample_rate,
+                    "duration_s": round(total_duration, 3),
+                    "samples": total_samples,
+                    "rtf": round(total_elapsed / total_duration, 3) if total_duration > 0 else 0.0,
+                    "segmented": True,
+                    "segment_count": len(segments),
+                    "segments": segment_meta,
+                }
+                return wav_bytes, meta
+
+        return self._synthesize_single(
+            text,
+            speaker_id=speaker_id,
+            speed=speed,
+            pitch_shift=pitch_shift,
+            language=language,
+            **kwargs,
+        )
+
+    def _synthesize_single(
+        self,
+        text: str,
+        speaker_id: Optional[int] = None,
+        speed: Optional[float] = None,
+        pitch_shift: Optional[float] = None,
+        language: Optional[str] = None,
+        **kwargs,
+    ) -> tuple[bytes, dict]:
+        """Run one already-bounded TTS request."""
         if self._native_fallback is not None:
             return self._native_fallback.synthesize(
                 text,
@@ -393,8 +622,15 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "talker_top_k": _DEFAULT_TOP_K,
             "talker_top_p": _DEFAULT_TOP_P,
             "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+            "codec_eos_logit_offset": _DEFAULT_CODEC_EOS_LOGIT_OFFSET,
+            "predictor_temperature": _DEFAULT_PREDICTOR_TEMPERATURE,
+            "predictor_top_k": _DEFAULT_PREDICTOR_TOP_K,
+            "predictor_top_p": _DEFAULT_PREDICTOR_TOP_P,
             "max_audio_length": kwargs.get(
                 "max_audio_length", _DEFAULT_MAX_AUDIO_LENGTH
+            ),
+            "min_audio_length": kwargs.get(
+                "min_audio_length", _DEFAULT_MIN_AUDIO_LENGTH
             ),
         }
 
@@ -413,6 +649,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                 input_path,
                 "--talkerEngineDir",
                 TTS_TALKER_DIR,
+                "--codePredictorEngineDir",
+                TTS_CODE_PREDICTOR_DIR,
                 "--tokenizerDir",
                 TTS_TOKENIZER_DIR,
                 "--outputFile",

@@ -36,6 +36,17 @@ _EDGE_LLM_BUILD = os.path.join(
     _EDGE_LLM_BASE,
     os.environ.get("EDGE_LLM_BUILD_DIR", "build_sm87"),
 )
+_JETSON_VOICE_BASE = os.environ.get(
+    "JETSON_VOICE_BASE", os.path.expanduser("~/project/jetson-voice")
+)
+_VOICE_WORKER_BUILD = os.environ.get(
+    "JETSON_VOICE_WORKER_BUILD",
+    os.path.join(_JETSON_VOICE_BASE, "build", "edgellm_voice_worker", "workers"),
+)
+
+
+def _prefer_existing(primary: str, fallback: str) -> str:
+    return primary if os.path.exists(primary) else fallback
 
 # Binaries
 TTS_BINARY = os.environ.get(
@@ -44,7 +55,10 @@ TTS_BINARY = os.environ.get(
 )
 TTS_WORKER_BINARY = os.environ.get(
     "EDGE_LLM_TTS_WORKER_BIN",
-    os.path.join(_EDGE_LLM_BUILD, "examples/omni/qwen3_tts_worker"),
+    _prefer_existing(
+        os.path.join(_VOICE_WORKER_BUILD, "qwen3_tts_worker"),
+        os.path.join(_EDGE_LLM_BUILD, "examples/omni/qwen3_tts_worker"),
+    ),
 )
 ASR_BINARY = os.environ.get(
     "EDGE_LLM_ASR_BIN",
@@ -52,7 +66,10 @@ ASR_BINARY = os.environ.get(
 )
 ASR_WORKER_BINARY = os.environ.get(
     "EDGE_LLM_ASR_WORKER_BIN",
-    os.path.join(_EDGE_LLM_BUILD, "examples/llm/qwen3_asr_worker"),
+    _prefer_existing(
+        os.path.join(_VOICE_WORKER_BUILD, "qwen3_asr_worker"),
+        os.path.join(_EDGE_LLM_BUILD, "examples/llm/qwen3_asr_worker"),
+    ),
 )
 PLUGIN_PATH = os.environ.get(
     "EDGELLM_PLUGIN_PATH",
@@ -70,6 +87,10 @@ TTS_TALKER_DIR = os.environ.get(
     "EDGE_LLM_TTS_TALKER_DIR",
     os.path.join(_TTS_DEFAULT_ROOT, "engines", "talker"),
 )
+TTS_CODE_PREDICTOR_DIR = os.environ.get(
+    "EDGE_LLM_TTS_CP_DIR",
+    os.path.join(os.path.dirname(TTS_TALKER_DIR), "code_predictor"),
+)
 TTS_CODE2WAV_DIR = os.environ.get(
     "EDGE_LLM_TTS_CODE2WAV_DIR",
     os.path.join(_TTS_DEFAULT_ROOT, "engines", "code2wav")
@@ -81,14 +102,6 @@ TTS_TOKENIZER_DIR = os.environ.get(
     _TTS_DEFAULT_ROOT
     if os.path.exists(os.path.join(_TTS_DEFAULT_ROOT, "processed_chat_template.json"))
     else os.path.expanduser("~/qwen3-tts-trt-edge-llm-export"),
-)
-TTS_SPECIAL_CP_ENGINE = os.environ.get(
-    "QWEN3_TTS_CP_ENGINE",
-    os.path.expanduser("~/voice_test/models/qwen3-tts/engines/cp_bf16.engine"),
-)
-TTS_SPECIAL_CP_EMBED_FP32 = os.environ.get(
-    "QWEN3_TTS_CP_EMBED_FP32",
-    os.path.expanduser("~/voice_test/models/qwen3-tts/onnx/cp_embed_fp32.bin"),
 )
 
 # ASR engine directories
@@ -128,9 +141,6 @@ def _build_env() -> dict:
     """Return a copy of os.environ with EDGELLM_PLUGIN_PATH set."""
     env = os.environ.copy()
     env["EDGELLM_PLUGIN_PATH"] = PLUGIN_PATH
-    if os.path.exists(TTS_SPECIAL_CP_ENGINE) and os.path.exists(TTS_SPECIAL_CP_EMBED_FP32):
-        env.setdefault("QWEN3_TTS_CP_ENGINE", TTS_SPECIAL_CP_ENGINE)
-        env.setdefault("QWEN3_TTS_CP_EMBED_FP32", TTS_SPECIAL_CP_EMBED_FP32)
     return env
 
 
