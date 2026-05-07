@@ -364,14 +364,25 @@ int main(int argc, char** argv)
                     code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, code2wavStream);
                 }
 
-                std::vector<float> samples;
+                rt::audioUtils::AudioData chunkAudio;
                 auto const chunkStart = std::chrono::steady_clock::now();
                 cudaStream_t const chunkStream = asyncCode2Wav ? code2wavStream : stream;
-                if (!code2wavRunner->generateWaveformChunk(job.windowCodes, job.skipContextFrames, samples, chunkStream))
+                if (!code2wavRunner->generateWaveform(job.windowCodes, chunkAudio, chunkStream))
                 {
-                    throw std::runtime_error("Code2Wav streaming chunk failed");
+                    throw std::runtime_error("Code2Wav chunk failed");
                 }
                 auto const chunkEnd = std::chrono::steady_clock::now();
+                if (!chunkAudio.waveform || chunkAudio.waveform->isEmpty())
+                {
+                    return;
+                }
+                int64_t const totalSamples = chunkAudio.waveform->getShape()[1];
+                int64_t const skipSamples = std::min<int64_t>(
+                    totalSamples, static_cast<int64_t>(job.skipContextFrames) * code2wavRunner->getConfig().upsampleRate);
+                int64_t const emitSamples = totalSamples - skipSamples;
+                std::vector<float> samples(static_cast<size_t>(emitSamples));
+                auto const* waveform = static_cast<float const*>(chunkAudio.waveform->rawPointer());
+                std::copy(waveform + skipSamples, waveform + totalSamples, samples.begin());
                 if (samples.empty())
                 {
                     return;
@@ -522,16 +533,7 @@ int main(int argc, char** argv)
                 processChunk(job);
             };
 
-            auto frameCallback = [&](std::vector<int32_t> const& frameCodes, int32_t totalFrames) {
-                streamedFrames.push_back(frameCodes);
-                if (streamOutput && totalFrames >= nextChunkAt)
-                {
-                    submitChunk(false);
-                }
-            };
-
-            bool ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
-                                   : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+            bool ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
             auto const genEnd = std::chrono::steady_clock::now();
             if (!ok || talkerResponse.rvqCodes.empty())
             {
@@ -539,6 +541,7 @@ int main(int argc, char** argv)
             }
             if (streamOutput)
             {
+                streamedFrames = talkerResponse.rvqCodes;
                 submitChunk(true);
             }
             if (asyncCode2Wav)

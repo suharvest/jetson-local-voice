@@ -287,6 +287,7 @@ short_cn.wav          3.52s
 short_mix.wav         7.12s
 long_cn.wav           6.24s
 mixed_question.wav    7.12s
+product-worker-short.wav 2.16s
 ```
 
 Product-side validation:
@@ -294,7 +295,19 @@ Product-side validation:
 ```text
 uv run pytest app/tests/test_trt_edge_llm_tts.py app/tests/test_trt_edge_llm_ipc_paths.py
 7 passed
+
+cmake --build /tmp/build_edgellm_voice_worker_0507 --target qwen3_tts_worker qwen3_asr_worker -j1
+qwen3_tts_worker and qwen3_asr_worker built on Orin Nano
+
+/tmp/build_edgellm_voice_worker_0507/workers/qwen3_tts_worker
+Generated /tmp/qwen3tts_product_worker_0507.wav through the official EdgeLLM backend
 ```
+
+Product-side compatibility fix:
+
+- The product worker no longer depends on investigation-only upstream streaming callback APIs.
+- With clean official EdgeLLM headers, `stream=true` now falls back to full RVQ generation followed by a final Code2Wav chunk.
+- The worker CMake links the CuTe DSL artifact and CUDA runtime shim from the configured EdgeLLM build when `ENABLE_CUTE_DSL` is enabled.
 
 Remaining manual check:
 
