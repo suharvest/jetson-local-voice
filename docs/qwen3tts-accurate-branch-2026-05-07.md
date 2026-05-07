@@ -6,10 +6,10 @@ English, and Japanese Seeed Studio conversational AI solution samples on Orin NX
 ## Branches
 
 - Product repo: `qwen3tts-accurate-20260507`
-- EdgeLLM/HLM repo: `stable/qwen3tts-direct-bf16-nx-20260507`
-- EdgeLLM/HLM commit: `b9c57c8 Freeze Qwen3-TTS direct BF16 reference runtime`
+- EdgeLLM fork repo: `stable/qwen3tts-direct-bf16-nx-20260507`
+- EdgeLLM fork commit: `b9c57c8 Freeze Qwen3-TTS direct BF16 reference runtime`
 
-The EdgeLLM/HLM branch was recovered from:
+The EdgeLLM fork branch was recovered from:
 
 ```text
 orin-nano:/tmp/tensorrt-edge-llm-upstream-runtime-0505
