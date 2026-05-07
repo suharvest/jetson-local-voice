@@ -36,6 +36,14 @@ pr-export-builder-robustness
 pr-qwen3-tts-runtime-correctness
 ```
 
+Current clean branch heads:
+
+```text
+pr-jetson-build-compat              395b1e7 Fix CuTe DSL CUDA 12.6 static linking
+pr-export-builder-robustness        5d8b9cf Harden ONNX parsing and safetensors shard loading
+pr-qwen3-tts-runtime-correctness    ae57c29 Expose Qwen3-TTS generation controls
+```
+
 Product integration branch:
 
 ```text
@@ -85,6 +93,7 @@ Action:
 Status:
 
 - Ready in principle.
+- Verified on Orin Nano as part of the combined clean validation below.
 
 ### PR 2: Export and builder robustness
 
@@ -120,6 +129,7 @@ Required validation before PR:
 
 - WSL/x86 export test with `nvidia-modelopt` installed.
 - Python unit tests for single-file and sharded safetensors.
+- Orin-side runtime validation consumes the exported/runtime artifacts successfully in the combined clean validation below.
 
 ### PR 3: Qwen3-TTS runtime correctness
 
@@ -164,6 +174,38 @@ Required validation before PR:
   - mixed Chinese/English
   - multi-question text
 - ASR semantic check for generated samples.
+
+Status:
+
+- Orin Nano native build passed for `NvInfer_edgellm_plugin` and `qwen3_tts_inference` when combined with `pr-jetson-build-compat`.
+- Direct runtime validation generated short Chinese, short mixed Chinese/English, long Chinese punctuation, and mixed question samples through the official backend binary.
+- Audio samples pulled to:
+
+```text
+/Users/harvest/project/jetson-voice/qwen3tts-listen-0506/clean-allprs-0507/
+```
+
+Build command used for the passing Orin validation:
+
+```bash
+cmake -S . -B build_clean_sm87_cutedsl_allprs \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTRT_PACKAGE_DIR=/usr \
+  -DCUDA_DIR=/usr/local/cuda-12.6 \
+  -DCUDA_CTK_VERSION=12.6 \
+  -DEMBEDDED_TARGET=jetson-orin \
+  -DCMAKE_CUDA_ARCHITECTURES=87 \
+  -DENABLE_CUTE_DSL=gemm \
+  -DCUTE_DSL_ARTIFACT_TAG=sm_87
+cmake --build build_clean_sm87_cutedsl_allprs \
+  --target NvInfer_edgellm_plugin qwen3_tts_inference -j1
+```
+
+Important finding:
+
+- `pr-qwen3-tts-runtime-correctness` by itself can build without CuTe DSL, but Qwen3-TTS Talker MLP then fails at runtime because the official path needs CuTe DSL GEMM.
+- Enabling CuTe DSL GEMM on Jetson with CUDA 12.6 requires the generic build compatibility changes from `pr-jetson-build-compat`, especially `-DEMBEDDED_TARGET=jetson-orin`.
+- Therefore final product validation should combine PR 1 + PR 2 + PR 3, even if upstream review receives them as separate PRs.
 
 ### PR 4: Formal generation controls
 
@@ -221,6 +263,43 @@ Keep in `jetson-voice`:
 Reason:
 
 - These are product/service behavior, not EdgeLLM inference framework fixes.
+
+## Latest validation result
+
+Date: 2026-05-07
+
+Validated combination:
+
+```text
+EdgeLLM clean checkout: /tmp/edgellm-pr-qwen3-clean-0507
+Merged branches: pr-qwen3-tts-runtime-correctness + pr-jetson-build-compat
+Build dir: /tmp/edgellm-pr-qwen3-clean-0507/build_clean_sm87_cutedsl_allprs
+Talker: /home/harvest/qwen3-tts-edgellm-runtime/engines/talker
+CodePredictor: /tmp/cp_product_unified_0506
+Code2Wav: /home/harvest/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav
+Tokenizer: /home/harvest/qwen3-tts-trt-edge-llm-export
+```
+
+Generated samples:
+
+```text
+short_cn.wav          3.52s
+short_mix.wav         7.12s
+long_cn.wav           6.24s
+mixed_question.wav    7.12s
+```
+
+Product-side validation:
+
+```text
+uv run pytest app/tests/test_trt_edge_llm_tts.py app/tests/test_trt_edge_llm_ipc_paths.py
+7 passed
+```
+
+Remaining manual check:
+
+- Listen to the four pulled WAVs and confirm the final subjective audio quality.
+- If long-form content still needs all text in one request, rebuild/export with larger Talker KV capacity or keep product-side segmentation. The current official runtime correctly clamps max audio length to the engine KV capacity.
 
 ### Fixed global EOS workaround
 
