@@ -481,6 +481,33 @@ Updated decision:
 - The remaining blocker is quality, not frame count. Run listen review, ASR round-trip, duration/silence checks, and BF16-vs-W8 fixed-text comparisons before accepting it as the low-latency Nano path.
 - Keep the runtime invariant permanently: generation length limits must be derived from past-KV capacity, never from the one-token input profile max.
 
+## Updated W8A16 Quality Decision
+
+The W8A16 quality gate failed after the KV-capacity repair.
+
+Qwen3 ASR round-trip results:
+
+- BF16 `你好` -> `你好。`, duration `0.96 s`.
+- BF16 `你好，今天天气很好。` -> `你好，今天天気很好。`, duration `1.84 s`.
+- W8 sampling `你好` -> `我用这个东西，就是。`, duration `4.00 s`.
+- W8 sampling `你好，今天天气很好。` -> `嗯，这个是，嗯，这个是，嗯。`, duration `4.80 s`.
+- W8 greedy `你好` -> `啊啊啊啊啊！`.
+- W8 greedy weather sentence -> `保险。`.
+- W8 v13/v11 for `你好` -> `可以。` / `嗯。`.
+- A rebuilt 445 MB engine using 10 real calibration batches still produced `你好` -> `都是你。`.
+
+Important correction:
+
+- The current TensorRT build path is not true weight-only W8A16. It sets `BuilderFlag.INT8` and uses entropy calibration, with only attention-score MatMuls pinned to BF16. Non-pinned layers can run INT8 activations, so this is TRT INT8 PTQ with BF16 attention, not a pure W8A16 artifact.
+- Small real calibration does not repair the semantic drift. It fixes the build methodology, but not the quality problem.
+
+Updated decision:
+
+- Block the current 445 MB W8 engines from the product path.
+- Do not spend more time on EOS, min frames, top-k/top-p, or tiny calibration sweeps for these engines.
+- Keep BF16 plus5k/vocoder50 as the current quality-preserving Nano baseline.
+- If W8 is still required, restart that branch as either true weight-only W8A16 or conservative partial quantization with layer rollback, and require BF16-vs-W8 logits/hidden cosine plus ASR round-trip before dual-resident soak.
+
 ## TTS Pruned Vocab +5k Decision
 
 The first expansion from `35669` rows to `40669` rows passed the real dual-resident streaming gate:

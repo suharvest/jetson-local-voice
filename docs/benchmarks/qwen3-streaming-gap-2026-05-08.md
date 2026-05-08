@@ -810,3 +810,42 @@ Lessons to carry forward:
 - For single-profile decode engines, `inputs_embeds` max seqLen and past-KV max length are different constraints. Generation length clamps must use past-KV capacity.
 - If a W8A16 run emits one frame, inspect stderr and runtime length clamps before changing EOS bias, min-EOS, top-k/top-p, or sampling seeds.
 - `curl time_starttransfer` on `/tts/stream` measures HTTP header timing, not first PCM body bytes. Use a body-reading client for first-audio latency.
+
+## Run 14 - W8A16 Quality Gate
+
+Fixed-text samples were generated with plus5k pruned vocab and vocoder50, then transcribed with the Qwen3 ASR EdgeLLM backend.
+
+Objective metrics and ASR round-trip:
+
+| Artifact | Text | Duration | ASR round-trip | Result |
+|---|---|---:|---|---|
+| BF16 | `你好` | 0.96 s | `你好。` | pass |
+| BF16 | `你好，今天天气很好。` | 1.84 s | `你好，今天天気很好。` | pass, minor ASR variant |
+| W8A16 `talker_decode_int8.engine` sampling | `你好` | 4.00 s | `我用这个东西，就是。` | fail |
+| W8A16 `talker_decode_int8.engine` sampling | `你好，今天天气很好。` | 4.80 s | `嗯，这个是，嗯，这个是，嗯。` | fail |
+| W8A16 `talker_decode_int8.engine` greedy | `你好` | 4.00 s | `啊啊啊啊啊！` | fail |
+| W8A16 `talker_decode_int8.engine` greedy | `你好，今天天气很好。` | 1.36 s | `保险。` | fail |
+| W8A16 `talker_decode_int8_v13.engine` | `你好` | 4.00 s | `可以。` | fail |
+| W8A16 `talker_decode_int8_v11.engine` | `你好` | 4.00 s | `嗯。` | fail |
+
+Real-calibration rebuild test:
+
+- Existing `scripts/build_talker_int8_engine.py` claimed W8A16, but it used TensorRT `INT8` plus entropy calibration. That quantizes activations for non-pinned layers, so the current artifact is better described as TRT INT8 PTQ with BF16-pinned attention, not pure weight-only W8A16.
+- The build path also had an unused real-calibration generator. It only used synthetic random tensors.
+- Added a real calibration path:
+  - `bench/calib/gen_calib_data.py` now writes `inputs_embeds` as `[1,1,1024]` and includes `position_ids`;
+  - `scripts/build_talker_int8_engine.py` accepts `CALIB_NPZ` and loads real batches instead of synthetic data.
+- A 10-batch real-calibration rebuild completed on Nano:
+  - output: `/tmp/qwen3_w8_quality_0509/int8_realcalib10/talker_decode_int8.engine`
+  - size: 445 MB
+  - build time: 19.6 min
+  - md5: `28a315783a09b425df258532d8576f6e`
+- It still failed the shortest ASR round-trip:
+  - `你好` -> 4.00 s audio -> ASR `都是你。`
+
+Decision:
+
+- The current TRT INT8 PTQ Talker branch is not quality-acceptable, even after the KV-capacity runtime repair.
+- Small real-calibration rebuilds do not fix the semantic drift. Do not spend more time tuning EOS, min frames, top-k/top-p, or tiny calibration sets for this artifact.
+- If W8 remains necessary, the next attempt should be a true weight-only W8A16 implementation or a much more conservative partial-quant build with explicit layer rollback and numeric gates. Treat the existing 445 MB engines as memory evidence only, not quality candidates.
+- For the immediate Nano path, keep BF16 plus5k/vocoder50 as the quality-preserving baseline and look for non-quantization memory cuts, or accept that W8 requires a new quantization approach.

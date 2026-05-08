@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 
 
 def drain_stderr(proc: subprocess.Popen[str], lines: list[str]) -> None:
@@ -39,6 +40,9 @@ def main() -> None:
     parser.add_argument("--max-audio-length", type=int, default=50)
     parser.add_argument("--min-audio-length", type=int, default=10)
     parser.add_argument("--print-stderr", action="store_true")
+    parser.add_argument("--output-pcm", default="")
+    parser.add_argument("--output-wav", default="")
+    parser.add_argument("--quiet-chunks", action="store_true")
     args = parser.parse_args()
 
     env = os.environ.copy()
@@ -116,13 +120,15 @@ def main() -> None:
 
     chunks = 0
     pcm_bytes = 0
+    pcm_parts: list[bytes] = []
     first_chunk_s = None
     while True:
         line = proc.stdout.readline()
         if not line:
             raise RuntimeError("worker exited during request: " + "".join(stderr_lines)[-2000:])
-        print(line.rstrip(), flush=True)
         event = json.loads(line)
+        if not (args.quiet_chunks and event.get("event") == "chunk"):
+            print(line.rstrip(), flush=True)
         if not event.get("ok", False):
             print("stderr_tail_begin", flush=True)
             print("".join(stderr_lines)[-4000:], flush=True)
@@ -132,9 +138,22 @@ def main() -> None:
             chunks += 1
             if first_chunk_s is None:
                 first_chunk_s = time.time() - start
-            pcm_bytes += len(base64.b64decode(event.get("audio_b64", "")))
+            chunk = base64.b64decode(event.get("audio_b64", ""))
+            pcm_parts.append(chunk)
+            pcm_bytes += len(chunk)
         if event.get("event") == "done":
             break
+
+    pcm = b"".join(pcm_parts)
+    if args.output_pcm:
+        with open(args.output_pcm, "wb") as f:
+            f.write(pcm)
+    if args.output_wav:
+        with wave.open(args.output_wav, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(pcm)
 
     print(
         json.dumps(
@@ -144,6 +163,8 @@ def main() -> None:
                 "pcm_bytes": pcm_bytes,
                 "first_chunk_wall_s": first_chunk_s,
                 "total_wall_s": time.time() - start,
+                "output_pcm": args.output_pcm,
+                "output_wav": args.output_wav,
             },
             ensure_ascii=False,
         ),
