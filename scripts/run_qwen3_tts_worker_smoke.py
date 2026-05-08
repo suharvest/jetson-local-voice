@@ -123,6 +123,9 @@ def main() -> None:
         print(line.rstrip(), flush=True)
         event = json.loads(line)
         if not event.get("ok", False):
+            print("stderr_tail_begin", flush=True)
+            print("".join(stderr_lines)[-4000:], flush=True)
+            print("stderr_tail_end", flush=True)
             raise RuntimeError(f"worker error: {event}")
         if event.get("event") == "chunk":
             chunks += 1

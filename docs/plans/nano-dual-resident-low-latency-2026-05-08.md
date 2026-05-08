@@ -425,3 +425,32 @@ Operational lesson:
 
 - Both ASR and TTS subprocess workers must drain stderr while waiting for JSON `ready`.
 - ASR backend patches must preserve `EDGE_LLM_ASR_MANIFEST` parsing; otherwise the app falls back to default `/root/...` paths and silently disables the real Qwen3-ASR residency test.
+
+## W8A16 Talker Trial Decision
+
+W8A16 was tested after the vocoder50 baseline using existing Talker INT8 engines under `/home/harvest/voice_test/models/qwen3-tts/engines`.
+
+Memory result:
+
+- `talker_decode_int8.engine` is `445 MB` versus `876 MB` for `talker_decode_bf16.engine`.
+- TTS-only `worker_after_tts_runtime` improved from about `2503 MB` available to about `3248 MB`.
+- Dual-resident startup minimum improved from `86 MB` available with BF16/vocoder50 to `485 MB` available with W8A16/vocoder50.
+- Real dual-resident `/tts/stream` stayed around `475 MB` available after final Code2Wav.
+
+Quality/runtime result:
+
+- The existing 445 MB W8A16 engines are single-profile, `inputs_embeds` max seqLen `1`.
+- A temporary runtime patch made them runnable by using iterative prefill and by separating input max seqLen from past-KV max length.
+- All tested W8A16 engines still produced only one codec frame for `你好` (`~80 ms`, `3840` PCM bytes).
+- Forcing `QWEN3_TTS_MIN_EOS_FRAMES=10` and disabling auto EOS bias did not fix the one-frame output.
+
+Decision:
+
+- W8A16 is now a confirmed memory-recovery path, not a confirmed product path.
+- Do not use it for production low-latency measurements until quality is repaired.
+- Next W8 work should compare BF16 vs W8 numerical traces at:
+  - prefill logits before/after logit adjustment;
+  - sampled primary codec token sequence;
+  - Talker hidden state feeding CodePredictor;
+  - frame count and duration.
+- If the single-profile iterative prefill is the quality source, rebuild W8A16 with a true prefill profile instead of accepting iterative prefill.

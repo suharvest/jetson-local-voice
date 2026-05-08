@@ -592,3 +592,73 @@ Lessons to carry forward:
 - Full TTS text embedding restore is not viable on this budget: `151936 -> 35669` rows would add back roughly `454-476 MB`, far beyond the measured headroom.
 - Text vocab expansion should be staged. Each added token row costs `2048 * 2 = 4096` bytes, so `+5k` tokens is about `19.5 MB`, `+10k` about `39 MB`, and `+20k` about `78 MB` before allocator overhead. Given the measured `~86-126 MB` headroom, start at `+5k` or at most `+10k`, then re-run dual-resident `/tts/stream`.
 - ASR worker also needs stderr drain when waiting for `ready`; otherwise it has the same pipe-blocking risk as TTS. Preserve manifest parsing when patching this file because the Nano ASR paths come from `EDGE_LLM_ASR_MANIFEST`.
+
+## Run 11 - Talker W8A16 + Vocoder50 + TTS Text Vocab Pruning
+
+Artifacts tested:
+
+| Artifact | Path | Size |
+|---|---|---:|
+| BF16 Talker baseline | `/home/harvest/voice_test/models/qwen3-tts/engines/talker_decode_bf16.engine` | 876 MB |
+| W8A16 Talker | `/home/harvest/voice_test/models/qwen3-tts/engines/talker_decode_int8.engine` | 445 MB |
+| W8A16 Talker v13 | `/home/harvest/voice_test/models/qwen3-tts/engines/talker_decode_int8_v13.engine` | 445 MB |
+| W8A16 Talker v11 | `/home/harvest/voice_test/models/qwen3-tts/engines/talker_decode_int8_v11.engine` | 621 MB |
+
+Runtime compatibility notes:
+
+- The 445 MB W8A16 engines are single-profile engines with `inputs_embeds` max seqLen `1`.
+- The current explicit-KV runtime originally used batch Talker prefill for the 9-row Qwen3-TTS prompt and failed with:
+  - `Qwen3-TTS direct Talker prefill seqLen out of range: 9 (max 1)`
+- A temporary runtime patch made W8A16 runnable by:
+  - falling back to iterative prefill when `maxSeqLen == 1`;
+  - separating single-token input max from past-KV max, because the same engine still supports past KV length around 200.
+
+TTS-only W8A16 result after the runtime patch:
+
+| Engine | `worker_after_tts_runtime` | `worker_after_lazy_code2wav` | Output |
+|---|---:|---:|---|
+| `talker_decode_int8.engine` | 3248 MB | 2840 MB | runs, but 1 frame / 3840 PCM bytes |
+| `talker_decode_int8_v13.engine` | 3211 MB | 2795 MB | runs, but 1 frame / 3840 PCM bytes |
+| `talker_decode_int8_v11.engine` | 2834 MB | 2431 MB | runs, but 1 frame / 3840 PCM bytes |
+
+TTS-only comparison:
+
+- BF16 + pruned text + vocoder50 had `worker_after_tts_runtime=2503 MB`.
+- W8A16 445 MB Talker improves TTS-only available memory by roughly `700-900 MB`, depending on run noise and engine variant.
+- Runtime generation latency is not comparable yet because W8A16 exits after one codec frame.
+
+Dual-resident W8A16 result with ASR warmup enabled:
+
+| Stage | MemAvailable |
+|---|---:|
+| TTS `worker_entry_before_plugin` | 4140 MB |
+| TTS `worker_before_tts_runtime` | 4065 MB |
+| TTS `worker_after_tts_runtime` | 977 MB |
+| TTS `worker_after_ready` | 977 MB |
+| startup warmup `worker_before_lazy_code2wav` | 971 MB |
+| startup warmup `worker_after_lazy_code2wav` | 598 MB |
+| startup warmup `worker_after_code2wav_final_chunk` | 485 MB |
+| real request `worker_after_code2wav_final_chunk` | 475 MB |
+
+Real `/tts/stream` request while ASR remained resident:
+
+```text
+POST /tts/stream {"text":"你好","language":"chinese"}
+HTTP 200
+downloaded: 3,844 bytes
+time_starttransfer: 0.061 s
+time_total: 0.828 s
+output: /tmp/qwen3_w8_vocoder50_pruned_stream_0508.pcm
+```
+
+Outcome:
+
+- W8A16 is very promising for memory: it raises real dual-resident steady headroom from about `86-126 MB` to about `475-485 MB`.
+- Current W8A16 output is not usable: all tested engines produce only one 80 ms codec frame for `你好`, even with `QWEN3_TTS_MIN_EOS_FRAMES=10` and auto EOS bias disabled in TTS-only smoke.
+- This must not be promoted as the low-latency solution yet. It is a memory-fit branch requiring quality/logit repair.
+
+Lessons to carry forward:
+
+- For single-profile Talker engines, do not treat `inputs_embeds` max seqLen as KV capacity. The runtime must track input max and past-KV max separately.
+- W8A16 needs a quality gate before any dual-resident soak: compare BF16 vs W8 prefill/decode logits, first codec token sequence, frame count, and audio duration before listening tests.
+- The next W8 step should be numerical diagnosis or a dual-profile W8A16 rebuild, not tuning EOS sampling knobs.
