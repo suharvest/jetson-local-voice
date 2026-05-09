@@ -4,7 +4,7 @@ Provides:
   - Path constants (override via env vars)
   - run_binary()  — one-shot subprocess invocation
   - write_safetensors() — numpy -> safetensors file (no PyPI dep needed)
-  - audio_bytes_to_mel() — WAV bytes -> log-mel spectrogram (scipy-only)
+  - audio_bytes_to_mel() — WAV bytes -> log-mel spectrogram (numpy-only)
 """
 
 from __future__ import annotations
@@ -74,6 +74,11 @@ ASR_WORKER_BINARY = os.environ.get(
 PLUGIN_PATH = os.environ.get(
     "EDGELLM_PLUGIN_PATH",
     os.path.join(_EDGE_LLM_BUILD, "libNvInfer_edgellm_plugin.so"),
+)
+DEFAULT_PLUGIN_PATH = os.path.join(_EDGE_LLM_BUILD, "libNvInfer_edgellm_plugin.so")
+ASR_PLUGIN_PATH = os.environ.get(
+    "EDGE_LLM_ASR_PLUGIN_PATH",
+    os.environ.get("EDGELLM_ASR_PLUGIN_PATH", DEFAULT_PLUGIN_PATH),
 )
 
 # TTS engine directories
@@ -288,67 +293,57 @@ def audio_bytes_to_mel(
     """Convert WAV bytes to log-mel spectrogram.
 
     Returns float32 array of shape ``[1, 128, T]`` (batch, mel, time),
-    using librosa STFT + Slaney mel filterbank matching the old working
-    compute_whisper_log_mel() in voice_test/app_overlay/backends/whisper_mel.py.
+    using a narrow numpy port of Whisper/Qwen3-ASR feature extraction.
 
     Dynamic range clamp uses max-8dB (old working behavior) instead of the
     fixed -4dB Whisper clamp (which was producing wrong mel for Qwen3 ASR).
     """
-    import librosa
-    from scipy.io import wavfile
-    from scipy import signal as scipy_signal
+    import wave
 
     # -- Read WAV --
-    sr, audio = wavfile.read(io.BytesIO(audio_bytes))
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
+        sr = wav.getframerate()
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        frames = wav.readframes(wav.getnframes())
 
-    # Convert integer PCM to float32 [-1, 1]
-    if audio.dtype == np.int16:
-        audio = audio.astype(np.float32) / 32768.0
-    elif audio.dtype == np.int32:
-        audio = audio.astype(np.float32) / 2147483648.0
-    elif audio.dtype == np.uint8:
-        audio = (audio.astype(np.float32) - 128.0) / 128.0
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+    elif sample_width == 1:
+        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
     else:
-        audio = audio.astype(np.float32)
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
 
-    # Mono
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
 
     # Resample if needed
     if sr != target_sr:
         new_len = int(round(len(audio) * target_sr / sr))
-        audio = scipy_signal.resample(audio, new_len).astype(np.float32)
+        src_x = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+        dst_x = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+        audio = np.interp(dst_x, src_x, audio).astype(np.float32)
 
-    # -- STFT via librosa (matches old working whisper_mel.py) --
-    stft = librosa.stft(
-        y=audio,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        win_length=N_FFT,
-        window="hann",
-        center=True,
-        dtype=np.complex64,
-        pad_mode="reflect",
+    # -- Centered STFT with periodic Hann window --
+    pad = N_FFT // 2
+    if audio.shape[0] <= 1:
+        audio = np.pad(audio, (0, 2 - audio.shape[0]), mode="constant")
+    audio = np.pad(audio, (pad, pad), mode="reflect")
+    window = np.hanning(N_FFT + 1)[:-1].astype(np.float32)
+    n_frames = 1 + (len(audio) - N_FFT) // HOP_LENGTH
+    frames = np.lib.stride_tricks.as_strided(
+        audio,
+        shape=(n_frames, N_FFT),
+        strides=(audio.strides[0] * HOP_LENGTH, audio.strides[0]),
     )
 
     # Drop final frame (Whisper convention)
-    magnitudes = np.abs(stft[:, :-1]).astype(np.float32) ** 2.0
+    stft = np.fft.rfft(frames * window[np.newaxis, :], n=N_FFT, axis=1)
+    magnitudes = np.abs(stft[:-1].T).astype(np.float32) ** 2.0
 
-    # -- Mel filterbank (librosa Slaney, matches old working behavior) --
-    mel_basis = librosa.filters.mel(
-        sr=target_sr,
-        n_fft=N_FFT,
-        n_mels=N_MELS,
-        fmin=FMIN,
-        fmax=FMAX,
-        htk=False,
-        norm="slaney",
-        dtype=np.float32,
-    )
-
-    mel_spec = mel_basis @ magnitudes
-
+    mel_spec = _MEL_FILTERBANK @ magnitudes
     # -- Log compression (old working: max-8dB dynamic range) --
     log_spec = np.log10(np.maximum(mel_spec, MEL_FLOOR))
     log_spec = np.maximum(log_spec, log_spec.max() - 8.0)

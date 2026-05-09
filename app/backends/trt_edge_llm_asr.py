@@ -30,7 +30,7 @@ from backends.trt_edge_llm_ipc import (
     ASR_WORKER_BINARY,
     ASR_ENGINE_DIR,
     ASR_AUDIO_ENC_DIR,
-    PLUGIN_PATH,
+    ASR_PLUGIN_PATH,
     audio_bytes_to_mel,
     run_binary,
     write_safetensors,
@@ -42,8 +42,8 @@ _DEFAULT_MAX_GENERATE_LENGTH = int(
     os.environ.get("ASR_MAX_GENERATE_LENGTH", "200")
 )
 _DEFAULT_TEMPERATURE = float(os.environ.get("ASR_TEMPERATURE", "1.0"))
-_DEFAULT_TOP_P = float(os.environ.get("ASR_TOP_P", "0.8"))
-_DEFAULT_TOP_K = int(os.environ.get("ASR_TOP_K", "50"))
+_DEFAULT_TOP_P = float(os.environ.get("ASR_TOP_P", "1.0"))
+_DEFAULT_TOP_K = int(os.environ.get("ASR_TOP_K", "1"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -80,7 +80,14 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 manifest.get("worker_binary", ASR_WORKER_BINARY),
             ),
             "plugin_path": os.environ.get(
-                "EDGELLM_PLUGIN_PATH", manifest.get("plugin_path", PLUGIN_PATH)
+                "EDGE_LLM_ASR_PLUGIN_PATH",
+                os.environ.get(
+                    "EDGELLM_ASR_PLUGIN_PATH",
+                    manifest.get(
+                        "asr_plugin_path",
+                        manifest.get("plugin_path", ASR_PLUGIN_PATH),
+                    ),
+                ),
             ),
             "engine_dir": os.environ.get(
                 "EDGE_LLM_ASR_ENGINE_DIR", manifest.get("engine_dir", ASR_ENGINE_DIR)
