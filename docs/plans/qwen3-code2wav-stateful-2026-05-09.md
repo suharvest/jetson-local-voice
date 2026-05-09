@@ -128,6 +128,56 @@ ConvTranspose is the risky part. It is causal but trims `kernel_size - stride` f
 
 This is the main correctness risk for a true stateful vocoder.
 
+## Phase A Progress
+
+Reference script:
+
+- `scripts/qwen3_code2wav_stateful_reference.py`
+- `scripts/qwen3_tts_code2wav_stateful_real_gate.py`
+
+Validated on CPU with random weights:
+
+- `CausalConv1d` streaming history matches full forward.
+- `CausalTransposeConv1d` overlap-add matches full forward when bias is applied once globally.
+- `CausalTransposeConv1d` online emit can output stable samples per chunk and match full forward.
+- Sliding-window attention KV state matches full forward when chunks use absolute `position_offset`.
+- Code embedding + 3-layer pre-transformer stack + final RMSNorm matches full forward.
+- A small complete `Code2WavModel` can be run through the same chunk-state rules and match full forward in collect mode.
+- The same small complete `Code2WavModel` also matches full forward in online mode, where each layer receives only stable chunks emitted by the previous layer.
+
+Latest probe results:
+
+```text
+float32 worst max_abs: 2.384185791015625e-07
+float16 worst max_abs: 0.0
+```
+
+This locks down the reference state rules for the full model structure. The
+remaining Phase A work is to run the online reference against real Code2Wav
+weights/codes, then turn the Python reference state layout into an exportable
+stateful graph interface.
+
+Real product decoder gate:
+
+- Source decoder: `/home/harvest/qwen3-tts-trt-edge-llm-export/tokenizer_decoder`
+- Transfer path: Orin -> `wsl2-local` direct fleet transfer, because Mac -> Orin was slow.
+- The product ONNX uses external data: `model.onnx` + `onnx_model.data`.
+- The actual decoder is Qwen3-TTS tokenizer-12Hz `Qwen3TTSTokenizerV2Decoder`, not the older Qwen3-Omni standalone `Code2WavModel`.
+- The ONNX initializer mapping needs two special cases:
+  - `quantizer.rvq_first.input_proj.weight` and `quantizer.rvq_rest.input_proj.weight` are absent because decode does not use input projection.
+  - `onnx::Exp_*` SnakeBeta initializers are raw alpha/beta parameters in this export; do not apply `log()`.
+
+Validated with real RVQ codes from `qwen3tts-listen-0506/clean-allprs-0507/short_cn/rvq_req0.safetensors`:
+
+```text
+8 frames, chunk=3:  max_abs 9.128125384449959e-07
+16 frames, chunk=5: max_abs 5.010515451431274e-06
+44 frames, chunk=8: max_abs 3.077089786529541e-06
+16 frames, chunk=1: max_abs 8.761882781982422e-06
+```
+
+All passed the float32 tolerance `2e-4`, with exact waveform length matches.
+
 ## Feasible Implementation Path
 
 ### Phase A: PyTorch reference, no TensorRT
@@ -185,6 +235,85 @@ Add a new runner instead of changing the existing stateless runner in place:
 
 Keep `Code2WavRunner` as fallback.
 
+Phase C production hook started:
+
+- Added C++ runner files in TensorRT-Edge-LLM:
+  - `cpp/multimodal/statefulCode2WavRunner.h`
+  - `cpp/multimodal/statefulCode2WavRunner.cpp`
+- Worker integration:
+  - `examples/omni/qwen3_tts_worker.cpp`
+  - `EDGE_LLM_TTS_STATEFUL_CODE2WAV=1` enables the stateful path.
+  - `EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR=<dir>` overrides the engine dir.
+  - Expected engine file: `<dir>/code2wav_stateful.engine`.
+  - Default stateless path is unchanged.
+- Runtime contract:
+  - input `codes`
+  - output `waveform`
+  - optional scalar input `position_offset`
+  - optional scalar input `is_final`
+  - state tensors are paired as `<name>_in` and `<name>_out`
+- Worker behavior:
+  - on each emitted streaming chunk, stateful mode feeds only `[lastEmittedFrames, totalFrames)` new codes.
+  - no left context window and no context sample discard.
+  - `reset()` is called per request before Talker generation.
+  - `async_code2wav` is rejected in stateful mode for now.
+
+Build and smoke status on Orin:
+
+```text
+cmake configure + qwen3_tts_worker build: passed
+default stateless streaming smoke: passed
+stateful flag without code2wav_stateful.engine: fails clearly at worker init
+```
+
+Build note: because `cpp/CMakeLists.txt` uses `GLOB_RECURSE`, adding the new
+runner `.cpp` requires rerunning `cmake ..` before `cmake --build`, otherwise
+the worker links with undefined `StatefulCode2WavRunner` symbols.
+
+Stateful ONNX/export status:
+
+- Export script: `scripts/qwen3_tts_code2wav_stateful_export.py`
+- Product decoder: `Qwen3TTSTokenizerV2Decoder`
+- Explicit state gate with real ONNX weights and real RVQ codes:
+  - 16 frames, chunk=4: `max_abs=5.36e-6`
+  - 16 frames, chunk=1: `max_abs=8.99e-6`
+  - 44 frames, chunk=8: `max_abs=2.94e-6`
+  - tolerance: `2e-4`
+- Final state interface:
+  - inputs: `codes`, `position_offset`, plus 37 state tensors
+  - outputs: `waveform`, plus 37 state tensors
+  - zero-length conv states and zero-length transposed-conv pending tails are not exported.
+- WSL artifact:
+  - `/tmp/qwen3_code2wav_stateful_gate/qwen3_tts_code2wav_stateful.onnx`
+- Orin artifact:
+  - `/tmp/qwen3_code2wav_stateful_engine/code2wav_stateful.onnx`
+  - `/tmp/qwen3_code2wav_stateful_engine/code2wav_stateful.engine`
+  - `/tmp/qwen3_code2wav_stateful_engine/config.json`
+
+TensorRT build status on Orin:
+
+```text
+trtexec fp16 profile: min=1, opt=4, max=16 frames
+engine size: 222.843 MiB
+activation memory: 129.253 MiB
+opt=4 GPU compute: ~15.99 ms
+```
+
+Production worker stateful smoke:
+
+```text
+EDGE_LLM_TTS_STATEFUL_CODE2WAV=1
+EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR=/tmp/qwen3_code2wav_stateful_engine
+stateful_code2wav: true
+warm stable first chunk: ~0.766-0.768 s
+warm stable RTF: ~0.976-0.984
+warm stable Code2Wav total: ~81-87 ms
+```
+
+Compared with the previous stateless small-chunk path, this removes the large
+per-chunk vocoder recompute cost. The remaining latency is now mostly Talker/CP
+generation and per-chunk orchestration, not Code2Wav full-window recompute.
+
 ### Phase D: Quality and performance gates
 
 Required gates:
@@ -215,4 +344,3 @@ It will not remove Talker/CodePredictor generation time. Current dual-resident R
 ## Recommendation
 
 Do not attempt to patch the current TensorRT engine into stateful mode. Build a PyTorch stateful reference first. If Phase A cannot match full-window output, stop there and keep the current `50/97/context=3` strategy.
-
