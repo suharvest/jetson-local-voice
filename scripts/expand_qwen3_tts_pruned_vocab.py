@@ -136,13 +136,21 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--add-rows", type=int, default=5000)
     parser.add_argument("--corpus", action="append", default=[])
+    parser.add_argument("--corpus-file", action="append", type=Path, default=[])
     parser.add_argument("--force-id", action="append", type=int, default=[])
     args = parser.parse_args()
 
     base_dir = Path(args.base_talker_dir)
     full_dir = Path(args.full_talker_dir)
     out_dir = Path(args.out_dir)
-    corpus_lines = DEFAULT_CORPUS + args.corpus
+    file_corpus: list[str] = []
+    for corpus_file in args.corpus_file:
+        file_corpus.extend(
+            line.strip()
+            for line in corpus_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    corpus_lines = DEFAULT_CORPUS + args.corpus + file_corpus
     force_ids = list(args.force_id)
 
     base_map = np.fromfile(base_dir / "token_map.bin", dtype=np.uint32)
