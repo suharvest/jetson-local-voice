@@ -18,6 +18,8 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
+import io
 from collections import deque
 from typing import Optional
 
@@ -162,6 +164,22 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         if self._use_worker():
             self._ensure_worker()
         self._ready = True
+        if self._use_worker():
+            self._warm_worker()
+
+    def _warm_worker(self) -> None:
+        if os.environ.get("SKIP_ASR_WARMUP", "").lower() in ("1", "true", "yes"):
+            logger.info("TRT-EdgeLLM ASR worker warmup skipped (SKIP_ASR_WARMUP set).")
+            return
+        if os.environ.get("EDGE_LLM_ASR_WORKER_WARMUP", "1").lower() in ("0", "false", "no"):
+            logger.info("TRT-EdgeLLM ASR worker warmup skipped.")
+            return
+        try:
+            silence = np.zeros(16000, dtype=np.float32)
+            self.transcribe(_float_audio_to_wav_bytes(silence, 16000))
+            logger.info("TRT-EdgeLLM ASR worker warmed with 1s silence.")
+        except Exception as exc:
+            logger.warning("TRT-EdgeLLM ASR worker warmup failed: %s", exc)
 
     def _use_worker(self) -> bool:
         return bool(self._config["use_worker"])
@@ -431,12 +449,55 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             )
 
     def create_stream(self, language: str = "auto") -> ASRStream:
-        """Streaming ASR is not yet implemented for the TRT-Edge-LLM backend.
+        """Accumulate stream audio and run the resident worker on finalize.
 
-        Phase 2 will use ``llm_stream --streamInterval N`` with per-token
-        stdout parsing.
+        This matches the current V2V product behavior: the user has already
+        stopped speaking before ASR is invoked, so partials are unnecessary.
+        The resident C++ worker keeps the stop-to-final path warm.
         """
-        raise NotImplementedError(
-            f"{self.name} does not support streaming yet; "
-            "use llm_inference for offline transcription."
-        )
+        if not self._ready:
+            raise RuntimeError("ASR backend not preloaded")
+        return _TRTEdgeLLMAccumulatingASRStream(self, language=language)
+
+
+def _float_audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+    return out.getvalue()
+
+
+class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
+    def __init__(self, backend: TRTEdgeLLMASRBackend, language: str = "auto"):
+        self._backend = backend
+        self._language = language
+        self._chunks: list[np.ndarray] = []
+
+    def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(samples) * ratio)
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, new_len),
+                np.arange(len(samples)),
+                samples,
+            ).astype(np.float32)
+        self._chunks.append(samples.copy())
+
+    def finalize(self) -> str:
+        if not self._chunks:
+            return ""
+        audio = np.concatenate(self._chunks)
+        wav_bytes = _float_audio_to_wav_bytes(audio, 16000)
+        result = self._backend.transcribe(wav_bytes, language=self._language)
+        return result.text
+
+    def get_partial(self) -> tuple[str, bool]:
+        return "", False

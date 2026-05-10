@@ -436,7 +436,10 @@ def test_edgellm_worker_defaults_match_dual_resident_streaming_profile(monkeypat
     monkeypatch.delenv("EDGE_LLM_TTS_CHUNK_FRAMES", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", raising=False)
     monkeypatch.delenv("QWEN3_TTS_CP_DECODE_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("QWEN3_TTS_ACTIVE_CP_GROUPS", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_PERF_PROFILE", raising=False)
 
     backend = tts_mod.TRTEdgeLLMTTSBackend()
     env = backend._worker_env()
@@ -456,15 +459,18 @@ def test_edgellm_worker_defaults_match_dual_resident_streaming_profile(monkeypat
 
     assert list(backend.generate_streaming("你好")) == []
     assert env["EDGE_LLM_TTS_CUDA_GRAPH"] == "0"
-    assert env["EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES"] == "3"
-    assert "QWEN3_TTS_CP_DECODE_CUDA_GRAPH" not in env
-    assert captured["request"]["first_chunk_frames"] == 50
-    assert captured["request"]["chunk_frames"] == 97
-    assert captured["request"]["max_chunk_frames"] == 97
+    assert env["EDGE_LLM_TTS_STATEFUL_CODE2WAV"] == "1"
+    assert env["EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES"] == "0"
+    assert env["QWEN3_TTS_CP_DECODE_CUDA_GRAPH"] == "1"
+    assert env["QWEN3_TTS_ACTIVE_CP_GROUPS"] == "13"
+    assert env["QWEN3_TTS_VOCAB_PRUNED"] == "0"
+    assert captured["request"]["first_chunk_frames"] == 7
+    assert captured["request"]["chunk_frames"] == 10
+    assert captured["request"]["max_chunk_frames"] == 10
     assert captured["request"]["adaptive_chunks"] is False
 
 
-def test_edgellm_worker_v2v_profile_uses_first_frame_fast_window(monkeypatch):
+def test_edgellm_worker_legacy_v2v_profile_uses_first_frame_fast_window(monkeypatch):
     import backends.trt_edge_llm_tts as tts_mod
 
     captured = {}
@@ -476,6 +482,7 @@ def test_edgellm_worker_v2v_profile_uses_first_frame_fast_window(monkeypatch):
     monkeypatch.delenv("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_CHUNK_FRAMES", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", raising=False)
+    monkeypatch.setenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "0")
 
     backend = tts_mod.TRTEdgeLLMTTSBackend()
 
@@ -534,7 +541,91 @@ def test_edgellm_worker_stateful_profile_uses_small_continuous_chunks(monkeypatc
     assert list(backend.generate_streaming("你好")) == []
     assert env["EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES"] == "0"
     assert env["QWEN3_TTS_CP_DECODE_CUDA_GRAPH"] == "1"
-    assert captured["request"]["first_chunk_frames"] == 8
+    assert env["QWEN3_TTS_ACTIVE_CP_GROUPS"] == "13"
+    assert captured["request"]["first_chunk_frames"] == 7
     assert captured["request"]["chunk_frames"] == 10
     assert captured["request"]["max_chunk_frames"] == 10
     assert captured["request"]["adaptive_chunks"] is False
+
+
+def test_edgellm_worker_stateful_balanced_profile_uses_cp13(monkeypatch):
+    import backends.trt_edge_llm_tts as tts_mod
+
+    captured = {}
+
+    class FakeWorker:
+        stdin = None
+        stdout = None
+
+    monkeypatch.setenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1")
+    monkeypatch.setenv("EDGE_LLM_TTS_PERF_PROFILE", "balanced")
+    monkeypatch.delenv("QWEN3_TTS_ACTIVE_CP_GROUPS", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", raising=False)
+
+    backend = tts_mod.TRTEdgeLLMTTSBackend()
+    env = backend._worker_env()
+
+    def fake_ensure_worker():
+        backend._worker = FakeWorker()
+        backend._worker.stdin = types.SimpleNamespace(
+            write=lambda data: captured.setdefault("request", json.loads(data)),
+            flush=lambda: None,
+        )
+        backend._worker.stdout = types.SimpleNamespace(
+            readline=lambda: json.dumps({"event": "done", "ok": True}) + "\n"
+        )
+
+    monkeypatch.setattr(backend, "_ensure_worker", fake_ensure_worker)
+    backend._ready = True
+
+    assert list(backend.generate_streaming("你好")) == []
+    assert env["QWEN3_TTS_CP_DECODE_CUDA_GRAPH"] == "1"
+    assert env["QWEN3_TTS_ACTIVE_CP_GROUPS"] == "13"
+    assert captured["request"]["first_chunk_frames"] == 6
+
+
+def test_edgellm_worker_stateful_fast_profile_uses_first4(monkeypatch):
+    import backends.trt_edge_llm_tts as tts_mod
+
+    captured = {}
+
+    class FakeWorker:
+        stdin = None
+        stdout = None
+
+    monkeypatch.setenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1")
+    monkeypatch.setenv("EDGE_LLM_TTS_PERF_PROFILE", "fast")
+    monkeypatch.delenv("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", raising=False)
+
+    backend = tts_mod.TRTEdgeLLMTTSBackend()
+    env = backend._worker_env()
+
+    def fake_ensure_worker():
+        backend._worker = FakeWorker()
+        backend._worker.stdin = types.SimpleNamespace(
+            write=lambda data: captured.setdefault("request", json.loads(data)),
+            flush=lambda: None,
+        )
+        backend._worker.stdout = types.SimpleNamespace(
+            readline=lambda: json.dumps({"event": "done", "ok": True}) + "\n"
+        )
+
+    monkeypatch.setattr(backend, "_ensure_worker", fake_ensure_worker)
+    backend._ready = True
+
+    assert list(backend.generate_streaming("你好")) == []
+    assert env["QWEN3_TTS_ACTIVE_CP_GROUPS"] == "13"
+    assert captured["request"]["first_chunk_frames"] == 4
+
+
+def test_edgellm_worker_stateful_respects_explicit_cp_groups(monkeypatch):
+    import backends.trt_edge_llm_tts as tts_mod
+
+    monkeypatch.setenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1")
+    monkeypatch.setenv("EDGE_LLM_TTS_PERF_PROFILE", "balanced")
+    monkeypatch.setenv("QWEN3_TTS_ACTIVE_CP_GROUPS", "14")
+
+    backend = tts_mod.TRTEdgeLLMTTSBackend()
+    env = backend._worker_env()
+
+    assert env["QWEN3_TTS_ACTIVE_CP_GROUPS"] == "14"

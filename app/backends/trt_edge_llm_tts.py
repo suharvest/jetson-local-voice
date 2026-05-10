@@ -46,6 +46,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _tts_perf_profile() -> str:
+    return os.environ.get("EDGE_LLM_TTS_PERF_PROFILE", "quality").strip().lower()
+
+
+def _tts_fast_profile(profile: str) -> bool:
+    return profile in ("fast", "v2v", "low_latency")
+
+
+def _tts_balanced_or_fast_profile(profile: str) -> bool:
+    return profile in ("balanced", "fast", "v2v", "low_latency")
+
+
+def _tts_stateful_code2wav_enabled() -> bool:
+    # Stateful Code2Wav is the validated low-latency streaming path. It keeps
+    # subsequent chunks small and continuous instead of optimizing only TTFA.
+    return _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV", default=True)
+
+
 def _detect_language(text: str) -> str:
     """Simple language detection — returns config-compatible language strings."""
     for ch in text:
@@ -362,16 +380,26 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         # RTF gain, while it costs extra resident memory during dual ASR+TTS.
         env.setdefault("EDGE_LLM_TTS_CUDA_GRAPH", "0")
         env.setdefault("EDGE_LLM_TTS_LAZY_CODE2WAV", "0")
-        # Keep each streaming Code2Wav invocation within the vocoder100 fast
-        # profile: first chunk 50 frames, then 97 new frames + 3 context.
-        if _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV"):
+        env.setdefault("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1")
+        stateful_engine_dir = os.environ.get(
+            "EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR",
+            "/tmp/qwen3_code2wav_stateful_engine",
+        )
+        if os.path.isdir(stateful_engine_dir):
+            env.setdefault("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR", stateful_engine_dir)
+        if _tts_stateful_code2wav_enabled():
             env.setdefault("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", "0")
             env.setdefault("QWEN3_TTS_CP_DECODE_CUDA_GRAPH", "1")
+            env.setdefault("QWEN3_TTS_ACTIVE_CP_GROUPS", "13")
         else:
+            # Legacy stateless vocoder100 path: first chunk 50 frames, then 97
+            # new frames + 3 context.
             env.setdefault("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", "3")
         vocab_pruned = os.environ.get("EDGE_LLM_TTS_VOCAB_PRUNED")
         if vocab_pruned is not None:
             env.setdefault("QWEN3_TTS_VOCAB_PRUNED", vocab_pruned)
+        else:
+            env.setdefault("QWEN3_TTS_VOCAB_PRUNED", "0")
         return env
 
     def _worker_stderr_snip(self) -> str:
@@ -532,8 +560,16 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             default_chunk_growth_frames = 0
             default_max_chunk_frames = 97
             default_adaptive_chunks = False
-        if _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV"):
-            default_first_chunk_frames = 8
+        if _tts_stateful_code2wav_enabled():
+            perf_profile = _tts_perf_profile()
+            if _tts_fast_profile(perf_profile):
+                default_first_chunk_frames = 4
+            elif perf_profile == "balanced":
+                default_first_chunk_frames = 6
+            else:
+                # 7 frames is the smallest validated default that still gives
+                # the second chunk overlap with stateful Code2Wav on Orin Nano.
+                default_first_chunk_frames = 7
             default_chunk_frames = 10
             default_chunk_growth_frames = 0
             default_max_chunk_frames = 10

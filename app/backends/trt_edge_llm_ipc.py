@@ -103,15 +103,20 @@ TTS_TALKER_DIR = os.environ.get(
 )
 TTS_FULL_TALKER_DIR = os.environ.get("EDGE_LLM_TTS_FULL_TALKER_DIR", TTS_TALKER_DIR)
 TTS_PRUNED_TALKER_DIR = os.environ.get("EDGE_LLM_TTS_PRUNED_TALKER_DIR", TTS_TALKER_DIR)
-_TTS_VOCAB_PRUNED = os.environ.get("EDGE_LLM_TTS_VOCAB_PRUNED", os.environ.get("QWEN3_TTS_VOCAB_PRUNED", "auto")).lower()
+_TTS_VOCAB_PRUNED = os.environ.get("EDGE_LLM_TTS_VOCAB_PRUNED", os.environ.get("QWEN3_TTS_VOCAB_PRUNED", "0")).lower()
 if "EDGE_LLM_TTS_TALKER_DIR" not in os.environ:
     if _TTS_VOCAB_PRUNED in ("1", "true", "yes"):
         TTS_TALKER_DIR = TTS_PRUNED_TALKER_DIR
     elif _TTS_VOCAB_PRUNED in ("0", "false", "no"):
         TTS_TALKER_DIR = TTS_FULL_TALKER_DIR
+_TTS_DEFAULT_CODE_PREDICTOR_DIR = os.path.join(os.path.dirname(TTS_TALKER_DIR), "code_predictor")
+_TTS_BF16_IO_CODE_PREDICTOR_DIR = os.environ.get(
+    "EDGE_LLM_TTS_CP_BF16_IO_DIR",
+    "/tmp/qwen3_tts_cp_lmhead_pretranspose_0510/cp_dir",
+)
 TTS_CODE_PREDICTOR_DIR = os.environ.get(
     "EDGE_LLM_TTS_CP_DIR",
-    os.path.join(os.path.dirname(TTS_TALKER_DIR), "code_predictor"),
+    _first_existing_dir(_TTS_BF16_IO_CODE_PREDICTOR_DIR, _TTS_DEFAULT_CODE_PREDICTOR_DIR),
 )
 TTS_CODE2WAV_DIR = os.environ.get(
     "EDGE_LLM_TTS_CODE2WAV_DIR",
@@ -139,10 +144,20 @@ _ASR_OFFICIAL_PRUNED_ENGINE_DIR = os.path.expanduser(
 _ASR_DIALOG_ENGINE_DIR = os.path.expanduser(
     "~/qwen3-asr-edgellm-runtime/engines/thinker_kv512"
 )
+_ASR_FP8_EMBED_FULL_ENGINE_DIR = os.path.expanduser(
+    "~/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_fp8embed_0510"
+)
+_ASR_SMALL_FULL_ENGINE_DIR = os.path.expanduser(
+    "~/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_0510"
+)
 _ASR_EXPORT_ENGINE_DIR = os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker")
 ASR_FULL_ENGINE_DIR = os.environ.get(
     "EDGE_LLM_ASR_FULL_ENGINE_DIR",
-    _ASR_DIALOG_ENGINE_DIR
+    _ASR_FP8_EMBED_FULL_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_FP8_EMBED_FULL_ENGINE_DIR, "llm.engine"))
+    else _ASR_SMALL_FULL_ENGINE_DIR
+    if os.path.exists(os.path.join(_ASR_SMALL_FULL_ENGINE_DIR, "llm.engine"))
+    else _ASR_DIALOG_ENGINE_DIR
     if os.path.exists(os.path.join(_ASR_DIALOG_ENGINE_DIR, "llm.engine"))
     else _ASR_EXPORT_ENGINE_DIR,
 )
@@ -152,7 +167,7 @@ ASR_PRUNED_ENGINE_DIR = os.environ.get(
     if os.path.exists(os.path.join(_ASR_PRUNED_ENGINE_DIR, "llm.engine"))
     else _ASR_OFFICIAL_PRUNED_ENGINE_DIR,
 )
-_ASR_VOCAB_PRUNED = os.environ.get("EDGE_LLM_ASR_VOCAB_PRUNED", "auto").lower()
+_ASR_VOCAB_PRUNED = os.environ.get("EDGE_LLM_ASR_VOCAB_PRUNED", "0").lower()
 ASR_ENGINE_DIR = os.environ.get(
     "EDGE_LLM_ASR_ENGINE_DIR",
     ASR_PRUNED_ENGINE_DIR
