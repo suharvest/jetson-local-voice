@@ -263,6 +263,21 @@ Quality gate with multi-N8/default stayed exact:
 
 Updated decision: the previous kernel was not optimal, and multi-N8 should stay as the default HMMA path. Multi-N16 reuses more of the A tile but loses the small gain to 512-thread block occupancy/synchronization overhead, so it is kept only as `EDGE_LLM_W8A16_HMMA_MULTI_N16=1` for experiments. ASR W8 still does not beat FP16+FP8. `attn_only_w8` is now a more credible memory-pressure mode because the latency gap is about `+39ms` instead of `+66ms`, while saving roughly `200-250MB` engine size. Full W8 is still a memory-only mode: it saves about `500MB` engine size but costs about `+88ms` on the product wav.
 
+2026-05-11 ASR MLP-only INT8/W8A8 feasibility check on Orin NX:
+
+- Added experimental builder `scripts/build_qwen3_asr_thinker_mlp_int8.py`.
+- Targeted only the 84 ASR MLP MatMul layers (`/mlp/{gate,up,down}_proj/MatMul`) for TensorRT implicit INT8/PTQ; kept 112 attention MatMul layers and the lm_head conservative.
+- The ASR thinker ONNX uses external data, so the builder must use TensorRT parser-from-file rather than parsing ONNX bytes.
+- Result: TensorRT build fails before engine generation with `AttentionPlugin: could not find any supported formats consistent with input/output data types`.
+- The failure reproduces even when non-MLP MatMuls are forced FP16 and AttentionPlugin precision is pinned FP16. In implicit INT8/PTQ mode, TensorRT still propagates INT8/calibration format choices through the EdgeLLM AttentionPlugin boundary.
+
+Decision from this check: do not pursue `BuilderFlag.INT8 + IInt8EntropyCalibrator` for ASR thinker MLP-only quantization. It is not a low-effort reuse path with the current EdgeLLM AttentionPlugin graph. If W8A8 is still needed, use one of these scoped routes instead:
+
+- Explicit Q/DQ around only the MLP MatMuls, with attention plugin inputs proven FP16 by TensorRT layer info before any quality run.
+- A dedicated MLP-only W8A8 TensorRT plugin that consumes FP16 activation, performs controlled activation quantization internally, and emits FP16 output. This keeps the AttentionPlugin ABI untouched but is no longer a simple TensorRT PTQ experiment.
+
+Do not spend more time tuning calibrator data, workspace size, or synthetic-vs-real batches for the implicit INT8 path; those do not address the plugin format failure.
+
 ## TTS CP Policy
 
 Stateful Code2Wav moves the main latency bottleneck back to Talker/CP generation. The current product policy is:
