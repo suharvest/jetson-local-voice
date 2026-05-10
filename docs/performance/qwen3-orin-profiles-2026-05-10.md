@@ -43,6 +43,8 @@ ASR text: `请关闭卧室的空调。`
 | `orin-nx` | 40W | round 1 | `184.3ms` | `486.0ms` | `670.3ms` | not sampled |
 | `orin-nx` | 40W locked | round 0 | `185.1ms` | `426.4ms` | `611.5ms` | `~8.8GB` |
 | `orin-nx` | 40W locked | round 1 | `172.0ms` | `425.8ms` | `597.8ms` | `~8.8GB` |
+| `orin-nx` | 40W locked, NX-native TTS engines | round 0 | `173.0ms` | `422.7ms` | `595.8ms` | `~8.2GB` |
+| `orin-nx` | 40W locked, NX-native TTS engines | round 1 | `172.8ms` | `422.3ms` | `595.1ms` | `~8.2GB` |
 
 ### Highperf TTS-Only
 
@@ -56,6 +58,7 @@ Streaming policy: stateful Code2Wav, `first_chunk_frames=7`, `chunk_frames=10`, 
 | `orin-nano` | MAXN_SUPER | `~540-542ms` | `0.641-0.648` | Same highperf engine set |
 | `orin-nx` | 40W | `~588-591ms` | `0.702-0.711` | From-zero transferred highperf artifacts; ASR round-trip exact |
 | `orin-nx` | 40W locked | `~533-535ms` | `0.619-0.628` | `jetson_clocks` locked; nano-imported engines; ASR round-trip exact |
+| `orin-nx` | 40W locked, NX-native TTS engines | `~530-532ms` | `0.613-0.623` | NX-built Talker W8A16, CP pretranspose, and stateful Code2Wav; ASR round-trip exact |
 
 ## Official Smoke
 
@@ -70,6 +73,7 @@ Latest smoke:
 | `highperf` V2V | `orin-nano` | pass | MAXN warm `EOS -> first audio=620.0ms`, ASR text exact |
 | `highperf` V2V | `orin-nx` | pass | 40W warm `EOS -> first audio=670.3-671.5ms`, ASR text exact |
 | `highperf` V2V | `orin-nx` | pass | 40W locked warm `EOS -> first audio=597.8-611.5ms`, ASR text exact |
+| `highperf` V2V | `orin-nx` | pass | 40W locked NX-native TTS engines `EOS -> first audio=595.1-595.8ms`, ASR text exact |
 
 ## NX From-Zero Replication Log
 
@@ -145,3 +149,53 @@ Quality check:
 | --- | --- | --- |
 | `/tmp/qwen3_quality_product_set1.smoke_1.wav` | `请关闭卧室的空调。` | exact |
 | `/tmp/qwen3_profile_opt_0511_nx/highperf_tts_nx_40w_locked.smoke_1.wav` | `今天我们继续验证低延迟流式生成的效果。` | exact |
+
+### NX-Native TTS Engine Run
+
+Date: 2026-05-11.
+
+Runtime state:
+
+- `nvpmodel`: 40W mode id `4`
+- `jetson_clocks`: enabled
+- Idle before TTS run: `~11GB MemAvailable`
+
+Engine set: `nx-native-tts-0511`. These engines were built on `orin-nx` and must be preserved separately from the `nano-imported-on-nx-40w-locked` set.
+
+Build script:
+
+- Local source: `scripts/build_qwen3_nx_native_engines.sh`
+- Remote build command: `bash /tmp/build_qwen3_nx_native_engines.sh`
+- Output root: `/tmp/qwen3_native_engines_nx_0511`
+
+Built TTS engines:
+
+| Component | Path | Size | md5 |
+| --- | --- | ---: | --- |
+| Talker W8A16 output-k | `/tmp/qwen3_native_engines_nx_0511/talker_w8a16_outputk/talker_decode_w8a16_outputk.engine` | `439M` | `267e8fdfc782172c0df0eac8a92a04af` |
+| CP lm-head pretranspose | `/tmp/qwen3_native_engines_nx_0511/cp_lmhead_pretranspose/cp_dir/qwen3_tts_cp.engine` | `212M` | `b15ea75ca399a6ba39be72a59552d288` |
+| Stateful Code2Wav | `/tmp/qwen3_native_engines_nx_0511/code2wav_stateful/code2wav_stateful.engine` | `224M` | `a06f96ec00cc25351965e43c9d9f077a` |
+
+Artifacts and logs:
+
+- TTS-only output directory: `/tmp/qwen3_profile_opt_0511_nx_native`
+- TTS-only log: `/tmp/qwen3_profile_opt_0511_nx_native/tts_only_nx_native_40w_locked.log`
+- V2V log: `/tmp/qwen3_profile_opt_0511_nx_native/v2v_nx_native_40w_locked.log`
+- Quality round-trip log: `/tmp/qwen3_profile_opt_0511_nx_native/quality_roundtrip_nx_native_40w_locked.log`
+- Engine manifest: `/tmp/qwen3_native_engines_nx_0511/engine_manifest_nx_native_0511.txt`
+
+Quality check:
+
+| WAV | ASR text | Result |
+| --- | --- | --- |
+| `/tmp/qwen3_quality_product_set1.smoke_1.wav` | `请关闭卧室的空调。` | exact |
+| `/tmp/qwen3_profile_opt_0511_nx_native/highperf_tts_nx_native_40w_locked.smoke_1.wav` | `今天我们继续验证低延迟流式生成的效果。` | exact |
+
+Comparison against nano-imported TTS engines on the same locked NX runtime:
+
+| Engine set | TTS first chunk | TTS RTF | V2V EOS -> first audio |
+| --- | ---: | ---: | ---: |
+| `nano-imported-on-nx-40w-locked` | `~533-535ms` | `0.619-0.628` | `597.8-611.5ms` |
+| `nx-native-tts-0511` | `~530-532ms` | `0.613-0.623` | `595.1-595.8ms` |
+
+Conclusion: NX-native TTS engine rebuild is valid and slightly faster, but the gain is small (`~2-4ms` on TTS first chunk and about `2-3ms` on the best V2V run). The main performance jump was still the runtime state (`40W` + `jetson_clocks`) rather than tactic rebuild alone.

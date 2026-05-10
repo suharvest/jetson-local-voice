@@ -186,7 +186,7 @@ Current Orin 8GB frozen baseline, MAXN_SUPER:
 | Qwen3 highperf TTS-only | warm first chunk | `~540ms` |
 | Qwen3 highperf TTS-only | RTF | `0.64-0.65` |
 | Qwen3 highperf memory | dual-resident minimum `MemAvailable` | `~759-850MB` |
-| Qwen3 highperf NX 40W locked | warm `EOS -> first audio` | `~598-612ms` |
+| Qwen3 highperf NX-native 40W locked | warm `EOS -> first audio` | `~595-596ms` |
 
 Detailed artifacts, engine md5s, and quality results are in [`docs/plans/qwen3-current-frozen-baseline-2026-05-10.md`](docs/plans/qwen3-current-frozen-baseline-2026-05-10.md). Cross-device performance and replication notes are tracked in [`docs/performance/qwen3-orin-profiles-2026-05-10.md`](docs/performance/qwen3-orin-profiles-2026-05-10.md). The ASR and TTS plugin paths are intentionally separate in the frozen baseline: the TTS highperf plugin is not a drop-in replacement for the ASR plugin until its ASR Attention/FMHA path is separately validated.
 
