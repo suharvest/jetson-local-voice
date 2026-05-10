@@ -90,6 +90,7 @@ docker compose build && docker compose up -d
 
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
+- [Qwen3 Multilanguage Paths](#qwen3-multilanguage-paths)
 - [API Reference](#api-reference)
 - [Performance](#performance)
 - [Configuration](#configuration)
@@ -137,6 +138,62 @@ Models are selected automatically based on `LANGUAGE_MODE`:
 | Qwen3 (multilanguage) | ❌ | ❌ | ✅ (x-vector) | 52 | ✅ |
 
 The service is model-agnostic at the API level — clients send audio/text, get audio/text back. Swap models without changing client code. Unsupported parameters return `501` with `{"required_capability": "..."}`.
+
+## Qwen3 Multilanguage Paths
+
+Qwen3-ASR and Qwen3-TTS have two maintained runtime profiles. They share the same API surface; select the profile with `EDGE_LLM_QWEN3_PROFILE`.
+
+| Profile | Goal | Default behavior |
+|---------|------|------------------|
+| `official` | Minimal-diff EdgeLLM example path. Keep it close enough to upstream that it can be reviewed or upstreamed as an official Qwen3 ASR/TTS example. | Only semantic/correctness fixes belong here: tokenizer/control-token layout, sampling semantics, runtime contract fixes, and stream callback correctness. It uses regular exported Talker/CodePredictor/Code2Wav directories and does not enable our Orin memory/latency strategies by default. |
+| `highperf` | Product low-latency dual-resident path for our Orin deployment. | Full ASR/TTS vocab, ASR FP8 embedding directory when present, TTS W8A16 Talker support, CP BF16 I/O + `lm_head` pretranspose, stateful Code2Wav, CP decode CUDA graph, `ACTIVE_CP_GROUPS=13`. |
+
+The repo default is `highperf` for Qwen3 because it is the measured product path. Use `official` when preparing or validating an EdgeLLM-upstream-compatible example:
+
+Branch ownership:
+
+- EdgeLLM official/minimal branch: `official-qwen3-tts-upstream-runtime` in the EdgeLLM fork.
+- Split upstream PR branches: `pr-jetson-build-compat`, `pr-export-builder-robustness`, `pr-qwen3-tts-runtime-correctness`.
+- Jetson Voice integration branch for that minimal official backend: `product-qwen3-tts-official-backend`.
+- Jetson Voice high-performance/product branch: `qwen3tts-accurate-20260507`.
+
+```bash
+EDGE_LLM_QWEN3_PROFILE=official \
+EDGE_LLM_TTS_BACKEND=edgellm_worker \
+EDGE_LLM_ASR_VOCAB_PRUNED=0 \
+EDGE_LLM_TTS_VOCAB_PRUNED=0 \
+uvicorn app.main:app --host 0.0.0.0 --port 8621
+```
+
+Use the high-performance path for Orin low-latency V2V:
+
+```bash
+EDGE_LLM_QWEN3_PROFILE=highperf \
+EDGE_LLM_TTS_BACKEND=edgellm_worker \
+EDGE_LLM_TTS_STATEFUL_CODE2WAV=1 \
+EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR=/tmp/qwen3_code2wav_stateful_engine \
+EDGE_LLM_TTS_CP_BF16_IO_DIR=/tmp/qwen3_tts_cp_lmhead_pretranspose_0510/cp_dir \
+EDGE_LLM_ASR_VOCAB_PRUNED=0 \
+EDGE_LLM_TTS_VOCAB_PRUNED=0 \
+uvicorn app.main:app --host 0.0.0.0 --port 8621
+```
+
+Current Orin 8GB frozen baseline, MAXN_SUPER:
+
+| Path | Metric | Result |
+|------|--------|--------|
+| Qwen3 highperf dual-resident V2V | warm `EOS -> first audio` | `~620ms` |
+| Qwen3 highperf TTS-only | warm first chunk | `~540ms` |
+| Qwen3 highperf TTS-only | RTF | `0.64-0.65` |
+| Qwen3 highperf memory | dual-resident minimum `MemAvailable` | `~759-850MB` |
+| Qwen3 highperf NX replication | warm `EOS -> first audio` | `~670ms` |
+
+Detailed artifacts, engine md5s, and quality results are in [`docs/plans/qwen3-current-frozen-baseline-2026-05-10.md`](docs/plans/qwen3-current-frozen-baseline-2026-05-10.md). Cross-device performance and replication notes are tracked in [`docs/performance/qwen3-orin-profiles-2026-05-10.md`](docs/performance/qwen3-orin-profiles-2026-05-10.md). The ASR and TTS plugin paths are intentionally separate in the frozen baseline: the TTS highperf plugin is not a drop-in replacement for the ASR plugin until its ASR Attention/FMHA path is separately validated.
+
+Regression scope:
+
+- `official`: semantic correctness and upstream-compatibility checks only. It should stay small and reviewable; do not add W8A16, FP8 embedding, pruned/full-vocab policy changes, stateful Code2Wav, CP graph, or engine-specific Orin tuning here.
+- `highperf`: full product regression, including Qwen3 ASR + Qwen3 TTS dual residency, V2V latency, memory floor, and ASR round-trip quality. This is where our Orin-specific memory and latency work belongs.
 
 ## API Reference
 

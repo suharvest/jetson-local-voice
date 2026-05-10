@@ -351,7 +351,7 @@ Custom BF16 GEMV operator probe:
 
 Fused MLP plugin probe:
 
-- Added a prototype `Qwen3TtsCpMlpPlugin` in the EdgeLLM highperf tree plus `scripts/insert_qwen3_tts_cp_mlp_plugin.py`.
+- Built a prototype `Qwen3TtsCpMlpPlugin` in the EdgeLLM highperf tree plus an ONNX rewrite script during the investigation. The code is intentionally not kept in the active repo path because the result was a negative prototype.
 - The plugin replaces each layer's `down_proj(silu(gate_proj(x)) * up_proj(x))` with one custom node and uses cuBLAS BF16 GEMMs plus a small SwiGLU kernel.
 - Standalone fixed-shape MLP block looked promising: `~0.256ms/layer` after correcting stream dependencies, versus rough TRT layer-profile MLP sum above `0.33ms/layer`.
 - Engine build succeeded and TensorRT imported all five plugin nodes. Artifact:
@@ -361,7 +361,7 @@ Fused MLP plugin probe:
   - baseline BF16 I/O aux1: GPU compute `2.53ms`, enqueue `0.50ms`
   - MLP plugin with internal aux streams: GPU compute `6.07ms`, enqueue `1.31ms`
   - MLP plugin single-stream cuBLAS: GPU compute `5.87ms`, enqueue `1.20ms`
-- Conclusion: cuBLAS inside a TensorRT plugin is not a viable CP decode optimization here. It loses TensorRT's native scheduling/tactic advantages and adds plugin enqueue/dispatch overhead. Do not quality-gate or deploy this engine; keep it only as a negative prototype.
+- Conclusion: cuBLAS inside a TensorRT plugin is not a viable CP decode optimization here. It loses TensorRT's native scheduling/tactic advantages and adds plugin enqueue/dispatch overhead. Do not quality-gate, deploy, or carry this plugin in the maintained code path.
 - Next custom-op work should avoid cuBLAS-in-plugin for CP decode. Only a true TensorRT-integrated tactic/plugin using Tensor Core kernels directly, or a larger graph-level change that preserves sampling semantics, is worth more effort.
 
 LM head pre-transpose graph optimization:

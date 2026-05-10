@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${JETSON_VOICE_APP_DIR:-/tmp/jetson-voice-current/app}"
+WAV="${1:-/tmp/qwen3_quality_product_set1.smoke_1.wav}"
+BENCH_SCRIPT="${QWEN3_V2V_BENCH_SCRIPT:-/tmp/tmp_benchmark_trt_edgellm_direct_v2v_0509.py}"
+
+export EDGE_LLM_QWEN3_PROFILE="${EDGE_LLM_QWEN3_PROFILE:-highperf}"
+
+export EDGE_LLM_ASR_WORKER="${EDGE_LLM_ASR_WORKER:-1}"
+export EDGE_LLM_ASR_WORKER_BIN="${EDGE_LLM_ASR_WORKER_BIN:-/tmp/qwen3_highperf_bin/qwen3_asr_worker}"
+export EDGE_LLM_ASR_PLUGIN_PATH="${EDGE_LLM_ASR_PLUGIN_PATH:-/tmp/qwen3_highperf_bin/libNvInfer_edgellm_plugin_asr.so}"
+export EDGE_LLM_ASR_ENGINE_DIR="${EDGE_LLM_ASR_ENGINE_DIR:-/home/harvest/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_fp8embed_0510}"
+export EDGE_LLM_ASR_AUDIO_ENC_DIR="${EDGE_LLM_ASR_AUDIO_ENC_DIR:-/home/harvest/qwen3-asr-trt-edge-llm-export/engines/audio_encoder}"
+export EDGE_LLM_ASR_VOCAB_PRUNED="${EDGE_LLM_ASR_VOCAB_PRUNED:-0}"
+export EDGE_LLM_ASR_WORKER_WARMUP="${EDGE_LLM_ASR_WORKER_WARMUP:-1}"
+
+export EDGE_LLM_TTS_WORKER="${EDGE_LLM_TTS_WORKER:-1}"
+export EDGE_LLM_TTS_WORKER_BIN="${EDGE_LLM_TTS_WORKER_BIN:-/tmp/qwen3_highperf_bin/qwen3_tts_worker}"
+export EDGELLM_PLUGIN_PATH="${EDGELLM_PLUGIN_PATH:-/tmp/qwen3_highperf_bin/libNvInfer_edgellm_plugin.so}"
+export EDGE_LLM_TTS_TALKER_DIR="${EDGE_LLM_TTS_TALKER_DIR:-/tmp/qwen3tts_ref_0507_from_nano/talker_text_embedding_fp8_0510}"
+export EDGE_LLM_TTS_TALKER_ENGINE="${EDGE_LLM_TTS_TALKER_ENGINE:-/tmp/qwen3_talker_decode_w8a16_outputk_0510/talker_decode_w8a16_outputk.engine}"
+export EDGE_LLM_TTS_TOKENIZER_DIR="${EDGE_LLM_TTS_TOKENIZER_DIR:-/home/harvest/qwen3-tts-trt-edge-llm-export}"
+export EDGE_LLM_TTS_CODE2WAV_DIR="${EDGE_LLM_TTS_CODE2WAV_DIR:-/home/harvest/qwen3-tts-trt-edge-llm-export/tokenizer_decoder}"
+export EDGE_LLM_TTS_CP_DIR="${EDGE_LLM_TTS_CP_DIR:-/tmp/qwen3_tts_cp_lmhead_pretranspose_0510/cp_dir}"
+export EDGE_LLM_TTS_STATEFUL_CODE2WAV="${EDGE_LLM_TTS_STATEFUL_CODE2WAV:-1}"
+export EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR="${EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR:-/tmp/qwen3_code2wav_stateful_engine}"
+export EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES="${EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES:-0}"
+export EDGE_LLM_TTS_CUDA_GRAPH="${EDGE_LLM_TTS_CUDA_GRAPH:-0}"
+export EDGE_LLM_TTS_LAZY_CODE2WAV="${EDGE_LLM_TTS_LAZY_CODE2WAV:-0}"
+export EDGE_LLM_TTS_VOCAB_PRUNED="${EDGE_LLM_TTS_VOCAB_PRUNED:-0}"
+export QWEN3_TTS_ACTIVE_CP_GROUPS="${QWEN3_TTS_ACTIVE_CP_GROUPS:-13}"
+export QWEN3_TTS_CP_DECODE_CUDA_GRAPH="${QWEN3_TTS_CP_DECODE_CUDA_GRAPH:-1}"
+export EDGE_LLM_TTS_FIRST_CHUNK_FRAMES="${EDGE_LLM_TTS_FIRST_CHUNK_FRAMES:-7}"
+export EDGE_LLM_TTS_CHUNK_FRAMES="${EDGE_LLM_TTS_CHUNK_FRAMES:-10}"
+export EDGE_LLM_TTS_MAX_CHUNK_FRAMES="${EDGE_LLM_TTS_MAX_CHUNK_FRAMES:-10}"
+
+cd "$APP_DIR"
+export PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 "$BENCH_SCRIPT" "$WAV"

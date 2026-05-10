@@ -506,6 +506,51 @@ def test_edgellm_worker_legacy_v2v_profile_uses_first_frame_fast_window(monkeypa
     assert captured["request"]["adaptive_chunks"] is False
 
 
+def test_edgellm_worker_official_profile_uses_upstream_like_streaming_defaults(monkeypatch):
+    import backends.trt_edge_llm_tts as tts_mod
+
+    captured = {}
+
+    class FakeWorker:
+        stdin = None
+        stdout = None
+
+    monkeypatch.setenv("EDGE_LLM_QWEN3_PROFILE", "official")
+    monkeypatch.delenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_FIRST_CHUNK_FRAMES", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_CHUNK_FRAMES", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_MAX_CHUNK_FRAMES", raising=False)
+    monkeypatch.delenv("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", raising=False)
+    monkeypatch.delenv("QWEN3_TTS_CP_DECODE_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("QWEN3_TTS_ACTIVE_CP_GROUPS", raising=False)
+    monkeypatch.setattr(tts_mod, "qwen3_highperf_enabled", lambda: False)
+
+    backend = tts_mod.TRTEdgeLLMTTSBackend()
+    env = backend._worker_env()
+
+    def fake_ensure_worker():
+        backend._worker = FakeWorker()
+        backend._worker.stdin = types.SimpleNamespace(
+            write=lambda data: captured.setdefault("request", json.loads(data)),
+            flush=lambda: None,
+        )
+        backend._worker.stdout = types.SimpleNamespace(
+            readline=lambda: json.dumps({"event": "done", "ok": True}) + "\n"
+        )
+
+    monkeypatch.setattr(backend, "_ensure_worker", fake_ensure_worker)
+    backend._ready = True
+
+    assert list(backend.generate_streaming("你好")) == []
+    assert env["EDGE_LLM_TTS_STATEFUL_CODE2WAV"] == "0"
+    assert env["EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES"] == "3"
+    assert "QWEN3_TTS_CP_DECODE_CUDA_GRAPH" not in env
+    assert "QWEN3_TTS_ACTIVE_CP_GROUPS" not in env
+    assert captured["request"]["first_chunk_frames"] == 50
+    assert captured["request"]["chunk_frames"] == 97
+    assert captured["request"]["max_chunk_frames"] == 97
+
+
 def test_edgellm_worker_stateful_profile_uses_small_continuous_chunks(monkeypatch):
     import backends.trt_edge_llm_tts as tts_mod
 

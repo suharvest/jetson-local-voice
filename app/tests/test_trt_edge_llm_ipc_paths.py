@@ -67,6 +67,21 @@ def test_tts_code_predictor_prefers_bf16_io_dir_when_present(monkeypatch, tmp_pa
     assert ipc.TTS_CODE_PREDICTOR_DIR == str(bf16_io_dir)
 
 
+def test_tts_code_predictor_uses_official_dir_in_official_profile(monkeypatch, tmp_path):
+    bf16_io_dir = tmp_path / "cp_bf16_io"
+    default_talker = tmp_path / "runtime" / "engines" / "talker"
+    bf16_io_dir.mkdir(parents=True)
+    default_talker.mkdir(parents=True)
+    monkeypatch.delenv("EDGE_LLM_TTS_CP_DIR", raising=False)
+    monkeypatch.setenv("EDGE_LLM_QWEN3_PROFILE", "official")
+    monkeypatch.setenv("EDGE_LLM_TTS_CP_BF16_IO_DIR", str(bf16_io_dir))
+    monkeypatch.setenv("EDGE_LLM_TTS_TALKER_DIR", str(default_talker))
+
+    ipc = _reload_ipc(monkeypatch)
+
+    assert ipc.TTS_CODE_PREDICTOR_DIR == str(tmp_path / "runtime" / "engines" / "code_predictor")
+
+
 def test_tts_vocab_pruned_selects_configured_talker_dir(monkeypatch, tmp_path):
     full_dir = tmp_path / "talker_full"
     pruned_dir = tmp_path / "talker_pruned"

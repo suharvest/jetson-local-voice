@@ -45,6 +45,16 @@ _VOICE_WORKER_BUILD = os.environ.get(
 )
 
 
+QWEN3_RUNTIME_PROFILE = os.environ.get(
+    "EDGE_LLM_QWEN3_PROFILE",
+    os.environ.get("JETSON_VOICE_QWEN3_PROFILE", "highperf"),
+).strip().lower().replace("-", "_")
+
+
+def qwen3_highperf_enabled() -> bool:
+    return QWEN3_RUNTIME_PROFILE in ("highperf", "perf", "performance", "v2v")
+
+
 def _prefer_existing(primary: str, fallback: str) -> str:
     return primary if os.path.exists(primary) else fallback
 
@@ -116,7 +126,9 @@ _TTS_BF16_IO_CODE_PREDICTOR_DIR = os.environ.get(
 )
 TTS_CODE_PREDICTOR_DIR = os.environ.get(
     "EDGE_LLM_TTS_CP_DIR",
-    _first_existing_dir(_TTS_BF16_IO_CODE_PREDICTOR_DIR, _TTS_DEFAULT_CODE_PREDICTOR_DIR),
+    _first_existing_dir(_TTS_BF16_IO_CODE_PREDICTOR_DIR, _TTS_DEFAULT_CODE_PREDICTOR_DIR)
+    if qwen3_highperf_enabled()
+    else _TTS_DEFAULT_CODE_PREDICTOR_DIR,
 )
 TTS_CODE2WAV_DIR = os.environ.get(
     "EDGE_LLM_TTS_CODE2WAV_DIR",

@@ -33,6 +33,8 @@ from backends.trt_edge_llm_ipc import (
     TTS_CODE2WAV_DIR,
     TTS_TOKENIZER_DIR,
     PLUGIN_PATH,
+    QWEN3_RUNTIME_PROFILE,
+    qwen3_highperf_enabled,
     run_binary,
 )
 
@@ -61,7 +63,7 @@ def _tts_balanced_or_fast_profile(profile: str) -> bool:
 def _tts_stateful_code2wav_enabled() -> bool:
     # Stateful Code2Wav is the validated low-latency streaming path. It keeps
     # subsequent chunks small and continuous instead of optimizing only TTFA.
-    return _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV", default=True)
+    return _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV", default=qwen3_highperf_enabled())
 
 
 def _detect_language(text: str) -> str:
@@ -362,7 +364,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             )
 
         logger.info(
-            "TTS backend preload OK (binary=%s talker=%s)",
+            "TTS backend preload OK (profile=%s binary=%s talker=%s)",
+            QWEN3_RUNTIME_PROFILE,
             TTS_WORKER_BINARY if self._use_worker() else TTS_BINARY,
             TTS_TALKER_DIR,
         )
@@ -380,7 +383,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         # RTF gain, while it costs extra resident memory during dual ASR+TTS.
         env.setdefault("EDGE_LLM_TTS_CUDA_GRAPH", "0")
         env.setdefault("EDGE_LLM_TTS_LAZY_CODE2WAV", "0")
-        env.setdefault("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1")
+        env.setdefault("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1" if qwen3_highperf_enabled() else "0")
         stateful_engine_dir = os.environ.get(
             "EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR",
             "/tmp/qwen3_code2wav_stateful_engine",
