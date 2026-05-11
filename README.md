@@ -149,8 +149,11 @@ The service is model-agnostic at the API level — clients send audio/text, get 
 Qwen3-ASR and Qwen3-TTS are exposed to Jetson Voice as the `multilanguage`
 mode. The product service stays in this repository; Qwen-specific export,
 engine build, worker/runtime glue, and performance scripts should live in the
-standalone Qwen project. Large model artifacts should live in the Hugging Face
-artifact repository described by [`deploy/artifacts/qwen3_manifest.json`](deploy/artifacts/qwen3_manifest.json).
+standalone Qwen project
+[`suharvest/qwen3-edgellm-jetson`](https://github.com/suharvest/qwen3-edgellm-jetson).
+Large model artifacts live in the Hugging Face artifact repository
+[`harvestsu/qwen3-edgellm-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-edgellm-jetson-artifacts)
+described by [`deploy/artifacts/qwen3_manifest.json`](deploy/artifacts/qwen3_manifest.json).
 
 For deployment, prefer selecting one JSON profile:
 
