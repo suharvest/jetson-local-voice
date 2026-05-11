@@ -1,6 +1,6 @@
 {
   "name": "multilanguage-qwen-highperf-nx",
-  "description": "Qwen3 ASR + Qwen3 TTS high-performance dual-resident profile for Jetson Voice on Orin NX.",
+  "description": "Qwen3 ASR + Qwen3 TTS high-performance dual-resident profile for Jetson Voice on Orin NX. Engine paths use ${QWEN3_ARTIFACT_ROOT} so the operator can override the artifact location (e.g. fallback to ~/qwen3-models when /opt/models needs sudo).",
   "artifact_set": "orin-nx-highperf-2026-05-11",
   "env": {
     "LANGUAGE_MODE": "multilanguage",
@@ -20,15 +20,15 @@
     "QWEN3_ARTIFACT_MANIFEST": "deploy/artifacts/qwen3_manifest.json",
     "QWEN3_ARTIFACT_SET": "orin-nx-highperf-2026-05-11",
     "QWEN3_ARTIFACT_ROOT": "/opt/models/qwen3-edgellm",
-    "EDGE_LLM_ASR_ENGINE_DIR": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_thinker_full_fp8embed",
-    "EDGE_LLM_ASR_AUDIO_ENC_DIR": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_audio_encoder",
-    "EDGE_LLM_TTS_TALKER_DIR": "/opt/models/qwen3-edgellm/tts/talker",
+    "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/asr_thinker_full_fp8embed",
+    "EDGE_LLM_ASR_AUDIO_ENC_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/asr_audio_encoder",
+    "EDGE_LLM_TTS_TALKER_DIR": "${QWEN3_ARTIFACT_ROOT}/tts/talker",
     "EDGE_LLM_TTS_TALKER_BACKEND": "qwen3_tts_explicit_kv",
-    "EDGE_LLM_TTS_TALKER_ENGINE": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/talker_w8a16_outputk/talker_decode_w8a16_outputk.engine",
-    "EDGE_LLM_TTS_CP_DIR": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/code_predictor/cp_dir",
-    "EDGE_LLM_TTS_CP_BF16_IO_DIR": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/code_predictor/cp_dir",
-    "EDGE_LLM_TTS_CODE2WAV_DIR": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/code2wav_stateful",
-    "EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR": "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/code2wav_stateful",
-    "EDGE_LLM_TTS_TOKENIZER_DIR": "/opt/models/qwen3-edgellm/tts/tokenizer"
+    "EDGE_LLM_TTS_TALKER_ENGINE": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/talker_w8a16_outputk/talker_decode_w8a16_outputk.engine",
+    "EDGE_LLM_TTS_CP_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/code_predictor/cp_dir",
+    "EDGE_LLM_TTS_CP_BF16_IO_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/code_predictor/cp_dir",
+    "EDGE_LLM_TTS_CODE2WAV_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/code2wav_stateful",
+    "EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/code2wav_stateful",
+    "EDGE_LLM_TTS_TOKENIZER_DIR": "${QWEN3_ARTIFACT_ROOT}/tts/tokenizer"
   }
 }

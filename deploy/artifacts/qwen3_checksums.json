@@ -1,0 +1,30 @@
+{
+  "artifact_sets": {
+    "orin-nano-highperf-2026-05-10": {
+      "files": {
+        "tts/speaker_encoder/speaker_encoder.onnx": {
+          "sha256": "544da28fd7463a3fd722d54630fe39b730376b6aee850ca66845ee981e87a40f",
+          "size_bytes": 35588164
+        }
+      }
+    },
+    "orin-nano-official-2026-05-10": {
+      "files": {
+        "tts/speaker_encoder/speaker_encoder.onnx": {
+          "sha256": "544da28fd7463a3fd722d54630fe39b730376b6aee850ca66845ee981e87a40f",
+          "size_bytes": 35588164
+        }
+      }
+    },
+    "orin-nx-highperf-2026-05-11": {
+      "files": {
+        "tts/speaker_encoder/speaker_encoder.onnx": {
+          "sha256": "544da28fd7463a3fd722d54630fe39b730376b6aee850ca66845ee981e87a40f",
+          "size_bytes": 35588164
+        }
+      }
+    }
+  },
+  "description": "SHA-256 sidecar for Qwen3 artifact sets. Populate by running scripts/deploy_qwen3_artifacts.py --generate-sidecar --set <set> against a successfully downloaded artifact root. Verify with --verify-sha256. Empty 'files' maps mean the set has no recorded checksums yet; --verify-sha256 will treat that set as 'no enforcement'.",
+  "schema_version": 1
+}

@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# HISTORICAL — captures the env used during the 2026-05-09/10 V2V profiling
+# session on the Nano. Defaults point at /tmp/ and /home/harvest/ paths that
+# only existed on that workstation. For fresh reproduction prefer:
+#   - runtime binaries: ~/project/jetson-voice/build/edgellm_voice_worker/workers/
+#   - plugin .so:       ~/project/tensorrt-edge-llm/build_sm87/libNvInfer_edgellm_plugin.so
+#   - artifact root:    /opt/models/qwen3-edgellm  (populated via
+#                       scripts/deploy_qwen3_artifacts.py --set <set>)
+# All variables below are overridable; export the ones you need before running.
 set -euo pipefail
 
 APP_DIR="${JETSON_VOICE_APP_DIR:-/tmp/jetson-voice-current/app}"

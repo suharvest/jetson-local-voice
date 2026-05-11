@@ -45,7 +45,11 @@ def apply_profile_from_env() -> dict:
     applied = []
     for key, value in env_defaults.items():
         if key not in os.environ or os.environ.get(key) == "":
-            os.environ[key] = str(value)
+            # Allow profiles to reference other env vars via ${VAR} or $VAR
+            # so paths like "${QWEN3_ARTIFACT_ROOT}/engines/..." resolve at
+            # apply time. Falls back to literal pass-through when the value
+            # has no expansions.
+            os.environ[key] = os.path.expandvars(str(value))
             applied.append(key)
 
     os.environ.setdefault("JETSON_VOICE_PROFILE_NAME", profile.get("name", path.stem))

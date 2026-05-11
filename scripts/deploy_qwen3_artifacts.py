@@ -8,6 +8,7 @@ Jetson Voice deployable from a JSON profile plus a Hugging Face artifact repo.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -42,8 +43,114 @@ def required_paths(manifest: dict, set_name: str, root_override: str | None) -> 
     return root, paths
 
 
+def warn_root_writable(root: Path) -> None:
+    """If `root` cannot be written by the current user, print the canonical
+    workaround so the operator does not have to re-run the script with sudo."""
+    target = root if root.exists() else root.parent
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        default_root = "/opt/models/qwen3-edgellm"
+        print(
+            f"WARN: cannot write to {root}. The default profiles expect "
+            f"{default_root}; if you can't sudo, re-run with `--root "
+            f"$HOME/qwen3-models` and start jetson-voice with "
+            f"`QWEN3_ARTIFACT_ROOT=$HOME/qwen3-models`. "
+            f"Profiles in configs/profiles/multilanguage-qwen-*.json now "
+            f"resolve every engine path via that variable.",
+            file=sys.stderr,
+        )
+
+
 def verify(paths: list[Path]) -> list[Path]:
     return [path for path in paths if not path.exists()]
+
+
+_SHA256_BUF = 1 << 20  # 1 MiB
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(_SHA256_BUF)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def default_checksum_path(manifest_path: Path) -> Path:
+    return manifest_path.parent / "qwen3_checksums.json"
+
+
+def load_checksums(path: Path) -> dict:
+    if not path.exists():
+        return {"schema_version": 1, "artifact_sets": {}}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_checksums(path: Path, data: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def relative_keys(manifest: dict, set_name: str) -> list[str]:
+    return list(manifest["artifact_sets"][set_name].get("required_files", []))
+
+
+def verify_checksums(
+    checksums: dict, set_name: str, root: Path, rel_keys: list[str]
+) -> tuple[int, list[tuple[str, str]]]:
+    """Return (checked_count, mismatches). mismatches: list of (rel, reason)."""
+    set_entry = checksums.get("artifact_sets", {}).get(set_name) or {}
+    files = set_entry.get("files") or {}
+    if not files:
+        return 0, []
+    mismatches: list[tuple[str, str]] = []
+    checked = 0
+    for rel in rel_keys:
+        meta = files.get(rel)
+        if not meta:
+            continue
+        path = root / rel
+        if not path.exists():
+            mismatches.append((rel, "missing"))
+            continue
+        expected_size = meta.get("size_bytes")
+        if expected_size is not None and path.stat().st_size != expected_size:
+            mismatches.append((rel, f"size mismatch: got {path.stat().st_size}, want {expected_size}"))
+            continue
+        expected_sha = meta.get("sha256")
+        if expected_sha:
+            actual = sha256_file(path)
+            if actual != expected_sha:
+                mismatches.append((rel, f"sha256 mismatch: got {actual}, want {expected_sha}"))
+                continue
+        checked += 1
+    return checked, mismatches
+
+
+def generate_sidecar(
+    checksums: dict, set_name: str, root: Path, rel_keys: list[str]
+) -> dict:
+    files: dict[str, dict] = {}
+    for rel in rel_keys:
+        path = root / rel
+        if not path.exists():
+            print(f"  skip (missing): {rel}", file=sys.stderr)
+            continue
+        files[rel] = {
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        print(f"  {rel} -> {files[rel]['sha256'][:12]}... ({files[rel]['size_bytes']} bytes)")
+    checksums.setdefault("schema_version", 1)
+    checksums.setdefault("artifact_sets", {})
+    checksums["artifact_sets"][set_name] = {"files": files}
+    return checksums
 
 
 def snapshot_download(manifest: dict, set_name: str, root: Path) -> None:
@@ -99,30 +206,85 @@ def main() -> int:
     parser.add_argument("--set", dest="set_name", default=os.environ.get("QWEN3_ARTIFACT_SET") or "orin-nano-highperf-2026-05-10")
     parser.add_argument("--root", default=os.environ.get("QWEN3_ARTIFACT_ROOT"))
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--checksums",
+        default=os.environ.get("QWEN3_ARTIFACT_CHECKSUMS"),
+        help="Path to checksum sidecar JSON (default: <manifest dir>/qwen3_checksums.json)",
+    )
+    parser.add_argument(
+        "--verify-sha256",
+        action="store_true",
+        help="Verify SHA-256 (and recorded size) of every required file present in the sidecar.",
+    )
+    parser.add_argument(
+        "--generate-sidecar",
+        action="store_true",
+        help="Walk the artifact root, compute SHA-256 for each required file, and (over)write the sidecar entry for the selected set.",
+    )
     args = parser.parse_args()
 
     manifest = load_manifest(args.manifest)
+    manifest_path = resolve_path(args.manifest)
+    checksum_path = Path(args.checksums) if args.checksums else default_checksum_path(manifest_path)
     root, paths = required_paths(manifest, args.set_name, args.root)
-    missing = verify(paths)
-    if not missing:
-        print(f"Qwen3 artifact set {args.set_name} OK at {root}")
+    rel_keys = relative_keys(manifest, args.set_name)
+    warn_root_writable(root)
+
+    if args.generate_sidecar:
+        missing = verify(paths)
+        if missing:
+            print(
+                f"--generate-sidecar requires all required files present; missing {len(missing)} file(s):",
+                file=sys.stderr,
+            )
+            for path in missing:
+                print(f"  {path}", file=sys.stderr)
+            return 4
+        print(f"Generating SHA-256 sidecar for {args.set_name} at {root}")
+        checksums = load_checksums(checksum_path)
+        generate_sidecar(checksums, args.set_name, root, rel_keys)
+        write_checksums(checksum_path, checksums)
+        print(f"Wrote {checksum_path}")
         return 0
 
-    print(f"Qwen3 artifact set {args.set_name} missing {len(missing)} file(s):")
-    for path in missing:
-        print(f"  {path}")
-
-    if args.check_only:
-        return 2
-
-    snapshot_download(manifest, args.set_name, root)
     missing = verify(paths)
     if missing:
-        print("Qwen3 artifact download completed but required files are still missing:", file=sys.stderr)
+        print(f"Qwen3 artifact set {args.set_name} missing {len(missing)} file(s):")
         for path in missing:
-            print(f"  {path}", file=sys.stderr)
-        return 3
-    print(f"Qwen3 artifact set {args.set_name} downloaded to {root}")
+            print(f"  {path}")
+        if args.check_only:
+            return 2
+        snapshot_download(manifest, args.set_name, root)
+        missing = verify(paths)
+        if missing:
+            print("Qwen3 artifact download completed but required files are still missing:", file=sys.stderr)
+            for path in missing:
+                print(f"  {path}", file=sys.stderr)
+            return 3
+        print(f"Qwen3 artifact set {args.set_name} downloaded to {root}")
+    else:
+        print(f"Qwen3 artifact set {args.set_name} OK at {root}")
+
+    if args.verify_sha256:
+        checksums = load_checksums(checksum_path)
+        checked, mismatches = verify_checksums(checksums, args.set_name, root, rel_keys)
+        if mismatches:
+            print(
+                f"SHA-256 verification failed for {args.set_name}: {len(mismatches)} mismatch(es):",
+                file=sys.stderr,
+            )
+            for rel, reason in mismatches:
+                print(f"  {rel}: {reason}", file=sys.stderr)
+            return 5
+        if checked == 0:
+            print(
+                f"SHA-256 sidecar has no entries for {args.set_name}; nothing to verify. "
+                f"Run --generate-sidecar on a trusted machine to populate {checksum_path}.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"SHA-256 verified {checked} file(s) for {args.set_name}.")
+
     return 0
 
 

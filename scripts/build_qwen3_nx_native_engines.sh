@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
+# HISTORICAL — script used to build the orin-nx-highperf-2026-05-11 engines on
+# the NX. ONNX/sidecar source paths below (/tmp/qwen3_talker_decode_*, /tmp/
+# qwen3_tts_cp_*, etc.) were the build-time outputs of that session and are NOT
+# expected to exist on a fresh checkout. Re-run only after re-exporting the
+# matching ONNX with scripts/export_qwen3_tts_onnx.sh and friends.
+# For PLUGIN, the canonical source-build path is
+# ~/project/tensorrt-edge-llm/build_sm87/libNvInfer_edgellm_plugin.so .
 set -euo pipefail
 
 TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
-PLUGIN="${EDGELLM_PLUGIN_PATH:-/tmp/qwen3_highperf_bin/libNvInfer_edgellm_plugin.so}"
+PLUGIN="${EDGELLM_PLUGIN_PATH:-$HOME/project/tensorrt-edge-llm/build_sm87/libNvInfer_edgellm_plugin.so}"
 ROOT="${QWEN3_NX_ENGINE_ROOT:-/tmp/qwen3_native_engines_nx_0511}"
 
 TALKER_SRC="/tmp/qwen3_talker_decode_w8a16_outputk_0510"

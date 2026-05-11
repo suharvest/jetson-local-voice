@@ -234,9 +234,21 @@ def add_profile(builder, network, config, max_input_len: int, max_kv: int, opt_i
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    # NOTE: --onnx, --out-dir defaults reflect the 2026-05-11 build session and
+    # may not exist on a fresh checkout. Pass --onnx/--out-dir explicitly.
+    # --plugin default points at the canonical source-build location; override
+    # via EDGE_LLM_ASR_PLUGIN_PATH or pass --plugin if your build lives elsewhere.
     ap.add_argument("--onnx", default="/home/harvest/tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/onnx-src/thinker/model.onnx")
     ap.add_argument("--out-dir", default="/tmp/qwen3_asr_thinker_mlp_int8_0511")
-    ap.add_argument("--plugin", default="/tmp/qwen3_highperf_bin/libNvInfer_edgellm_plugin_asr.so")
+    ap.add_argument(
+        "--plugin",
+        default=os.environ.get(
+            "EDGE_LLM_ASR_PLUGIN_PATH",
+            os.path.expanduser(
+                "~/project/tensorrt-edge-llm/build_sm87/libNvInfer_edgellm_plugin.so"
+            ),
+        ),
+    )
     ap.add_argument("--workspace-mb", type=int, default=1024)
     ap.add_argument("--max-input-len", type=int, default=128)
     ap.add_argument("--max-kv", type=int, default=256)

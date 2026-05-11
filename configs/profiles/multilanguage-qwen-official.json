@@ -1,6 +1,6 @@
 {
   "name": "multilanguage-qwen-official",
-  "description": "Qwen3 ASR + Qwen3 TTS minimal-diff EdgeLLM profile for correctness/upstream checks.",
+  "description": "Qwen3 ASR + Qwen3 TTS minimal-diff EdgeLLM profile for correctness/upstream checks. Engine paths use ${QWEN3_ARTIFACT_ROOT} for portability when /opt/models needs sudo.",
   "artifact_set": "orin-nano-official-2026-05-10",
   "env": {
     "LANGUAGE_MODE": "multilanguage",
@@ -16,11 +16,11 @@
     "QWEN3_ARTIFACT_MANIFEST": "deploy/artifacts/qwen3_manifest.json",
     "QWEN3_ARTIFACT_SET": "orin-nano-official-2026-05-10",
     "QWEN3_ARTIFACT_ROOT": "/opt/models/qwen3-edgellm",
-    "EDGE_LLM_ASR_ENGINE_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/asr_thinker",
-    "EDGE_LLM_ASR_AUDIO_ENC_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/asr_audio_encoder",
-    "EDGE_LLM_TTS_TALKER_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/talker",
-    "EDGE_LLM_TTS_CP_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/code_predictor",
-    "EDGE_LLM_TTS_CODE2WAV_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/code2wav",
-    "EDGE_LLM_TTS_TOKENIZER_DIR": "/opt/models/qwen3-edgellm/tts/tokenizer"
+    "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nano/official/asr_thinker",
+    "EDGE_LLM_ASR_AUDIO_ENC_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nano/official/asr_audio_encoder",
+    "EDGE_LLM_TTS_TALKER_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nano/official/talker",
+    "EDGE_LLM_TTS_CP_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nano/official/code_predictor",
+    "EDGE_LLM_TTS_CODE2WAV_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nano/official/code2wav",
+    "EDGE_LLM_TTS_TOKENIZER_DIR": "${QWEN3_ARTIFACT_ROOT}/tts/tokenizer"
   }
 }

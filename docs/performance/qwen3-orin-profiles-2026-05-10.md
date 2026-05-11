@@ -2,6 +2,17 @@
 
 Date: 2026-05-10
 
+> **Historical paths note (added 2026-05-11):** `/tmp/qwen3_highperf_bin/...`,
+> `/tmp/qwen3_*_0510/...`, `/tmp/qwen3_*_0511/...`, and `/home/harvest/...`
+> paths in this document are the workstation-local layout used during the
+> 2026-05-10/11 profiling sessions. They are kept verbatim so the reported
+> numbers stay reproducible against the original logs, but **fresh deployments
+> should not depend on them.** For new work use:
+> - runtime binaries: `~/project/jetson-voice/build/edgellm_voice_worker/workers/`
+> - plugin .so:       `~/project/tensorrt-edge-llm/build_sm87/libNvInfer_edgellm_plugin.so`
+> - artifact root:    `/opt/models/qwen3-edgellm` (populated via
+>                     `scripts/deploy_qwen3_artifacts.py --set <set>`)
+
 This document tracks the two Qwen3 runtime lines separately:
 
 - `official`: minimal-diff EdgeLLM example/upstream line. It is evaluated for semantic correctness and upstream compatibility, not Orin 8GB dual residency.
