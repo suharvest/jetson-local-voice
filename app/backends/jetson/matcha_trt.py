@@ -17,7 +17,7 @@ import time
 import numpy as np
 from typing import Optional
 
-from tts_backend import TTSBackend, TTSCapability
+from app.core.tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
 

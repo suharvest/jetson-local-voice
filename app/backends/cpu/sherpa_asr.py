@@ -14,7 +14,7 @@ from typing import Optional
 
 import numpy as np
 
-from asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
+from app.core.asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 

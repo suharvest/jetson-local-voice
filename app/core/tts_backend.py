@@ -6,11 +6,11 @@ Clients check capabilities before calling optional endpoints.
 
 from __future__ import annotations
 
+import importlib
 import logging
-import os
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -94,47 +94,37 @@ class TTSBackend(ABC):
     def has_capability(self, cap: TTSCapability) -> bool:
         return cap in self.capabilities
 
+    def unload(self) -> None:
+        """Release GPU/NPU resources. See ASRBackend.unload() for semantics."""
+        pass
 
-def create_backend(backend_name: Optional[str] = None) -> TTSBackend:
-    """Factory: create TTS backend by name.
 
-    Args:
-        backend_name: 'matcha_trt', 'sherpa', 'qwen3_trt', or None for auto-detect.
+_TTS_REGISTRY: Dict[str, Tuple[str, str]] = {
+    "jetson.trt_edge_llm": ("app.backends.jetson.trt_edge_llm_tts", "TRTEdgeLLMTTSBackend"),
+    "jetson.matcha_trt":   ("app.backends.jetson.matcha_trt",       "MatchaTRTBackend"),
+    "jetson.qwen3_trt":    ("app.backends.jetson.qwen3_trt",        "Qwen3TRTBackend"),
+    "cpu.sherpa":          ("app.backends.cpu.sherpa",              "SherpaBackend"),
+}
 
-    Auto-detect logic:
-        - LANGUAGE_MODE=zh_en → matcha_trt (Matcha-icefall-zh-en, TRT)
-        - LANGUAGE_MODE=multilanguage → qwen3_trt (52 languages)
-        - Override with TTS_BACKEND env var (matcha_trt|sherpa|qwen3_trt)
+
+def _lazy_import(module_path: str, attr: str):
+    mod = importlib.import_module(module_path)
+    return getattr(mod, attr)
+
+
+def create_tts_backend() -> TTSBackend:
+    """Factory: instantiate the TTS backend declared by the loaded profile.
+
+    Reads ``tts_backend`` from app.core.profile_loader.current_profile().
+    Raises ValueError when no profile is loaded, the key is missing, or
+    the value is not in the registry.
     """
-    if backend_name is None:
-        language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
-        if language_mode == "zh_en":
-            default = "matcha_trt"
-        elif language_mode == "multilanguage":
-            default = "trt_edgellm"
-        else:
-            default = "qwen3_trt"
-        backend_name = os.environ.get("TTS_BACKEND", default)
-
-    if backend_name == "sherpa":
-        from backends.sherpa import SherpaBackend
-        return SherpaBackend()
-    elif backend_name == "qwen3_trt":
-        # Try importing from standalone package first, fallback to local
-        try:
-            from jetson_qwen3_speech import Qwen3TRTBackend
-            logger.info("Using Qwen3TRTBackend from jetson-qwen3-speech package")
-        except ImportError:
-            from backends.qwen3_trt import Qwen3TRTBackend
-            logger.info("Using Qwen3TRTBackend from local backends/")
-        return Qwen3TRTBackend()
-    elif backend_name == "matcha_trt":
-        from backends.matcha_trt import MatchaTRTBackend
-        logger.info("Using MatchaTRTBackend from local backends/")
-        return MatchaTRTBackend()
-    elif backend_name == "trt_edgellm":
-        from backends.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
-        logger.info("Using TRTEdgeLLMTTSBackend (TRT-Edge-LLM subprocess)")
-        return TRTEdgeLLMTTSBackend()
-    else:
-        raise ValueError(f"Unknown TTS backend: {backend_name}")
+    from app.core.profile_loader import current_profile
+    spec = current_profile().get("tts_backend")
+    if not spec:
+        raise ValueError("Profile must declare 'tts_backend'")
+    if spec not in _TTS_REGISTRY:
+        raise ValueError(f"Unknown tts_backend: {spec!r}")
+    module_path, cls_name = _TTS_REGISTRY[spec]
+    logger.info("Creating TTS backend %s (%s.%s)", spec, module_path, cls_name)
+    return _lazy_import(module_path, cls_name)()

@@ -13,7 +13,7 @@ import logging
 import os
 from typing import Optional
 
-from tts_backend import TTSBackend, TTSCapability, create_backend
+from app.core.tts_backend import TTSBackend, TTSCapability, create_tts_backend
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ _backend: Optional[TTSBackend] = None
 def get_backend() -> TTSBackend:
     global _backend
     if _backend is None:
-        _backend = create_backend()
+        _backend = create_tts_backend()
     return _backend
 
 

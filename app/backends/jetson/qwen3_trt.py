@@ -15,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 
-from tts_backend import TTSBackend, TTSCapability
+from app.core.tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
 

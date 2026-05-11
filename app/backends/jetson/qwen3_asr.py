@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 
-from asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
+from app.core.asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
@@ -1395,16 +1395,7 @@ class Qwen3ASRBackend(ASRBackend):
         # was confirmed bit-equivalent (<1e-7 max abs diff) and produced no
         # CER regression vs. transformers baseline. This drops the runtime
         # dependency on transformers entirely.
-        try:
-            from app.utils.whisper_mel import compute_whisper_log_mel
-        except ImportError:
-            try:
-                from utils.whisper_mel import compute_whisper_log_mel
-            except ImportError:
-                # Container overlay layout ships whisper_mel.py next to this
-                # backend (under backends/) because /opt/speech/app/utils/ is
-                # not bind-mountable without a compose change.
-                from backends.whisper_mel import compute_whisper_log_mel
+        from app.utils.whisper_mel import compute_whisper_log_mel
         return compute_whisper_log_mel(audio, chunk_len, self._mel_cache)
 
     @staticmethod

@@ -25,9 +25,9 @@ from typing import Optional
 
 import numpy as np
 
-from asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
+from app.core.asr_backend import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
 
-from backends.trt_edge_llm_ipc import (
+from app.backends.jetson.trt_edge_llm_ipc import (
     ASR_BINARY,
     ASR_WORKER_BINARY,
     ASR_ENGINE_DIR,

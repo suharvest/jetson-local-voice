@@ -23,9 +23,9 @@ from typing import Optional
 import importlib
 import uuid
 
-from tts_backend import TTSBackend, TTSCapability
+from app.core.tts_backend import TTSBackend, TTSCapability
 
-from backends.trt_edge_llm_ipc import (
+from app.backends.jetson.trt_edge_llm_ipc import (
     TTS_BINARY,
     TTS_WORKER_BINARY,
     TTS_TALKER_DIR,

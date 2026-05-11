@@ -5,11 +5,11 @@ Mirrors the TTS backend pattern (tts_backend.py).
 
 from __future__ import annotations
 
+import importlib
 import logging
-import os
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -86,45 +86,41 @@ class ASRBackend(ABC):
     def has_capability(self, cap: ASRCapability) -> bool:
         return cap in self.capabilities
 
+    def unload(self) -> None:
+        """Release GPU/NPU resources. Override in backends that hold shared
+        hardware so the BackendCoordinator's 'exclusive' mode can hand the
+        device to another backend. Default is a no-op — backends without
+        an unload() stay resident, which is fine for 'concurrent' and
+        'serialized' modes."""
+        pass
 
-def create_asr_backend(backend_name: Optional[str] = None) -> ASRBackend:
-    """Factory: create ASR backend by name.
 
-    Auto-detect logic:
-        - If LANGUAGE_MODE=multilanguage → qwen3 (52 languages)
-        - If LANGUAGE_MODE=zh_en → paraformer_trt (Jetson TRT zh+en)
-        - Otherwise, use ASR_BACKEND env var (default: sherpa)
+_ASR_REGISTRY: Dict[str, Tuple[str, str]] = {
+    "jetson.trt_edge_llm":   ("app.backends.jetson.trt_edge_llm_asr", "TRTEdgeLLMASRBackend"),
+    "jetson.paraformer_trt": ("app.backends.jetson.paraformer_trt",   "ParaformerTRTBackend"),
+    "jetson.qwen3_asr":      ("app.backends.jetson.qwen3_asr",        "Qwen3ASRBackend"),
+    "cpu.sherpa_asr":        ("app.backends.cpu.sherpa_asr",          "SherpaASRBackend"),
+}
+
+
+def _lazy_import(module_path: str, attr: str):
+    mod = importlib.import_module(module_path)
+    return getattr(mod, attr)
+
+
+def create_asr_backend() -> ASRBackend:
+    """Factory: instantiate the ASR backend declared by the loaded profile.
+
+    Reads ``asr_backend`` from app.core.profile_loader.current_profile().
+    The value must be a registry key (e.g. ``jetson.trt_edge_llm``). Raises
+    ValueError if no profile is loaded, the key is missing, or unknown.
     """
-    if backend_name is None:
-        # Check LANGUAGE_MODE for automatic backend selection
-        language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
-        if language_mode == "multilanguage":
-            backend_name = os.environ.get("ASR_BACKEND", "trt_edgellm")
-            logger.info("LANGUAGE_MODE=multilanguage → using %s ASR backend", backend_name)
-        elif language_mode == "zh_en":
-            backend_name = os.environ.get("ASR_BACKEND", "paraformer_trt")
-            logger.info("LANGUAGE_MODE=zh_en → using %s ASR backend", backend_name)
-        else:
-            backend_name = os.environ.get("ASR_BACKEND", "sherpa")
-
-    if backend_name == "sherpa":
-        from backends.sherpa_asr import SherpaASRBackend
-        return SherpaASRBackend()
-    elif backend_name == "paraformer_trt":
-        from backends.paraformer_trt import ParaformerTRTBackend
-        return ParaformerTRTBackend()
-    elif backend_name == "qwen3":
-        # Try importing from standalone package first, fallback to local
-        try:
-            from jetson_qwen3_speech import Qwen3ASRBackend
-            logger.info("Using Qwen3ASRBackend from jetson-qwen3-speech package")
-        except ImportError:
-            from backends.qwen3_asr import Qwen3ASRBackend
-            logger.info("Using Qwen3ASRBackend from local backends/")
-        return Qwen3ASRBackend()
-    elif backend_name == "trt_edgellm":
-        from backends.trt_edge_llm_asr import TRTEdgeLLMASRBackend
-        logger.info("Using TRTEdgeLLMASRBackend (TRT-Edge-LLM subprocess)")
-        return TRTEdgeLLMASRBackend()
-    else:
-        raise ValueError(f"Unknown ASR backend: {backend_name}")
+    from app.core.profile_loader import current_profile
+    spec = current_profile().get("asr_backend")
+    if not spec:
+        raise ValueError("Profile must declare 'asr_backend'")
+    if spec not in _ASR_REGISTRY:
+        raise ValueError(f"Unknown asr_backend: {spec!r}")
+    module_path, cls_name = _ASR_REGISTRY[spec]
+    logger.info("Creating ASR backend %s (%s.%s)", spec, module_path, cls_name)
+    return _lazy_import(module_path, cls_name)()
