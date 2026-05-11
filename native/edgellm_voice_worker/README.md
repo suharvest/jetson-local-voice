@@ -60,9 +60,9 @@ Use the explicit-KV backend only through the product backend selector:
 
 ```bash
 PYTHONPATH=/home/harvest/project/jetson-voice/app:/home/harvest/voice_test/app_overlay \
-JETSON_VOICE_TTS_BACKEND=product_explicit_kv \
-JETSON_VOICE_TTS_MODEL_BASE=/home/harvest/voice_test/models/qwen3-tts \
-JETSON_VOICE_TTS_NATIVE_MODULE_DIR=/home/harvest/voice_test/app_overlay \
+SEEED_LOCAL_VOICE_TTS_BACKEND=product_explicit_kv \
+SEEED_LOCAL_VOICE_TTS_MODEL_BASE=/home/harvest/voice_test/models/qwen3-tts \
+SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR=/home/harvest/voice_test/app_overlay \
 python3 scripts/verify_product_explicit_kv_tts.py \
   --text "语音合成的稳定性。" \
   --output /tmp/jetson_voice_product_explicit_kv.wav

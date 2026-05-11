@@ -338,7 +338,7 @@ class Qwen3TRTBackend(TTSBackend):
             and os.environ.get("QWEN3_TTS_OFFLINE_STREAMING_FOR_LONG", "1").lower()
             not in ("0", "false", "no")
         )
-        seed = int(kwargs.get("seed", os.environ.get("JETSON_VOICE_TTS_SEED", "0")))
+        seed = int(kwargs.get("seed", os.environ.get("SEEED_LOCAL_VOICE_TTS_SEED", "0")))
         segment_text = kwargs.get("product_segment_text", True)
         if isinstance(segment_text, str):
             segment_text = segment_text.lower() not in ("0", "false", "no")
@@ -494,7 +494,7 @@ class Qwen3TRTBackend(TTSBackend):
         first_chunk_frames = kwargs.get("first_chunk_frames", 5)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)
-        seed = int(kwargs.get("seed", os.environ.get("JETSON_VOICE_TTS_SEED", "0")))
+        seed = int(kwargs.get("seed", os.environ.get("SEEED_LOCAL_VOICE_TTS_SEED", "0")))
         random_values = _sampling_uniforms(seed, int(max_frames))
 
         token_ids = self._tokenize(text)

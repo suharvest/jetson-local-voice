@@ -92,10 +92,10 @@ def _prepare_imports(args: argparse.Namespace) -> None:
 
 def _synthesize(args: argparse.Namespace, text: str, max_audio_length: int, output: Path) -> dict[str, Any]:
     _prepare_imports(args)
-    os.environ["JETSON_VOICE_TTS_BACKEND"] = args.backend
-    os.environ["JETSON_VOICE_TTS_MODEL_BASE"] = args.model_base
-    os.environ["JETSON_VOICE_TTS_NATIVE_MODULE_DIR"] = args.native_module_dir
-    os.environ["JETSON_VOICE_TTS_SEED"] = str(args.seed)
+    os.environ["SEEED_LOCAL_VOICE_TTS_BACKEND"] = args.backend
+    os.environ["SEEED_LOCAL_VOICE_TTS_MODEL_BASE"] = args.model_base
+    os.environ["SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR"] = args.native_module_dir
+    os.environ["SEEED_LOCAL_VOICE_TTS_SEED"] = str(args.seed)
     os.environ.setdefault("QWEN3_TTS_PRODUCT_SEGMENT_TEXT", "0")
     os.environ.setdefault("TTS_INT8_EOS_LOGIT_OFFSET", "0")
     os.environ.setdefault("QWEN3_TTS_EOS_BIAS_ONSET_MULT", "3")

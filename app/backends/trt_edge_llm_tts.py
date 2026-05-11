@@ -40,7 +40,7 @@ from backends.trt_edge_llm_ipc import (
 
 logger = logging.getLogger(__name__)
 
-_QWEN3_TTS_MODEL_BASE = os.environ.get("JETSON_VOICE_TTS_MODEL_BASE", os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts"))
+_QWEN3_TTS_MODEL_BASE = os.environ.get("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts"))
 _QWEN3_SPEAKER_ENCODER = os.environ.get(
     "QWEN3_SPEAKER_ENCODER", os.path.join(_QWEN3_TTS_MODEL_BASE, "onnx", "speaker_encoder.onnx")
 )
@@ -315,12 +315,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         return self._ready
 
     def _backend_mode(self) -> str:
-        mode = os.environ.get("JETSON_VOICE_TTS_BACKEND", os.environ.get("EDGE_LLM_TTS_BACKEND", "edgellm_worker"))
+        mode = os.environ.get("SEEED_LOCAL_VOICE_TTS_BACKEND", os.environ.get("EDGE_LLM_TTS_BACKEND", "edgellm_worker"))
         return mode.strip().lower().replace("-", "_")
 
     def _load_product_explicit_kv_backend(self):
-        model_base = os.environ.get("JETSON_VOICE_TTS_MODEL_BASE", "/home/harvest/voice_test/models/qwen3-tts")
-        overlay = os.environ.get("JETSON_VOICE_TTS_NATIVE_MODULE_DIR", "/home/harvest/voice_test/app_overlay")
+        model_base = os.environ.get("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", "/home/harvest/voice_test/models/qwen3-tts")
+        overlay = os.environ.get("SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", "/home/harvest/voice_test/app_overlay")
         overlay_backends = os.path.join(overlay, "backends")
         for path in (overlay, overlay_backends):
             if os.path.isdir(path) and path not in sys.path:
@@ -353,7 +353,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             return
         if mode not in ("edgellm", "edgellm_worker", "official"):
             raise ValueError(
-                "Unsupported JETSON_VOICE_TTS_BACKEND/EDGE_LLM_TTS_BACKEND value "
+                "Unsupported SEEED_LOCAL_VOICE_TTS_BACKEND/EDGE_LLM_TTS_BACKEND value "
                 f"{mode!r}; expected edgellm_worker or product_explicit_kv"
             )
 
@@ -763,7 +763,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             if len(segments) > 1:
                 segment_kwargs = dict(kwargs)
                 segment_kwargs["segment_text"] = False
-                segment_kwargs.setdefault("seed", int(os.environ.get("JETSON_VOICE_TTS_SEED", "42")))
+                segment_kwargs.setdefault("seed", int(os.environ.get("SEEED_LOCAL_VOICE_TTS_SEED", "42")))
                 wav_parts: list[bytes] = []
                 segment_meta: list[dict] = []
                 total_elapsed = 0.0

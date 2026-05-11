@@ -224,7 +224,7 @@ def test_product_backend_bypasses_generic_segmentation(monkeypatch):
             calls.append((text, kwargs.get("seed")))
             return _make_wav_bytes(240), {"backend": "product_explicit_kv"}
 
-    monkeypatch.setenv("JETSON_VOICE_TTS_SEED", "42")
+    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_SEED", "42")
     backend = tts_mod.TRTEdgeLLMTTSBackend()
     backend._ready = True
     backend._product_backend = FakeProductBackend()
@@ -374,9 +374,9 @@ def test_product_explicit_kv_backend_is_selected_explicitly(monkeypatch, tmp_pat
             return b"wav", {"backend": "product_explicit_kv"}
 
     fake_module = types.SimpleNamespace(Qwen3TRTBackend=FakeProductBackend)
-    monkeypatch.setenv("JETSON_VOICE_TTS_BACKEND", "product_explicit_kv")
-    monkeypatch.setenv("JETSON_VOICE_TTS_MODEL_BASE", str(tmp_path / "models" / "qwen3-tts"))
-    monkeypatch.setenv("JETSON_VOICE_TTS_NATIVE_MODULE_DIR", str(tmp_path / "app_overlay"))
+    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_BACKEND", "product_explicit_kv")
+    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", str(tmp_path / "models" / "qwen3-tts"))
+    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", str(tmp_path / "app_overlay"))
     monkeypatch.setattr(tts_mod.importlib, "import_module", lambda name: fake_module)
     monkeypatch.setattr(tts_mod.importlib, "reload", lambda module: module)
 
@@ -407,7 +407,7 @@ def test_old_native_fallback_env_no_longer_changes_backend(monkeypatch, tmp_path
         path.touch()
 
     monkeypatch.setenv("EDGE_LLM_TTS_NATIVE_FALLBACK", "1")
-    monkeypatch.delenv("JETSON_VOICE_TTS_BACKEND", raising=False)
+    monkeypatch.delenv("SEEED_LOCAL_VOICE_TTS_BACKEND", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_BACKEND", raising=False)
     monkeypatch.setattr(tts_mod, "TTS_WORKER_BINARY", str(tmp_path / "worker"))
     monkeypatch.setattr(tts_mod, "PLUGIN_PATH", str(tmp_path / "plugin.so"))

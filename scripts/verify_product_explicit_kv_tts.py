@@ -27,8 +27,8 @@ def main() -> None:
     parser.add_argument("--streaming", action="store_true")
     args = parser.parse_args()
 
-    os.environ["JETSON_VOICE_TTS_BACKEND"] = "product_explicit_kv"
-    os.environ["JETSON_VOICE_TTS_SEED"] = str(args.seed)
+    os.environ["SEEED_LOCAL_VOICE_TTS_BACKEND"] = "product_explicit_kv"
+    os.environ["SEEED_LOCAL_VOICE_TTS_SEED"] = str(args.seed)
     backend = TRTEdgeLLMTTSBackend()
     backend.preload()
     if args.streaming:

@@ -43,7 +43,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${JETSON_VOICE_MEMORY_LIMIT:-6G}
+          memory: ${SEEED_LOCAL_VOICE_MEMORY_LIMIT:-6G}
 
 volumes:
   speech-models:

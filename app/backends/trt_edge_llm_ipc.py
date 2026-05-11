@@ -36,18 +36,18 @@ _EDGE_LLM_BUILD = os.path.join(
     _EDGE_LLM_BASE,
     os.environ.get("EDGE_LLM_BUILD_DIR", "build_sm87"),
 )
-_JETSON_VOICE_BASE = os.environ.get(
-    "JETSON_VOICE_BASE", os.path.expanduser("~/project/jetson-voice")
+_SEEED_LOCAL_VOICE_BASE = os.environ.get(
+    "SEEED_LOCAL_VOICE_BASE", os.path.expanduser("~/project/seeed-local-voice")
 )
 _VOICE_WORKER_BUILD = os.environ.get(
-    "JETSON_VOICE_WORKER_BUILD",
-    os.path.join(_JETSON_VOICE_BASE, "build", "edgellm_voice_worker", "workers"),
+    "SEEED_LOCAL_VOICE_WORKER_BUILD",
+    os.path.join(_SEEED_LOCAL_VOICE_BASE, "build", "edgellm_voice_worker", "workers"),
 )
 
 
 QWEN3_RUNTIME_PROFILE = os.environ.get(
     "EDGE_LLM_QWEN3_PROFILE",
-    os.environ.get("JETSON_VOICE_QWEN3_PROFILE", "highperf"),
+    os.environ.get("SEEED_LOCAL_VOICE_QWEN3_PROFILE", "highperf"),
 ).strip().lower().replace("-", "_")
 
 
