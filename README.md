@@ -167,7 +167,7 @@ bash qwen3-edgellm-jetson/scripts/reproduce_qwen3_highperf.sh \
 
 The orchestrator clones this repo + the EdgeLLM fork, builds the runtime,
 downloads + SHA-256-verifies the HF artifacts, builds the slim docker
-image (`Dockerfile.slim.qwen3`), starts the service, and runs
+image (`deploy/docker/Dockerfile.jetson` with `--build-arg LANGUAGE_MODE=multilanguage`), starts the service, and runs
 `scripts/verify_reproduction.sh` which fail-fasts on plugin-symbol set,
 artifact integrity, TTS→ASR loopback, and voice clone. Exit 0 means the
 slim container on port 18092 is healthy and serving the validated stack.
@@ -478,10 +478,11 @@ seeed-local-voice/
 ├── patches/                 # Paraformer EOF truncation fix
 ├── scripts/                 # Model download, ORT patching
 ├── deploy/
-│   └── docker-compose.yml   # Production deploy (pre-built image)
-├── Dockerfile               # Full build from dustynv base (development)
-├── Dockerfile.slim          # Slim multi-stage build (898MB, production)
-├── docker-compose.yml       # Development build (build from source)
+│   ├── docker-compose.yml   # Production deploy (pre-built image)
+│   └── docker/
+│       ├── Dockerfile.jetson  # Jetson Orin Nano/NX/AGX (zh_en or multilanguage)
+│       ├── Dockerfile.rk      # Rockchip RK3576/RK3588 NPU
+│       └── Dockerfile.rpi     # Raspberry Pi 4/5 (CPU)
 └── setup-performance.sh     # Jetson clock/power tuning
 ```
 

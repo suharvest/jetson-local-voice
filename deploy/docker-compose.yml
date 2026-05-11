@@ -11,6 +11,14 @@
 services:
   speech:
     image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v3.0-slim
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.jetson
+      args:
+        LANGUAGE_MODE: ${LANGUAGE_MODE:-zh_en}
+    # TODO: add separate compose entries for RK (deploy/docker/Dockerfile.rk)
+    # and Raspberry Pi (deploy/docker/Dockerfile.rpi) — these targets run on
+    # different hosts and don't share this compose file's nvidia runtime.
     runtime: nvidia
     ipc: host
     ports:
