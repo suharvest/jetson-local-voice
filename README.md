@@ -1,16 +1,18 @@
-# Jetson Voice
+# Seeed Local Voice
 
-**A fully local bilingual voice server with sub-200ms latency and zero cloud dependency — built for edge AI, robots, and real-time voice interaction.**
+**A fully local bilingual voice server with sub-200ms latency and zero cloud dependency — built for edge AI, robots, and real-time voice interaction. Runs on Jetson Orin, RK3576, RK3588, and Raspberry Pi 4/5.**
 
-[![GitHub stars](https://img.shields.io/github/stars/Seeed-Projects/jetson-voice?style=social)](https://github.com/Seeed-Projects/jetson-voice)
+[![GitHub stars](https://img.shields.io/github/stars/suharvest/seeed-local-voice?style=social)](https://github.com/suharvest/seeed-local-voice)
 [![sherpa-onnx](https://img.shields.io/badge/engine-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
 [![Kokoro TTS](https://img.shields.io/badge/TTS-Kokoro%20v1.0-orange.svg)](https://huggingface.co/hexgrad/Kokoro-82M)
 [![Docker](https://img.shields.io/badge/deploy-Docker-blue.svg)](https://www.docker.com/)
-[![Jetson](https://img.shields.io/badge/platform-Jetson%20Orin-76b900.svg)](https://developer.nvidia.com/embedded-computing)
+[![Devices](https://img.shields.io/badge/devices-Jetson%20%7C%20RK3576%20%7C%20RK3588%20%7C%20RPi4%2F5-76b900.svg)](#supported-devices)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
+**Supported devices**: Jetson Orin (Nano / NX / AGX, CUDA) · RK3576 · RK3588 (Rockchip NPU) · Raspberry Pi 4 / 5 (CPU)
+
 <p align="center">
-  <img src="media/hero.png" alt="Jetson Voice — sub-200ms ASR + TTS on edge" width="640" />
+  <img src="media/hero.png" alt="Seeed Local Voice — sub-200ms ASR + TTS on edge" width="640" />
 </p>
 
 <!-- TODO: Add demo GIF showing voice-in → text → voice-out round-trip -->
@@ -69,8 +71,8 @@ docker run -d --name seeed-local-voice \
 **Deploy with compose** (recommended for production):
 
 ```bash
-git clone https://github.com/Seeed-Projects/jetson-voice.git
-cd jetson-voice
+git clone https://github.com/suharvest/seeed-local-voice.git
+cd seeed-local-voice
 
 # Chinese + English (default)
 docker compose -f deploy/docker-compose.yml up -d
@@ -87,7 +89,7 @@ docker compose -f deploy/docker-compose.yml up -d
 **Build from source** (for development):
 
 ```bash
-cd jetson-voice
+cd seeed-local-voice
 docker compose build && docker compose up -d
 ```
 
@@ -146,7 +148,7 @@ The service is model-agnostic at the API level — clients send audio/text, get 
 
 ## Qwen3 Multilanguage Paths
 
-Qwen3-ASR and Qwen3-TTS are exposed to Jetson Voice as the `multilanguage`
+Qwen3-ASR and Qwen3-TTS are exposed to Seeed Local Voice as the `multilanguage`
 mode. The product service stays in this repository; Qwen-specific export,
 engine build, worker/runtime glue, and performance scripts live in the
 standalone companion repo
@@ -212,8 +214,8 @@ Branch ownership:
 
 - EdgeLLM official/minimal branch: `official-qwen3-tts-upstream-runtime` in the EdgeLLM fork.
 - Split upstream PR branches: `pr-jetson-build-compat`, `pr-export-builder-robustness`, `pr-qwen3-tts-runtime-correctness`.
-- Jetson Voice integration branch for that minimal official backend: `product-qwen3-tts-official-backend`.
-- Jetson Voice high-performance/product branch: `qwen3tts-accurate-20260507`.
+- Seeed Local Voice integration branch for that minimal official backend: `product-qwen3-tts-official-backend`.
+- Seeed Local Voice high-performance/product branch: `qwen3tts-accurate-20260507`.
 
 ```bash
 EDGE_LLM_QWEN3_PROFILE=official \
@@ -360,8 +362,8 @@ The service uses only ~650 MB RAM, leaving plenty of headroom for LLM inference 
 
 | Setup | Hardware Cost | Per-request Cost | Latency |
 |-------|-------------|-----------------|---------|
-| **Jetson Voice (Orin Nano)** | **~$250 one-time** | **$0** | **~110-180ms** |
-| **Jetson Voice (Orin NX)** | **~$400 one-time** | **$0** | **~110-180ms** |
+| **Seeed Local Voice (Orin Nano)** | **~$250 one-time** | **$0** | **~110-180ms** |
+| **Seeed Local Voice (Orin NX)** | **~$400 one-time** | **$0** | **~110-180ms** |
 | Google Cloud Speech + TTS | $0 | ~$0.01/request | 300-800ms |
 | Azure Speech Services | $0 | ~$0.01/request | 200-500ms |
 | OpenAI TTS + Whisper | $0 | ~$0.02/request | 500ms-2s |
@@ -464,7 +466,7 @@ See `patches/README.md` for rebuild instructions.
 ## Project Structure
 
 ```text
-jetson-voice/
+seeed-local-voice/
 ├── app/                     # FastAPI service
 │   ├── main.py              # Endpoints and startup
 │   ├── asr_service.py       # SenseVoice offline ASR
