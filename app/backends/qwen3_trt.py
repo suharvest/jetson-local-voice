@@ -7,13 +7,27 @@ Models loaded once at preload(), C++ engine stays resident in memory.
 from __future__ import annotations
 
 import logging
+import io
 import os
 import time
+import wave
 from typing import Optional
+
+import numpy as np
 
 from tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
+
+
+def _sampling_uniforms(seed: int, max_frames: int) -> list[float]:
+    if seed == 0 or os.environ.get("QWEN3_TTS_NUMPY_SAMPLING", "1").lower() in ("0", "false", "no"):
+        return []
+    # One primary sample plus up to 15 CP residual samples per frame, with
+    # slack for EOS/edge cases. This preserves the old Python reference
+    # RandomState(seed).choice() consumption order without calling Python from C++.
+    n = max(64, (max_frames + 4) * 16)
+    return np.random.RandomState(seed).random_sample(n).astype(float).tolist()
 
 
 def _detect_language(text: str) -> str:
@@ -30,6 +44,142 @@ def _detect_language(text: str) -> str:
         if 0xAC00 <= cp <= 0xD7AF:
             return "korean"
     return "english"
+
+
+def _pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return out.getvalue()
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(0x4E00 <= ord(ch) <= 0x9FFF for ch in text)
+
+
+def _is_ascii_word_char(ch: str) -> bool:
+    return ch.isascii() and (ch.isalnum() or ch in "_+-./")
+
+
+def _is_ascii_word_boundary(text: str, idx: int) -> bool:
+    before = text[idx - 1] if idx > 0 else ""
+    after = text[idx] if idx < len(text) else ""
+    return not (_is_ascii_word_char(before) and _is_ascii_word_char(after))
+
+
+def _safe_product_tts_cut(text: str, max_chars: int) -> int:
+    if len(text) <= max_chars:
+        return len(text)
+
+    # Prefer whitespace or mixed CJK/ASCII boundaries. Splitting inside English
+    # product/device names such as "Jetson" is audible and hurts ASR.
+    floor = max(1, int(max_chars * 0.55))
+    for idx in range(max_chars, floor - 1, -1):
+        if not _is_ascii_word_boundary(text, idx):
+            continue
+        prev_ch = text[idx - 1]
+        next_ch = text[idx] if idx < len(text) else ""
+        if prev_ch.isspace() or next_ch.isspace():
+            return idx
+        if (prev_ch.isascii() and not next_ch.isascii()) or (not prev_ch.isascii() and next_ch.isascii()):
+            return idx
+
+    idx = max_chars
+    while idx < len(text) and not _is_ascii_word_boundary(text, idx):
+        idx += 1
+    return idx if idx < len(text) else len(text)
+
+
+def _split_product_tts_text(text: str, max_chars: int = 20) -> list[str]:
+    """Split only where the Qwen3-TTS product path is known to lose conditioning.
+
+    Chinese comma/full-stop continuations regress in a single Talker session on
+    the current Jetson path. Keep punctuation with each segment and synthesize
+    segments with the same seed for ASR-correct output.
+    """
+    text = text.strip()
+    if not text or not _contains_cjk(text):
+        return [text] if text else []
+    breaks = set("，,、。！？!?；;：:\n")
+    raw_parts: list[str] = []
+    current: list[str] = []
+    for ch in text:
+        current.append(ch)
+        part = "".join(current).strip()
+        if ch in breaks:
+            if part:
+                raw_parts.append(part)
+            current.clear()
+    tail = "".join(current).strip()
+    if tail:
+        raw_parts.append(tail)
+
+    parts: list[str] = []
+    punctuation_only = set("，,、。！？!?；;：:")
+    for raw in raw_parts:
+        rest = raw
+        while len(rest) > max_chars:
+            cut = _safe_product_tts_cut(rest, max_chars)
+            part = rest[:cut]
+            rest = rest[cut:]
+            if part.strip():
+                parts.append(part)
+        if rest.strip():
+            if parts and all(ch in punctuation_only for ch in rest):
+                parts[-1] += rest
+            else:
+                parts.append(rest)
+    return parts or [text]
+
+
+def _segment_pause_ms(segment: str) -> int:
+    comma_pause = int(os.environ.get("QWEN3_TTS_PRODUCT_COMMA_PAUSE_MS", "120"))
+    hard_pause = int(os.environ.get("QWEN3_TTS_PRODUCT_HARD_PAUSE_MS", "180"))
+    if segment.rstrip().endswith(("。", "！", "？", "!", "?", "；", ";")):
+        return max(0, hard_pause)
+    return max(0, comma_pause)
+
+
+def _concat_wav_bytes(parts: list[bytes], pauses_ms: Optional[list[int]] = None) -> bytes:
+    non_empty = [part for part in parts if part]
+    if not non_empty:
+        return b""
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    params = None
+    frames: list[bytes] = []
+    for idx, part in enumerate(non_empty):
+        with wave.open(io.BytesIO(part), "rb") as reader:
+            current = (
+                reader.getnchannels(),
+                reader.getsampwidth(),
+                reader.getframerate(),
+                reader.getcomptype(),
+                reader.getcompname(),
+            )
+            if params is None:
+                params = current
+            elif current != params:
+                raise RuntimeError(f"Cannot concatenate WAV segments with different formats: {current} != {params}")
+            frames.append(reader.readframes(reader.getnframes()))
+            if pauses_ms and idx < len(non_empty) - 1:
+                pause_samples = int(current[2] * max(0, pauses_ms[idx]) / 1000)
+                if pause_samples > 0:
+                    frames.append(b"\x00" * pause_samples * current[0] * current[1])
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as writer:
+        writer.setnchannels(params[0])
+        writer.setsampwidth(params[1])
+        writer.setframerate(params[2])
+        writer.setcomptype(params[3], params[4])
+        for frame_bytes in frames:
+            writer.writeframes(frame_bytes)
+    return out.getvalue()
 
 # Paths — all under /opt/models/qwen3-tts (persistent volume)
 _BASE = os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts")
@@ -177,12 +327,102 @@ class Qwen3TRTBackend(TTSBackend):
             language = _detect_language(text)
 
         token_ids = self._tokenize(text)
+        requested_max_frames = int(kwargs.get("max_audio_length", kwargs.get("max_frames", 200)))
+        vocoder_cap = int(os.environ.get("TTS_TRT_VOCODER_MAX_FRAMES", "100"))
+        use_trt_vocoder = os.environ.get("TTS_VOCODER_TRT", "1").lower() not in ("0", "false", "no")
+        expected_frames = max(50, len(token_ids) * 3)
+        collect_streaming = (
+            use_trt_vocoder
+            and requested_max_frames > vocoder_cap
+            and expected_frames > vocoder_cap
+            and os.environ.get("QWEN3_TTS_OFFLINE_STREAMING_FOR_LONG", "1").lower()
+            not in ("0", "false", "no")
+        )
+        seed = int(kwargs.get("seed", os.environ.get("JETSON_VOICE_TTS_SEED", "0")))
+        segment_text = kwargs.get("product_segment_text", True)
+        if isinstance(segment_text, str):
+            segment_text = segment_text.lower() not in ("0", "false", "no")
+        if segment_text and os.environ.get("QWEN3_TTS_PRODUCT_SEGMENT_TEXT", "0").lower() not in ("0", "false", "no"):
+            max_chars = int(os.environ.get("QWEN3_TTS_PRODUCT_SEGMENT_MAX_CHARS", "20"))
+            segments = _split_product_tts_text(text, max_chars=max_chars)
+            if len(segments) > 1:
+                start = time.time()
+                wav_parts: list[bytes] = []
+                segment_meta: list[dict] = []
+                segment_kwargs = dict(kwargs)
+                segment_kwargs["product_segment_text"] = False
+                segment_kwargs.pop("seed", None)
+                segment_kwargs.setdefault("max_audio_length", min(requested_max_frames, vocoder_cap if use_trt_vocoder else requested_max_frames))
+                for segment in segments:
+                    wav, meta = self.synthesize(
+                        segment,
+                        speaker_id=speaker_id,
+                        speed=speed,
+                        pitch_shift=pitch_shift,
+                        language=language,
+                        seed=seed,
+                        **segment_kwargs,
+                    )
+                    wav_parts.append(wav)
+                    segment_meta.append({"text": segment, **meta})
+                pauses_ms = [_segment_pause_ms(segment) for segment in segments[:-1]]
+                wav_bytes = _concat_wav_bytes(wav_parts, pauses_ms=pauses_ms)
+                duration = 0.0
+                samples = 0
+                with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+                    samples = reader.getnframes()
+                    duration = samples / reader.getframerate() if reader.getframerate() else 0.0
+                elapsed = time.time() - start
+                return wav_bytes, {
+                    "duration": round(duration, 3),
+                    "inference_time": round(elapsed, 3),
+                    "rtf": round(elapsed / duration, 3) if duration else 0,
+                    "sample_rate": self.sample_rate,
+                    "samples": samples,
+                    "seed": seed,
+                    "product_segmented": True,
+                    "segment_count": len(segments),
+                    "segment_pauses_ms": pauses_ms,
+                    "segments": segment_meta,
+                }
+
+        if collect_streaming:
+            start = time.time()
+            pcm = b"".join(
+                self.generate_streaming(
+                    text,
+                    language=language,
+                    max_frames=requested_max_frames,
+                    seed=seed,
+                    first_chunk_frames=int(kwargs.get("first_chunk_frames", 25)),
+                    chunk_frames=int(kwargs.get("chunk_frames", 25)),
+                )
+            )
+            elapsed = time.time() - start
+            duration = len(pcm) / 2 / self.sample_rate if pcm else 0.0
+            return _pcm16_to_wav(pcm, self.sample_rate), {
+                "duration": round(duration, 3),
+                "inference_time": round(elapsed, 3),
+                "rtf": round(elapsed / duration, 3) if duration else 0,
+                "sample_rate": self.sample_rate,
+                "samples": len(pcm) // 2,
+                "seed": seed,
+                "offline_collected_streaming": True,
+            }
+
+        max_frames = requested_max_frames
+        if use_trt_vocoder:
+            max_frames = min(max_frames, vocoder_cap)
+        random_values = _sampling_uniforms(seed, max_frames)
 
         start = time.time()
         result = self._engine.synthesize(
             text=text,
             lang=language,
             token_ids=token_ids,
+            max_frames=max_frames,
+            seed=seed,
+            random_values=random_values,
         )
         elapsed = time.time() - start
 
@@ -196,6 +436,7 @@ class Qwen3TRTBackend(TTSBackend):
             "sample_rate": self.sample_rate,
             "n_frames": result.get("n_frames", 0),
             "per_step_ms": round(result.get("per_step_ms", 0), 1),
+            "seed": seed,
         }
         return wav_bytes, meta
 
@@ -253,6 +494,8 @@ class Qwen3TRTBackend(TTSBackend):
         first_chunk_frames = kwargs.get("first_chunk_frames", 5)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)
+        seed = int(kwargs.get("seed", os.environ.get("JETSON_VOICE_TTS_SEED", "0")))
+        random_values = _sampling_uniforms(seed, int(max_frames))
 
         token_ids = self._tokenize(text)
 
@@ -277,6 +520,7 @@ class Qwen3TRTBackend(TTSBackend):
                         first_chunk_frames=first_chunk_frames,
                         chunk_frames=chunk_frames,
                         max_frames=max_frames,
+                        seed=seed,
                     )
                 else:
                     self._engine.synthesize_streaming_callback(
@@ -287,6 +531,8 @@ class Qwen3TRTBackend(TTSBackend):
                         first_chunk_frames=first_chunk_frames,
                         chunk_frames=chunk_frames,
                         max_frames=max_frames,
+                        seed=seed,
+                        random_values=random_values,
                     )
             finally:
                 chunk_queue.put(SENTINEL)
