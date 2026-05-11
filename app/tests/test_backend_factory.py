@@ -1,159 +1,102 @@
-"""Unit tests for create_asr_backend() factory selection logic.
+"""Unit tests for the registry-driven create_asr_backend() factory.
 
-Backend modules (sherpa_onnx, CUDA deps) are mocked via sys.modules so
-the factory can be imported without hardware present.
+The factory consults app.core.profile_loader.current_profile() for the
+``asr_backend`` key and importlib-loads the matching module. Each test
+injects a fake backend module via sys.modules and patches current_profile()
+to return the right key.
 """
 
+import importlib
 import sys
 import types
-import importlib
 from unittest.mock import MagicMock
+
+import pytest
 
 
 def _make_mock_backend_class(name: str):
-    """Return a trivial mock class that looks like an ASRBackend subclass."""
     cls = MagicMock(name=name)
-    instance = MagicMock()
-    cls.return_value = instance
+    cls.return_value = MagicMock()
     return cls
 
 
-def _inject_mock_sherpa(monkeypatch):
-    """Inject a fake backends.sherpa_asr module into sys.modules."""
-    mock_cls = _make_mock_backend_class("SherpaASRBackend")
-    mock_mod = types.ModuleType("backends.sherpa_asr")
-    mock_mod.SherpaASRBackend = mock_cls
+def _inject_module(monkeypatch, dotted: str, class_name: str):
+    """Inject a fake module at `dotted` exposing `class_name` and return the class mock.
 
-    # Also need the parent package present
-    if "backends" not in sys.modules:
-        parent = types.ModuleType("backends")
-        monkeypatch.setitem(sys.modules, "backends", parent)
-    monkeypatch.setitem(sys.modules, "backends.sherpa_asr", mock_mod)
-    return mock_cls
-
-
-def _inject_mock_paraformer(monkeypatch):
-    """Inject a fake backends.paraformer_trt module into sys.modules."""
-    mock_cls = _make_mock_backend_class("ParaformerTRTBackend")
-    mock_mod = types.ModuleType("backends.paraformer_trt")
-    mock_mod.ParaformerTRTBackend = mock_cls
-
-    if "backends" not in sys.modules:
-        parent = types.ModuleType("backends")
-        monkeypatch.setitem(sys.modules, "backends", parent)
-    monkeypatch.setitem(sys.modules, "backends.paraformer_trt", mock_mod)
-    return mock_cls
-
-
-def _inject_mock_qwen3(monkeypatch):
-    """Inject a fake backends.qwen3_asr module into sys.modules."""
-    mock_cls = _make_mock_backend_class("Qwen3ASRBackend")
-    mock_mod = types.ModuleType("backends.qwen3_asr")
-    mock_mod.Qwen3ASRBackend = mock_cls
-
-    if "backends" not in sys.modules:
-        parent = types.ModuleType("backends")
-        monkeypatch.setitem(sys.modules, "backends", parent)
-    monkeypatch.setitem(sys.modules, "backends.qwen3_asr", mock_mod)
-
-    # Ensure jetson_qwen3_speech is NOT importable so the local fallback is used
-    monkeypatch.setitem(sys.modules, "jetson_qwen3_speech", None)
-    return mock_cls
-
-
-def _inject_mock_trt_edgellm(monkeypatch):
-    """Inject a fake backends.trt_edge_llm_asr module into sys.modules."""
-    mock_cls = _make_mock_backend_class("TRTEdgeLLMASRBackend")
-    mock_mod = types.ModuleType("backends.trt_edge_llm_asr")
-    mock_mod.TRTEdgeLLMASRBackend = mock_cls
-
-    if "backends" not in sys.modules:
-        parent = types.ModuleType("backends")
-        monkeypatch.setitem(sys.modules, "backends", parent)
-    monkeypatch.setitem(sys.modules, "backends.trt_edge_llm_asr", mock_mod)
-    return mock_cls
-
-
-def _load_factory(monkeypatch):
-    """Remove asr_backend from sys.modules cache and re-import it fresh.
-
-    This is necessary because create_asr_backend uses lazy imports inside the
-    function body, but the module itself must be reloaded to ensure we get a
-    clean function reference unaffected by any previous import-cache state.
+    Walks the dotted path so intermediate packages exist in sys.modules.
     """
-    # Also stub out numpy so asr_backend.py can import without the real package
+    parts = dotted.split(".")
+    for i in range(1, len(parts)):
+        prefix = ".".join(parts[:i])
+        if prefix not in sys.modules:
+            monkeypatch.setitem(sys.modules, prefix, types.ModuleType(prefix))
+    mock_cls = _make_mock_backend_class(class_name)
+    mod = types.ModuleType(dotted)
+    setattr(mod, class_name, mock_cls)
+    monkeypatch.setitem(sys.modules, dotted, mod)
+    return mock_cls
+
+
+def _patch_profile(monkeypatch, profile_dict):
+    """Patch app.core.profile_loader.current_profile() to return profile_dict."""
+    from app.core import profile_loader
+    monkeypatch.setattr(profile_loader, "_CURRENT_PROFILE", profile_dict, raising=False)
+
+
+@pytest.fixture
+def fresh_factory(monkeypatch):
+    """Stub numpy if absent (asr_backend imports it at module scope), reload the
+    factory module, and return create_asr_backend."""
     if "numpy" not in sys.modules:
         monkeypatch.setitem(sys.modules, "numpy", MagicMock())
-
-    monkeypatch.delitem(sys.modules, "asr_backend", raising=False)
-    import asr_backend
+    from app.core import asr_backend
     importlib.reload(asr_backend)
     return asr_backend.create_asr_backend
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def test_profile_selects_trt_edge_llm(monkeypatch, fresh_factory):
+    cls = _inject_module(
+        monkeypatch, "app.backends.jetson.trt_edge_llm_asr", "TRTEdgeLLMASRBackend"
+    )
+    _patch_profile(monkeypatch, {"asr_backend": "jetson.trt_edge_llm"})
+
+    result = fresh_factory()
+
+    cls.assert_called_once()
+    assert result is cls.return_value
 
 
-def test_default_is_paraformer_for_zh_en(monkeypatch):
-    """No env vars set → LANGUAGE_MODE default zh_en uses Paraformer TRT."""
-    paraformer_cls = _inject_mock_paraformer(monkeypatch)
-    monkeypatch.delenv("LANGUAGE_MODE", raising=False)
-    monkeypatch.delenv("ASR_BACKEND", raising=False)
+def test_profile_selects_paraformer(monkeypatch, fresh_factory):
+    cls = _inject_module(
+        monkeypatch, "app.backends.jetson.paraformer_trt", "ParaformerTRTBackend"
+    )
+    _patch_profile(monkeypatch, {"asr_backend": "jetson.paraformer_trt"})
 
-    create_asr_backend = _load_factory(monkeypatch)
-    result = create_asr_backend()
+    result = fresh_factory()
 
-    paraformer_cls.assert_called_once()
-    assert result is paraformer_cls.return_value
-
-
-def test_multilanguage_selects_trt_edgellm(monkeypatch):
-    """LANGUAGE_MODE=multilanguage → backend resolves to EdgeLLM worker ASR."""
-    trt_cls = _inject_mock_trt_edgellm(monkeypatch)
-    monkeypatch.setenv("LANGUAGE_MODE", "multilanguage")
-    monkeypatch.delenv("ASR_BACKEND", raising=False)
-
-    create_asr_backend = _load_factory(monkeypatch)
-    result = create_asr_backend()
-
-    trt_cls.assert_called_once()
-    assert result is trt_cls.return_value
+    cls.assert_called_once()
+    assert result is cls.return_value
 
 
-def test_multilanguage_can_explicitly_select_legacy_qwen3(monkeypatch):
-    """ASR_BACKEND=qwen3 keeps the old local/package backend as an explicit override."""
-    qwen3_cls = _inject_mock_qwen3(monkeypatch)
-    monkeypatch.setenv("LANGUAGE_MODE", "multilanguage")
-    monkeypatch.setenv("ASR_BACKEND", "qwen3")
+def test_profile_selects_sherpa(monkeypatch, fresh_factory):
+    cls = _inject_module(
+        monkeypatch, "app.backends.cpu.sherpa_asr", "SherpaASRBackend"
+    )
+    _patch_profile(monkeypatch, {"asr_backend": "cpu.sherpa_asr"})
 
-    create_asr_backend = _load_factory(monkeypatch)
-    result = create_asr_backend()
+    result = fresh_factory()
 
-    qwen3_cls.assert_called_once()
-    assert result is qwen3_cls.return_value
-
-
-def test_explicit_backend_name(monkeypatch):
-    """Passing backend_name='sherpa' explicitly → SherpaASRBackend regardless of env."""
-    sherpa_cls = _inject_mock_sherpa(monkeypatch)
-    monkeypatch.setenv("LANGUAGE_MODE", "multilanguage")  # would pick qwen3 if auto
-
-    create_asr_backend = _load_factory(monkeypatch)
-    result = create_asr_backend(backend_name="sherpa")
-
-    sherpa_cls.assert_called_once()
-    assert result is sherpa_cls.return_value
+    cls.assert_called_once()
+    assert result is cls.return_value
 
 
-def test_unknown_backend_raises(monkeypatch):
-    """Passing an unrecognised backend_name → ValueError."""
-    monkeypatch.delenv("LANGUAGE_MODE", raising=False)
-    monkeypatch.delenv("ASR_BACKEND", raising=False)
+def test_missing_asr_backend_raises(monkeypatch, fresh_factory):
+    _patch_profile(monkeypatch, {})
+    with pytest.raises(ValueError, match="asr_backend"):
+        fresh_factory()
 
-    create_asr_backend = _load_factory(monkeypatch)
 
-    import pytest
-    with pytest.raises(ValueError, match="Unknown ASR backend"):
-        create_asr_backend(backend_name="nonexistent")
+def test_unknown_asr_backend_raises(monkeypatch, fresh_factory):
+    _patch_profile(monkeypatch, {"asr_backend": "nonexistent.backend"})
+    with pytest.raises(ValueError, match="Unknown asr_backend"):
+        fresh_factory()

@@ -2,15 +2,16 @@
 
 Run: cd /Users/harvest/project/jetson-voice && python3 -m pytest tests/test_streaming_asr.py -v
 """
+import os
 import sys
-sys.path.insert(0, "app")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
 import pytest
 from collections import deque
 from unittest.mock import MagicMock, patch
 
-from backends.qwen3_asr import (
+from app.backends.jetson.qwen3_asr import (
     Qwen3StreamingASRStream,
     SegmentInfo,
     _is_cjk,

@@ -5,8 +5,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from asr_backend import ASRCapability
-from backends.trt_edge_llm_asr import (
+from app.core.asr_backend import ASRCapability
+from app.backends.jetson.trt_edge_llm_asr import (
     TRTEdgeLLMASRBackend,
     _float_audio_to_wav_bytes,
 )

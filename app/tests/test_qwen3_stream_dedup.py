@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backends.qwen3_asr import Qwen3StreamingASRStream, DEDUP_MAX_OVERLAP
+from app.backends.jetson.qwen3_asr import Qwen3StreamingASRStream, DEDUP_MAX_OVERLAP
 
 
 class MockBackend:

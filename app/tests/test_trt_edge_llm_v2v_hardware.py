@@ -10,8 +10,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_qwen3_tts_asr_round_trip_nihao():
-    from backends.trt_edge_llm_asr import TRTEdgeLLMASRBackend
-    from backends.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
+    from app.backends.jetson.trt_edge_llm_asr import TRTEdgeLLMASRBackend
+    from app.backends.jetson.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
 
     text = "你好。"
     tts = TRTEdgeLLMTTSBackend()

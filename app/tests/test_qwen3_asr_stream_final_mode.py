@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backends.qwen3_asr import Qwen3StreamingASRStream
+from app.backends.jetson.qwen3_asr import Qwen3StreamingASRStream
 
 
 class FakeTokenizer:

@@ -14,7 +14,7 @@ import numpy as np
 def main():
     wav_path = sys.argv[1] if len(sys.argv) > 1 else None
 
-    from backends.qwen3_asr import Qwen3ASRBackend
+    from app.backends.jetson.qwen3_asr import Qwen3ASRBackend
 
     print("Loading Qwen3-ASR backend...")
     backend = Qwen3ASRBackend()

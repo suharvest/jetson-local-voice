@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Import only the pure-Python pieces — no ONNX/GPU deps required
-from backends.qwen3_asr import _is_cjk, Qwen3StreamingASRStream
+from app.backends.jetson.qwen3_asr import _is_cjk, Qwen3StreamingASRStream
 
 _la = Qwen3StreamingASRStream._local_agreement
 

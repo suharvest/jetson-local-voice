@@ -105,7 +105,7 @@ def _synthesize(args: argparse.Namespace, text: str, max_audio_length: int, outp
     os.environ.setdefault("QWEN3_CP_ENGINE", str(engines_dir / "cp_unified_bf16.engine"))
     os.environ.setdefault("QWEN3_TTS_CP_KV_ENGINE", str(engines_dir / "cp_unified_bf16.engine"))
 
-    from backends.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
+    from app.backends.jetson.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
 
     t0 = time.time()
     backend = TRTEdgeLLMTTSBackend()
@@ -130,7 +130,7 @@ def _asr_with_product_qwen3(args: argparse.Namespace, wav_path: Path) -> dict[st
     _prepare_imports(args)
     os.environ.setdefault("QWEN3_ASR_MODEL_BASE", args.qwen3_asr_model_base)
 
-    from backends.qwen3_asr import Qwen3ASRBackend
+    from app.backends.jetson.qwen3_asr import Qwen3ASRBackend
 
     t0 = time.time()
     backend = Qwen3ASRBackend()
@@ -160,7 +160,7 @@ os.environ.setdefault('MODEL_DIR', '/opt/models')
 os.environ.setdefault('LANGUAGE_MODE', 'zh_en')
 os.environ.setdefault('ASR_BACKEND', 'paraformer_trt')
 
-from asr_backend import create_asr_backend
+from app.core.asr_backend import create_asr_backend
 
 backend = create_asr_backend('paraformer_trt')
 t0 = time.time()

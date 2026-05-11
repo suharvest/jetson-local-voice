@@ -15,8 +15,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from asr_backend import TranscriptionResult  # noqa: E402
-from backends.qwen3_asr import Qwen3StreamingASRStream  # noqa: E402
+from app.core.asr_backend import TranscriptionResult  # noqa: E402
+from app.backends.jetson.qwen3_asr import Qwen3StreamingASRStream  # noqa: E402
 
 
 # ── Test double ────────────────────────────────────────────────────────

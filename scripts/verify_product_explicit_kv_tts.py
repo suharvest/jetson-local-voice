@@ -5,7 +5,7 @@ import json
 import os
 import wave
 
-from backends.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
+from app.backends.jetson.trt_edge_llm_tts import TRTEdgeLLMTTSBackend
 
 
 def _write_pcm16_wav(path: str, pcm: bytes, sample_rate: int = 24000) -> None:
