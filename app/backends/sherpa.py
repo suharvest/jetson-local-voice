@@ -183,12 +183,19 @@ class SherpaBackend(TTSBackend):
         return wav_bytes, meta
 
     def generate_streaming(self, text: str, **kwargs):
-        """Yield PCM int16 chunks (sentence-level streaming)."""
+        """Yield PCM int16 chunks as the vocoder produces them (true streaming)."""
         import queue
+        import threading
 
-        sid = kwargs.get("speaker_id", DEFAULT_SPEAKER_ID)
-        speed = kwargs.get("speed", DEFAULT_SPEED)
-        pitch = kwargs.get("pitch_shift", PITCH_SHIFT)
+        sid = kwargs.get("speaker_id")
+        if sid is None:
+            sid = DEFAULT_SPEAKER_ID
+        speed = kwargs.get("speed")
+        if speed is None:
+            speed = DEFAULT_SPEED
+        pitch = kwargs.get("pitch_shift")
+        if pitch is None:
+            pitch = PITCH_SHIFT
 
         audio_queue: queue.Queue[bytes | None] = queue.Queue()
 
@@ -200,8 +207,15 @@ class SherpaBackend(TTSBackend):
             audio_queue.put(pcm)
             return 1
 
-        self._tts.generate(text, sid=sid, speed=speed, callback=callback)
-        audio_queue.put(None)
+        def runner():
+            try:
+                self._tts.generate(text, sid=sid, speed=speed, callback=callback)
+            except Exception as e:
+                logger.exception("TTS streaming generate failed: %s", e)
+            finally:
+                audio_queue.put(None)
+
+        threading.Thread(target=runner, daemon=True).start()
 
         while True:
             chunk = audio_queue.get()
