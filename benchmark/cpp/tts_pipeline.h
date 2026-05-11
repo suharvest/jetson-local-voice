@@ -126,6 +126,11 @@ class TTSPipeline {
   // Print profiling stats and reset counters
   void PrintProfilingStats();
 
+  // Optional externally supplied uniform random stream. Product Python uses
+  // this to preserve parity with NumPy reference sampling for Qwen3-TTS.
+  void SetSamplingUniforms(const std::vector<double>& values);
+  void ClearSamplingUniforms();
+
   // Enable CUDA Graph for talker decode steps (per-step re-capture).
   // Captures a fresh graph every step using actual seq_len to avoid
   // attention dilution. Saves ~14ms per step from kernel launch overhead.
@@ -213,6 +218,10 @@ class TTSPipeline {
 
   // RNG for sampling — seeded per request for reproducibility
   std::mt19937 rng_{42};
+  std::vector<double> sampling_uniforms_;
+  size_t sampling_uniform_pos_ = 0;
+  bool use_sampling_uniforms_ = false;
+  double NextUniform01();
 
   // Mutex to serialize access to talker_ (prevents race between streaming daemon thread and offline requests)
   // Without this, streaming TTS daemon thread may leave stream in capturing state when next offline request starts.

@@ -8,6 +8,7 @@
 - Vocoder: ORT CUDA EP
 """
 import argparse, json, os, time, wave
+from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
@@ -42,6 +43,16 @@ CODEC_NOTHINK = CFG["codec_nothink_id"]
 CODEC_THINK_BOS = CFG["codec_think_bos_id"]
 CODEC_THINK_EOS = CFG["codec_think_eos_id"]
 LANG_IDS = CFG["codec_language_id"]
+
+
+def dump_array(name, values):
+    dump_dir = os.environ.get("QWEN3_TTS_DUMP_DIR")
+    if not dump_dir:
+        return
+    prefix = os.environ.get("QWEN3_TTS_DUMP_PREFIX", "reference")
+    Path(dump_dir).mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(values)
+    arr.tofile(Path(dump_dir) / f"{prefix}_{name}")
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +231,27 @@ so = ort.SessionOptions()
 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 CUDA = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
-text_proj_s = ort.InferenceSession(f"{SHERPA_DIR}/text_project.onnx", so, providers=CUDA)
+text_project_onnx = f"{SHERPA_DIR}/text_project.onnx"
+text_projection_onnx = f"{SHERPA_DIR}/text_projection_only.onnx"
+text_embed_bin = f"{SHERPA_DIR}/text_embed_fp16.bin"
+text_proj_s = None
+text_projection_s = None
+text_embed_table = None
+if os.path.exists(text_embed_bin) and os.path.exists(text_projection_onnx):
+    text_embed_table = np.fromfile(text_embed_bin, dtype=np.float16).reshape(151936, -1)
+    text_projection_s = ort.InferenceSession(text_projection_onnx, so, providers=CUDA)
+else:
+    text_proj_s = ort.InferenceSession(text_project_onnx, so, providers=CUDA)
 codec_emb_s = ort.InferenceSession(f"{SHERPA_DIR}/codec_embed.onnx", so, providers=CUDA)
 cp_emb_s = ort.InferenceSession(f"{SHERPA_DIR}/code_predictor_embed.onnx", so, providers=CUDA)
-prefill_s = ort.InferenceSession(f"{SHERPA_DIR}/talker_prefill.onnx", so, providers=CUDA)
-voc_s = ort.InferenceSession(f"{MODEL_DIR}/vocoder.onnx", so, providers=CUDA) if os.path.exists(f"{MODEL_DIR}/vocoder.onnx") else None
+prefill_onnx = os.environ.get("TTS_PREFILL_ONNX", f"{SHERPA_DIR}/talker_prefill.onnx")
+if not os.path.exists(prefill_onnx):
+    prefill_onnx = f"{SHERPA_DIR}/talker_prefill_dynamic.onnx"
+vocoder_onnx = os.environ.get("TTS_VOCODER_ONNX", f"{MODEL_DIR}/vocoder.onnx")
+if not os.path.exists(vocoder_onnx):
+    vocoder_onnx = f"{SHERPA_DIR}/vocoder_fp16.onnx"
+prefill_s = ort.InferenceSession(prefill_onnx, so, providers=CUDA)
+voc_s = ort.InferenceSession(vocoder_onnx, so, providers=CUDA) if os.path.exists(vocoder_onnx) else None
 
 # Talker: TRT with GPU-resident KV, or ORT CUDA fallback
 talker_trt = None
@@ -260,6 +287,9 @@ print("Models loaded.")
 # Helpers
 # ---------------------------------------------------------------------------
 def text_proj(ids):
+    if text_projection_s is not None:
+        gathered = text_embed_table[np.array(ids, dtype=np.int64)].astype(np.float32)[np.newaxis, :, :]
+        return text_projection_s.run(None, {text_projection_s.get_inputs()[0].name: gathered})[0]
     return text_proj_s.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[0]
 
 def codec_emb(ids):
@@ -323,6 +353,7 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
     t_total = time.perf_counter()
 
     prefill_emb, trailing_text, tts_pad_e, codec_pad_e = build_prefill(text, lang)
+    dump_array("prefill_embeds_f32.bin", prefill_emb.astype(np.float32).reshape(-1))
 
     # --- Prefill (ORT CUDA) ---
     t0 = time.perf_counter()
@@ -331,6 +362,8 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
     logits = pf_map["logits"]
     last_hidden = pf_map["last_hidden"]
     kv = {k: v for k, v in pf_map.items() if k.startswith("past_")}
+    dump_array("talker_prefill_logits_f32.bin", logits[0, -1, :].astype(np.float32).reshape(-1))
+    dump_array("talker_prefill_hidden_f32.bin", last_hidden.astype(np.float32).reshape(-1))
     pf_ms = (time.perf_counter() - t0) * 1000
 
     # Seed TRT KV cache from prefill output (one-time copy)
@@ -347,6 +380,8 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
     for step in range(max_frames):
         primary_code = sample(logits[0, -1, :], TALKER_VOCAB,
                               suppress_eos=(step < 2), eos_id=CODEC_EOS)
+        if step == 0:
+            dump_array("frame0_primary_i32.bin", np.array([primary_code], dtype=np.int32))
         if primary_code == CODEC_EOS:
             print(f"  EOS at step {step}")
             break
@@ -358,6 +393,12 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
         cp_ctx = np.concatenate([lh_last, primary_e], axis=1).astype(np.float32)
         codec_sum = primary_e[0, 0, :].copy()
         frame_codes = [primary_code]
+        if step == 0:
+            dump_array("cp_input_hidden_f32.bin", lh_last.astype(np.float32).reshape(-1))
+            dump_array("cp_input_primary_emb_f32.bin", primary_e.astype(np.float32).reshape(-1))
+        if step < 2:
+            dump_array(f"cp_frame{step}_input_hidden_f32.bin", lh_last.astype(np.float32).reshape(-1))
+            dump_array(f"cp_frame{step}_input_primary_emb_f32.bin", primary_e.astype(np.float32).reshape(-1))
 
         for j in range(N_GROUPS - 1):
             cp_logits = cp_trt_engine.predict(cp_ctx, j) if cp_trt_engine else cp_iob.predict(cp_ctx, j)
@@ -368,6 +409,8 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
             codec_sum += re[0, 0, :]
         ct_times.append(time.perf_counter() - t_cp)
         all_codes.append(frame_codes)
+        if step == 0:
+            dump_array("frame0_codes_i32.bin", np.array(frame_codes, dtype=np.int32))
 
         # --- Next talker input ---
         if step < len(trailing_text):
@@ -375,6 +418,9 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
         else:
             text_e = tts_pad_e[0, 0, :] + codec_pad_e[0, 0, :]
         next_emb = (codec_sum + text_e).reshape(1, 1, D).astype(np.float32)
+        if step < 12:
+            dump_array(f"frame{step}_addend_f32.bin", np.asarray(text_e, dtype=np.float32).reshape(-1))
+            dump_array(f"frame{step}_residual_f32.bin", next_emb.astype(np.float32).reshape(-1))
 
         # --- Talker decode ---
         t_d = time.perf_counter()
@@ -390,6 +436,9 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
             last_hidden = dc_map["last_hidden"]
             kv = {k.replace("new_", ""): v for k, v in dc_map.items()
                   if k.startswith("new_past_")}
+        if step < 12:
+            dump_array(f"talker_decode{step + 1}_logits_f32.bin", logits.astype(np.float32).reshape(-1))
+            dump_array(f"talker_decode{step + 1}_hidden_f32.bin", last_hidden.astype(np.float32).reshape(-1))
         dt_times.append(time.perf_counter() - t_d)
 
         if (step + 1) % 10 == 0:
@@ -399,6 +448,7 @@ def synthesize(text, lang="english", output="/tmp/tts_sherpa_trt.wav", max_frame
     if n == 0:
         print("  No frames!")
         return
+    dump_array("all_codes_i32.bin", np.array(all_codes, dtype=np.int32).reshape(-1))
 
     dur = n / 12.5
     da = np.mean(dt_times) * 1000

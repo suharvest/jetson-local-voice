@@ -102,7 +102,7 @@ endif()
 
 if(pybind11_FOUND)
     message(STATUS "pybind11 found — building Python module")
-    pybind11_add_module(qwen3_speech_engine
+    pybind11_add_module(qwen3_speech_engine NO_EXTRAS
         tts_binding.cpp
         tts_trt_engine.cpp
         tts_ort_models.cpp

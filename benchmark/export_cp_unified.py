@@ -49,6 +49,7 @@ _mock_torchaudio()
 
 import torch
 import torch.nn as nn
+from safetensors.torch import save_file
 from transformers import AutoConfig, AutoModel
 from transformers.cache_utils import DynamicCache
 
@@ -80,7 +81,12 @@ def _simple_causal_mask_explicit(config, input_embeds, attention_mask, cache_pos
     batch, seq_len = input_embeds.shape[:2]
     
     # Get past KV length from cache shape (may be padded > past_length)
-    past_kv_len = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+    if past_key_values is None:
+        past_kv_len = 0
+    elif hasattr(past_key_values, "layers"):
+        past_kv_len = past_key_values.layers[0].keys.shape[2]
+    else:
+        past_kv_len = past_key_values[0][0].shape[2]
     
     # Total KV positions = cache + current sequence
     total_kv_len = past_kv_len + seq_len
@@ -190,7 +196,10 @@ class CPUnifiedWrapper(nn.Module):
         all_logits = all_logits.reshape(self.num_heads, -1)  # [15, 2048]
 
         # Flatten updated KV cache
-        new_kv = out.past_key_values.to_legacy_cache()
+        if hasattr(out.past_key_values, "to_legacy_cache"):
+            new_kv = out.past_key_values.to_legacy_cache()
+        else:
+            new_kv = tuple((layer.keys, layer.values) for layer in out.past_key_values.layers)
         new_kv_flat = tuple(t for kv in new_kv for t in kv)
 
         return (all_logits,) + new_kv_flat
@@ -254,7 +263,10 @@ class CPSingleHeadWrapper(nn.Module):
         logits = torch.matmul(last_hidden, weight.T)  # [1, 1, 2048]
         logits = logits.reshape(1, -1)  # [1, 2048]
 
-        new_kv = out.past_key_values.to_legacy_cache()
+        if hasattr(out.past_key_values, "to_legacy_cache"):
+            new_kv = out.past_key_values.to_legacy_cache()
+        else:
+            new_kv = tuple((layer.keys, layer.values) for layer in out.past_key_values.layers)
         new_kv_flat = tuple(t for kv in new_kv for t in kv)
 
         return (logits,) + new_kv_flat
@@ -393,6 +405,34 @@ def export_cp_single_head(model, output_dir, opset=17, device="cpu"):
     print(f"          past_key/value_{{0..{N-1}}} [1, {H}, past_len, {dh}]")
     print(f"  Output: logits [1, {V}] — single head")
     print(f"          new_past_key/value_{{0..{N-1}}} [1, {H}, new_len, {dh}]")
+
+
+def save_cp_sidecars(model, output_dir):
+    cp = model.talker.code_predictor
+    os.makedirs(output_dir, exist_ok=True)
+
+    codec_embeddings = cp.model.codec_embedding
+    save_file(
+        {f"embedding_{i}": emb.weight.detach().cpu().half() for i, emb in enumerate(codec_embeddings)},
+        os.path.join(output_dir, "codec_embeddings.safetensors"),
+    )
+    stacked = torch.stack([emb.weight.detach().cpu().float() for emb in codec_embeddings]).contiguous()
+    stacked.numpy().tofile(os.path.join(output_dir, "cp_embed_fp32.bin"))
+
+    save_file(
+        {f"lm_head_{i}.weight": head.weight.detach().cpu().half() for i, head in enumerate(cp.lm_head)},
+        os.path.join(output_dir, "lm_heads.safetensors"),
+    )
+
+    proj = cp.small_to_mtp_projection
+    if hasattr(proj, "weight") and hasattr(proj, "bias"):
+        save_file(
+            {
+                "weight": proj.weight.detach().cpu().half(),
+                "bias": proj.bias.detach().cpu().half(),
+            },
+            os.path.join(output_dir, "small_to_mtp_projection.safetensors"),
+        )
 
 
 def verify_cp_unified(output_dir):
@@ -662,6 +702,8 @@ def main():
         if not a.no_verify:
             verify_cp_unified(a.output_dir)
             verify_mask_correctness(a.output_dir)
+
+    save_cp_sidecars(model, a.output_dir)
 
     # Print ONNX info
     import onnx

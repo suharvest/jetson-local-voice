@@ -7,9 +7,11 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -380,6 +382,7 @@ class TRTCPKVEngine {
   ~TRTCPKVEngine();
 
   void ResetInputShapes();  // NOTE: startup-only; not thread-safe against in-flight requests
+  void SetSamplingSeed(unsigned long long seed);
 
   // Run CP for one codec frame (autoregressive):
   //   Step 0: prefill [hidden, primary_emb] (seq_len=2) → logits[0] → sample code[0]
@@ -392,7 +395,8 @@ class TRTCPKVEngine {
   void RunFrameAutoregressive(const float* hidden, const float* primary_emb,
                               int* codes_out,
                               const float* embed_table, int embed_vocab,
-                              int active_groups = -1);
+                              int active_groups = -1,
+                              std::function<double()>* uniform01 = nullptr);
 
   // GPU-resident autoregressive CP: all 15 steps run async on GPU.
   // Only 1 H2D at start + 1 D2H sync at the end to read 15 sampled codes.
@@ -503,7 +507,9 @@ class TRTCPKVEngine {
   int* d_codes_out_ = nullptr;             // [cp_out_groups] int on GPU
   int64_t* d_cache_pos_table_ = nullptr;   // [max_past] int64 pre-filled {0,1,2,...}
   int64_t* d_cache_pos_single_ = nullptr;  // [1] int64 written by kernel
+  unsigned long long rng_seed_ = 0;         // per-request seed for GPU sampler
   unsigned long long rng_counter_ = 0;     // monotonic counter for cuRAND sequence
+  std::mt19937 cp_rng_;                    // per-request CPU sampler
 
   // Pre-cached tensor names for fast binding
   std::vector<std::string> cp_kv_names_;     // "past_key_0", "past_value_0", ...

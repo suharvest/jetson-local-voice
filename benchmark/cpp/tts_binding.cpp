@@ -155,8 +155,11 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            [](TTSPipeline& self, const std::string& text,
               const std::string& lang,
               const std::vector<int64_t>& token_ids,
-              int max_frames, int seed) -> py::dict {
+              int max_frames, int seed,
+              const std::vector<double>& random_values) -> py::dict {
              py::gil_scoped_release release;
+             if (!random_values.empty()) self.SetSamplingUniforms(random_values);
+             else self.ClearSamplingUniforms();
              SynthResult r;
              if (!token_ids.empty()) {
                r = self.SynthesizeWithTokenIds(text, lang, token_ids,
@@ -164,6 +167,7 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
              } else {
                r = self.Synthesize(text, lang, max_frames, seed);
              }
+             self.ClearSamplingUniforms();
 
              py::gil_scoped_acquire acquire;
              py::dict result;
@@ -180,7 +184,8 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            py::arg("lang") = "english",
            py::arg("token_ids") = std::vector<int64_t>{},
            py::arg("max_frames") = 200,
-           py::arg("seed") = 0)
+           py::arg("seed") = 0,
+           py::arg("random_values") = std::vector<double>{})
 
       .def("synthesize_clone",
            [](TTSPipeline& self, const std::string& text,
@@ -227,7 +232,8 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
               const std::string& lang,
               const std::vector<int64_t>& token_ids,
               int first_chunk_frames, int chunk_frames,
-              int max_frames, int seed) -> py::list {
+              int max_frames, int seed,
+              const std::vector<double>& random_values) -> py::list {
              StreamConfig config;
              config.first_chunk_frames = first_chunk_frames;
              config.chunk_frames = chunk_frames;
@@ -241,10 +247,13 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
                py::gil_scoped_release release;
 
                std::vector<StreamChunk> collected;
+               if (!random_values.empty()) self.SetSamplingUniforms(random_values);
+               else self.ClearSamplingUniforms();
                self.SynthesizeStreaming(text, lang, token_ids, config,
                    [&collected](const StreamChunk& chunk) {
                      collected.push_back(chunk);
                    });
+               self.ClearSamplingUniforms();
 
                py::gil_scoped_acquire acquire;
                for (auto& c : collected) {
@@ -265,7 +274,8 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            py::arg("first_chunk_frames") = 10,
            py::arg("chunk_frames") = 25,
            py::arg("max_frames") = 200,
-           py::arg("seed") = 0)
+           py::arg("seed") = 0,
+           py::arg("random_values") = std::vector<double>{})
 
       .def("enable_profiling", &TTSPipeline::EnableProfiling,
            py::arg("enable") = true,
@@ -285,7 +295,8 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
               const std::vector<int64_t>& token_ids,
               py::object callback,
               int first_chunk_frames, int chunk_frames,
-              int max_frames, int seed) {
+              int max_frames, int seed,
+              const std::vector<double>& random_values) {
              StreamConfig config;
              config.first_chunk_frames = first_chunk_frames;
              config.chunk_frames = chunk_frames;
@@ -294,6 +305,8 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
 
              // Release GIL for C++ work, reacquire in callback for Python
              py::gil_scoped_release release;
+             if (!random_values.empty()) self.SetSamplingUniforms(random_values);
+             else self.ClearSamplingUniforms();
              self.SynthesizeStreaming(text, lang, token_ids, config,
                  [&callback](const StreamChunk& chunk) {
                    py::gil_scoped_acquire acquire;
@@ -304,6 +317,7 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
                    d["is_final"] = chunk.is_final;
                    callback(d);
                  });
+             self.ClearSamplingUniforms();
            },
            py::arg("text"),
            py::arg("lang"),
@@ -312,7 +326,8 @@ PYBIND11_MODULE(qwen3_speech_engine, m) {
            py::arg("first_chunk_frames") = 10,
            py::arg("chunk_frames") = 25,
            py::arg("max_frames") = 200,
-           py::arg("seed") = 0)
+           py::arg("seed") = 0,
+           py::arg("random_values") = std::vector<double>{})
 
       .def("synthesize_streaming_clone_callback",
            [](TTSPipeline& self, const std::string& text,

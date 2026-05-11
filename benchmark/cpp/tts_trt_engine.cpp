@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
@@ -27,6 +28,26 @@
       std::abort();                                                       \
     }                                                                     \
   } while (0)
+
+static std::filesystem::path Qwen3TTSDumpPath(const std::string& name) {
+  const char* dump_dir = std::getenv("QWEN3_TTS_DUMP_DIR");
+  if (!dump_dir || !*dump_dir) return {};
+  std::filesystem::create_directories(dump_dir);
+  std::string prefix = "native";
+  if (const char* p = std::getenv("QWEN3_TTS_DUMP_PREFIX")) {
+    if (*p) prefix = p;
+  }
+  return std::filesystem::path(dump_dir) / (prefix + "_" + name);
+}
+
+template <typename T>
+static void Qwen3TTSDumpVector(const std::string& name, const std::vector<T>& values) {
+  auto path = Qwen3TTSDumpPath(name);
+  if (path.empty()) return;
+  std::ofstream file(path, std::ios::binary);
+  file.write(reinterpret_cast<const char*>(values.data()),
+             static_cast<std::streamsize>(values.size() * sizeof(T)));
+}
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -1394,6 +1415,7 @@ TRTCPKVEngine::TRTCPKVEngine(const std::string& engine_path, int n_cp_layers,
                               int cp_vocab, int cp_out_groups, int /*max_past*/)
     : n_cp_layers_(n_cp_layers), hidden_dim_(hidden_dim), n_heads_(n_heads),
       head_dim_(head_dim), cp_vocab_(cp_vocab), cp_out_groups_(cp_out_groups) {
+  SetSamplingSeed(0);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
   engine_.reset(LoadEngineStreaming(runtime_.get(), engine_path));
   if (!engine_) {
@@ -1623,6 +1645,17 @@ TRTCPKVEngine::~TRTCPKVEngine() {
   if (stream_) cudaStreamDestroy(stream_);
 }
 
+void TRTCPKVEngine::SetSamplingSeed(unsigned long long seed) {
+  if (seed == 0) {
+    seed = std::chrono::high_resolution_clock::now()
+               .time_since_epoch()
+               .count();
+  }
+  rng_seed_ = seed;
+  rng_counter_ = 0;
+  cp_rng_.seed(static_cast<std::mt19937::result_type>(seed));
+}
+
 void TRTCPKVEngine::ResetInputShapes() {
   // P1: force re-bind optimization profile per request to reset TRT 10.3 Myelin
   // state on Jetson (known buggy: "already loaded binary graph" on request 2+).
@@ -1703,7 +1736,8 @@ void TRTCPKVEngine::RunFrameAutoregressive(
     const float* hidden, const float* primary_emb,
     int* codes_out,
     const float* embed_table, int embed_vocab,
-    int active_groups) {
+    int active_groups,
+    std::function<double()>* uniform01) {
   // Autoregressive CP: 15 sequential steps.
   //
   // Two execution strategies (selected automatically):
@@ -1743,13 +1777,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
   // fits in [1, n_heads, max_past_, head_dim] buffers.
   const int fixed_past = max_past_ - 1;
 
-  // RNG seed for GPU sampling
-  unsigned long long rng_seed = std::chrono::high_resolution_clock::now()
-      .time_since_epoch().count();
-
   // CPU sampling fallback (only used when no GPU embed table)
-  static thread_local std::mt19937 cp_rng(
-      std::chrono::high_resolution_clock::now().time_since_epoch().count());
   auto sample_topk_cpu = [&](const void* logits_buf, int group_idx) -> int {
     size_t offset = is_single_head_ ? 0 : (size_t)group_idx * cp_vocab_;
     std::vector<float> logits(cp_vocab_);
@@ -1769,10 +1797,25 @@ void TRTCPKVEngine::RunFrameAutoregressive(
                                   cudaMemcpyDeviceToHost, stream_));
       CHECK_CUDA(cudaStreamSynchronize(stream_));
     }
+    static bool dumped_first_cp_group0_logits = false;
+    if (group_idx == 0 && !dumped_first_cp_group0_logits) {
+      Qwen3TTSDumpVector("cp_logits_g0_f32.bin", logits);
+      dumped_first_cp_group0_logits = true;
+    }
+    static int dumped_cp_sample_calls = 0;
+    if (std::getenv("QWEN3_TTS_GREEDY") && dumped_cp_sample_calls < 32) {
+      Qwen3TTSDumpVector("cp_call_" + std::to_string(dumped_cp_sample_calls) +
+                             "_g" + std::to_string(group_idx) + "_logits_f32.bin",
+                         logits);
+      ++dumped_cp_sample_calls;
+    }
     std::vector<std::pair<float, int>> vals(cp_vocab_);
     for (int v = 0; v < cp_vocab_; ++v) vals[v] = {logits[v], v};
     std::partial_sort(vals.begin(), vals.begin() + 50, vals.end(),
                       [](auto& a, auto& b) { return a.first > b.first; });
+    if (std::getenv("QWEN3_TTS_GREEDY")) {
+      return vals[0].second;
+    }
     double max_v = vals[0].first;
     std::vector<double> probs(50);
     double sum = 0;
@@ -1781,8 +1824,58 @@ void TRTCPKVEngine::RunFrameAutoregressive(
       sum += probs[v];
     }
     for (auto& p : probs) p /= sum;
+    if (uniform01) {
+      double u = (*uniform01)();
+      if (u < 0.0) u = 0.0;
+      if (u >= 1.0) u = std::nextafter(1.0, 0.0);
+      if (std::getenv("QWEN3_TTS_CP_UNIFORM_SORTED")) {
+        double acc = 0.0;
+        int last_eligible = vals[49].second;
+        for (int r = 0; r < 50; ++r) {
+          last_eligible = vals[r].second;
+          acc += probs[r];
+          if (u < acc) {
+            return vals[r].second;
+          }
+        }
+        return last_eligible;
+      }
+      double threshold = vals[49].first;
+      double vocab_sum = 0.0;
+      for (int v = 0; v < cp_vocab_; ++v) {
+        if (logits[v] >= threshold) {
+          vocab_sum += std::exp((logits[v] - max_v) / 0.9);
+        }
+      }
+      double acc = 0.0;
+      int last_eligible = vals[49].second;
+      for (int v = 0; v < cp_vocab_; ++v) {
+        if (logits[v] < threshold) continue;
+        last_eligible = v;
+        acc += std::exp((logits[v] - max_v) / 0.9) / vocab_sum;
+        if (u < acc) {
+          if (std::getenv("QWEN3_TTS_LOG_UNIFORMS") && group_idx < 3) {
+            std::cerr << "[cp_sample] group=" << group_idx
+                      << " u=" << u
+                      << " selected=" << v
+                      << " vocab_order=1"
+                      << " top=" << vals[0].second
+                      << " top_logit=" << vals[0].first << std::endl;
+          }
+          return v;
+        }
+      }
+      if (std::getenv("QWEN3_TTS_LOG_UNIFORMS") && group_idx < 3) {
+        std::cerr << "[cp_sample] group=" << group_idx
+                  << " u=" << u
+                  << " selected=" << last_eligible
+                  << " vocab_order=1 top=" << vals[0].second
+                  << " top_logit=" << vals[0].first << std::endl;
+      }
+      return last_eligible;
+    }
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return vals[dist(cp_rng)].second;
+    return vals[dist(cp_rng_)].second;
   };
 
   if (profiling_) {
@@ -1859,7 +1952,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
         cp_vocab_, D, /*layer_idx=*/0,
         /*next_cache_pos=*/2,
         /*top_k=*/50, /*temperature=*/0.9f,
-        rng_seed, rng_counter_++);
+        rng_seed_, rng_counter_++);
     // Sync after prefill: the decode context needs different shapes (seq_len=1
     // vs 2) which requires a one-time shape setup. After this, decode shapes
     // are fixed and no more syncs are needed between steps.
@@ -2078,7 +2171,7 @@ void TRTCPKVEngine::RunFrameAutoregressive(
           cp_vocab_, D, /*layer_idx=*/j,
           next_pos,
           /*top_k=*/50, /*temperature=*/0.9f,
-          rng_seed, rng_counter_++);
+          rng_seed_, rng_counter_++);
       CHECK_CUDA(cudaStreamSynchronize(stream_));
     } else {
       codes_out[j] = sample_topk_cpu(d_logits_decode_, j);
@@ -2152,10 +2245,6 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
   // fits in [1, n_heads, max_past_, head_dim] buffers.
   const int fixed_past = max_past_ - 1;
 
-  // Use a fixed seed derived from time for this frame, sequence from counter
-  unsigned long long rng_seed =
-      std::chrono::high_resolution_clock::now().time_since_epoch().count();
-
   if (profiling_) {
     CHECK_CUDA(cudaEventRecord(ev_start_, stream_));
   }
@@ -2217,7 +2306,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
       cp_vocab_, D, /*layer_idx=*/0,
       /*next_cache_pos=*/2,
       /*top_k=*/50, /*temperature=*/0.9f,
-      rng_seed, rng_counter_++);
+      rng_seed_, rng_counter_++);
   // Sync after prefill: decode context needs different shapes (seq_len=1 vs 2).
   // After this one-time setup, shapes are fixed and no more syncs needed.
   CHECK_CUDA(cudaStreamSynchronize(stream_));
@@ -2288,7 +2377,7 @@ void TRTCPKVEngine::RunFrameGPU(const float* hidden, const float* primary_emb,
         cp_vocab_, D, /*layer_idx=*/j,
         next_pos,
         /*top_k=*/50, /*temperature=*/0.9f,
-        rng_seed, rng_counter_++);
+        rng_seed_, rng_counter_++);
     // Sync after sample: dynamic shape change on next step needs a quiescent
     // stream, else TRT enqueueV3 triggers ~10ms internal reconfiguration.
     CHECK_CUDA(cudaStreamSynchronize(stream_));

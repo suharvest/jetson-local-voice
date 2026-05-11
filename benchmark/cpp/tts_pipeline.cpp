@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -14,6 +15,44 @@
 
 // Simple JSON parser for config.json (avoids external dependency)
 #include "json_minimal.h"
+
+static std::filesystem::path Qwen3TTSDumpPath(const std::string& name) {
+  const char* dump_dir = std::getenv("QWEN3_TTS_DUMP_DIR");
+  if (!dump_dir || !*dump_dir) return {};
+  std::filesystem::create_directories(dump_dir);
+  std::string prefix = "native";
+  if (const char* p = std::getenv("QWEN3_TTS_DUMP_PREFIX")) {
+    if (*p) prefix = p;
+  }
+  return std::filesystem::path(dump_dir) / (prefix + "_" + name);
+}
+
+template <typename T>
+static void Qwen3TTSDumpVector(const std::string& name, const std::vector<T>& values) {
+  auto path = Qwen3TTSDumpPath(name);
+  if (path.empty()) return;
+  std::ofstream file(path, std::ios::binary);
+  file.write(reinterpret_cast<const char*>(values.data()),
+             static_cast<std::streamsize>(values.size() * sizeof(T)));
+}
+
+static int Qwen3TTSEnvInt(const char* name, int default_value) {
+  const char* raw = std::getenv(name);
+  if (!raw || !*raw) return default_value;
+  char* end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (!end || *end != '\0') return default_value;
+  return static_cast<int>(value);
+}
+
+static float Qwen3TTSEnvFloat(const char* name, float default_value) {
+  const char* raw = std::getenv(name);
+  if (!raw || !*raw) return default_value;
+  char* end = nullptr;
+  float value = std::strtof(raw, &end);
+  if (!end || *end != '\0') return default_value;
+  return value;
+}
 
 // Memory checkpoint helper for OOM diagnosis. Reads /proc/meminfo and prints
 // MemAvailable in MB. Used to bisect TRT engine deserialization peaks on
@@ -175,9 +214,17 @@ TTSPipeline::TTSPipeline(const std::string& model_dir,
     // Its deserialization peak is smaller (~400 MB) and fits in the remaining
     // memory after vocoder. GPU embed upload and CUDA Graph warmup are deferred
     // to avoid pushing the peak over the limit.
+    bool use_cp_kv = true;
+    if (const char* env_cp_kv = std::getenv("QWEN3_TTS_CP_KV")) {
+      std::string v(env_cp_kv);
+      use_cp_kv = !(v == "0" || v == "false" || v == "False" || v == "no");
+    }
     std::string cp_kv_path = engine_dir + "/cp_unified_bf16.engine";
+    if (const char* env_cp_kv_engine = std::getenv("QWEN3_TTS_CP_KV_ENGINE")) {
+      if (*env_cp_kv_engine) cp_kv_path = env_cp_kv_engine;
+    }
     std::ifstream cp_kv_test(cp_kv_path);
-    if (cp_kv_test.good()) {
+    if (use_cp_kv && cp_kv_test.good()) {
       cp_kv_test.close();
       std::cout << "  Found CP KV engine: " << cp_kv_path << std::endl;
       TTSPipelineMemLog("before_cp_kv_load");
@@ -248,6 +295,13 @@ void TTSPipeline::LoadConfig(const std::string& sherpa_dir) {
   // Runtime CP codebook-count experiment knob.
   // Default = num_code_groups - 1 (all 15 residuals = full quality).
   cfg_.cp_active_groups = j.GetInt("cp_active_groups", cfg_.num_code_groups - 1);
+  if (const char* env_groups = std::getenv("QWEN3_TTS_ACTIVE_CP_GROUPS")) {
+    char* end = nullptr;
+    long value = std::strtol(env_groups, &end, 10);
+    if (end != env_groups && *end == '\0') {
+      cfg_.cp_active_groups = static_cast<int>(value);
+    }
+  }
   if (cfg_.cp_active_groups < 1) cfg_.cp_active_groups = 1;
   if (cfg_.cp_active_groups > cfg_.num_code_groups - 1)
     cfg_.cp_active_groups = cfg_.num_code_groups - 1;
@@ -370,6 +424,9 @@ int TTSPipeline::SampleWithPenalty(const float* logits, int vocab_size,
       if (v < threshold) v = -1e30;
     }
   }
+  if (std::getenv("QWEN3_TTS_GREEDY")) {
+    return (int)(std::max_element(l.begin(), l.end()) - l.begin());
+  }
 
   // 7. Softmax
   double max_val = *std::max_element(l.begin(), l.end());
@@ -381,8 +438,46 @@ int TTSPipeline::SampleWithPenalty(const float* logits, int vocab_size,
   for (auto& v : l) v /= sum;
 
   // 8. Sample — rng_ is a member, seeded per-request in GenerateInternal
+  if (use_sampling_uniforms_) {
+    double u = NextUniform01();
+    double acc = 0.0;
+    for (int i = 0; i < vocab_size; ++i) {
+      acc += l[i];
+      if (u < acc) return i;
+    }
+    return vocab_size - 1;
+  }
   std::discrete_distribution<int> dist(l.begin(), l.end());
   return dist(rng_);
+}
+
+void TTSPipeline::SetSamplingUniforms(const std::vector<double>& values) {
+  sampling_uniforms_ = values;
+  sampling_uniform_pos_ = 0;
+  use_sampling_uniforms_ = !sampling_uniforms_.empty();
+}
+
+void TTSPipeline::ClearSamplingUniforms() {
+  sampling_uniforms_.clear();
+  sampling_uniform_pos_ = 0;
+  use_sampling_uniforms_ = false;
+}
+
+double TTSPipeline::NextUniform01() {
+  double u;
+  if (sampling_uniform_pos_ < sampling_uniforms_.size()) {
+    u = sampling_uniforms_[sampling_uniform_pos_++];
+  } else {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    u = dist(rng_);
+  }
+  if (std::getenv("QWEN3_TTS_LOG_UNIFORMS") && sampling_uniform_pos_ <= 40) {
+    std::cerr << "[uniform] pos=" << (sampling_uniform_pos_ - 1)
+              << " value=" << u << std::endl;
+  }
+  if (u < 0.0) return 0.0;
+  if (u >= 1.0) return std::nextafter(1.0, 0.0);
+  return u;
 }
 
 bool TTSPipeline::DetectRepetition(const std::vector<int>& history,
@@ -414,15 +509,15 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
     const std::string& text, const std::string& lang,
     const float* speaker_embed,
     const std::vector<int64_t>* token_ids_ptr) {
-  // Official Qwen3-TTS prefill layout (multi-language):
+  // Product correctness layout, aligned with the original sherpa-style
+  // reference path that produced stable Qwen3-TTS audio on Jetson:
   //   [0..2]  = role_emb (text_proj([151644, 77091, 198]))
-  //   [3]     = tts_pad + codec[THINK]
+  //   [3]     = tts_pad + codec[NOTHINK]
   //   [4]     = tts_pad + codec[THINK_BOS]
-  //   [5]     = tts_pad + codec[lang_id]
-  //   [6]     = tts_pad + codec[THINK_EOS]
-  //   [6+s]   = speaker_embed             (only if voice clone, s=1)
-  //   [7+s]   = tts_bos + codec[PAD]
-  //   [8+s]   = body[0]  + codec[BOS]
+  //   [5]     = tts_pad + codec[THINK_EOS]
+  //   [5+s]   = speaker_embed             (only if voice clone, s=1)
+  //   [6+s]   = tts_bos + codec[PAD]
+  //   [7+s]   = body[0]  + codec[BOS]
   //   trailing = body[1:] + codec[PAD], then tts_eos + codec[PAD]
 
   int D = cfg_.hidden_dim;
@@ -438,21 +533,43 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
   const float* tts_eos_e = special_emb.data() + D;
   const float* tts_pad_e = special_emb.data() + 2 * D;
 
-  // Codec prefix: [THINK, THINK_BOS, lang_id, THINK_EOS, PAD, BOS]
-  int lang_id = cfg_.GetLangId(lang);
+  bool use_official_prefill = false;
+  if (const char* layout = std::getenv("QWEN3_TTS_PREFILL_LAYOUT")) {
+    use_official_prefill = std::string(layout) == "official";
+  }
   std::vector<int64_t> codec_ids;
-  if (lang_id >= 0) {
-    codec_ids = {cfg_.codec_think_id, cfg_.codec_think_bos_id,
-                 (int64_t)lang_id, cfg_.codec_think_eos_id,
-                 cfg_.codec_pad_id, cfg_.codec_bos_id};
+  if (use_official_prefill) {
+    int lang_id = cfg_.GetLangId(lang);
+    if (lang_id >= 0) {
+      codec_ids = {
+          cfg_.codec_think_id,
+          cfg_.codec_think_bos_id,
+          (int64_t)lang_id,
+          cfg_.codec_think_eos_id,
+          cfg_.codec_pad_id,
+          cfg_.codec_bos_id,
+      };
+    } else {
+      codec_ids = {
+          cfg_.codec_nothink_id,
+          cfg_.codec_think_bos_id,
+          cfg_.codec_think_eos_id,
+          cfg_.codec_pad_id,
+          cfg_.codec_bos_id,
+      };
+    }
   } else {
-    // Fallback: no language token (like old simplified version)
-    codec_ids = {cfg_.codec_nothink_id, cfg_.codec_think_bos_id,
-                 cfg_.codec_think_eos_id,
-                 cfg_.codec_pad_id, cfg_.codec_bos_id};
+    (void)lang;
+    codec_ids = {
+        cfg_.codec_nothink_id,
+        cfg_.codec_think_bos_id,
+        cfg_.codec_think_eos_id,
+        cfg_.codec_pad_id,
+        cfg_.codec_bos_id,
+    };
   }
   // Look up codec prefix embeddings from pre-loaded table (no ORT needed)
-  int n_codec = (int)codec_ids.size();  // 6 (with lang) or 5 (without)
+  int n_codec = (int)codec_ids.size();
   std::vector<float> codec_prefix(n_codec * D);
   for (int i = 0; i < n_codec; ++i) {
     const float* e = CodecEmbedLookup((int)codec_ids[i]);
@@ -514,7 +631,11 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
   pf.embeds = std::move(prefill);
   pf.seq_len = pos;
 
-  // Trailing text: body[1:], then tts_eos (NO codec_pad — matches official)
+  bool trailing_codec_pad = !use_official_prefill;
+  if (const char* env_pad = std::getenv("QWEN3_TTS_TRAILING_CODEC_PAD")) {
+    std::string v(env_pad);
+    trailing_codec_pad = !(v == "0" || v == "false" || v == "False" || v == "no");
+  }
   int n_text = body_emb.empty() ? 0 : (int)(body_emb.size() / D);
   int n_trailing = (n_text > 1 ? n_text - 1 : 0) + 1;  // body[1:] + eos
   pf.trailing_text.resize(n_trailing * D);
@@ -522,10 +643,17 @@ TTSPipeline::PrefillData TTSPipeline::BuildPrefill(
 
   int t = 0;
   for (int i = 1; i < n_text; ++i, ++t) {
-    VecCopy(pf.trailing_text.data() + t * D, body_emb.data() + i * D, D);
+    if (trailing_codec_pad) {
+      VecAdd(pf.trailing_text.data() + t * D, body_emb.data() + i * D, codec_pad_e, D);
+    } else {
+      VecCopy(pf.trailing_text.data() + t * D, body_emb.data() + i * D, D);
+    }
   }
-  // Last: tts_eos only (no codec_pad)
-  VecCopy(pf.trailing_text.data() + t * D, tts_eos_e, D);
+  if (trailing_codec_pad) {
+    VecAdd(pf.trailing_text.data() + t * D, tts_eos_e, codec_pad_e, D);
+  } else {
+    VecCopy(pf.trailing_text.data() + t * D, tts_eos_e, D);
+  }
 
   return pf;
 }
@@ -549,18 +677,22 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
   TRTCPKVEngine* cp_kv = cp_lease.get();
   if (talker_) talker_->ResetCapturedEvents();
 
-  // Seed RNG: 0 = random (time-based), >0 = fixed seed
-  if (seed == 0) {
-    rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-  } else {
-    rng_.seed(seed);
-  }
+  // Seed all samplers for the request. Primary and CP residual codes are both
+  // stochastic; leaving CP on a time-based RNG causes timbre drift across runs.
+  unsigned long long request_seed = seed == 0
+      ? (unsigned long long)std::chrono::high_resolution_clock::now()
+            .time_since_epoch()
+            .count()
+      : (unsigned long long)seed;
+  rng_.seed(static_cast<std::mt19937::result_type>(request_seed));
+  if (cp_kv) cp_kv->SetSamplingSeed(request_seed);
 
   int D = cfg_.hidden_dim;
 
   // Build prefill
   auto pf = BuildPrefill(text, lang, speaker_embed, token_ids);
   std::cout << "  Prefill: " << pf.seq_len << " tokens" << std::endl;
+  Qwen3TTSDumpVector("prefill_embeds_f32.bin", pf.embeds);
 
   // Run prefill: try TRT unified engine first, fall back to ORT
   auto t0 = Clock::now();
@@ -602,6 +734,8 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       // last_hidden is always full sequence
       VecCopy(last_hidden.data(),
               pf_result.last_hidden.data() + (pf.seq_len - 1) * D, D);
+      Qwen3TTSDumpVector("talker_prefill_logits_f32.bin", logits);
+      Qwen3TTSDumpVector("talker_prefill_hidden_f32.bin", pf_result.last_hidden);
     }
   }
 
@@ -614,15 +748,19 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
 
   // EOS bias: progressive boost, delayed until expected audio length
   // Each text token ≈ 3-4 frames at 12.5Hz. Start biasing after 3x trailing.
-  const float kEosBiasBase = 5.0f;
-  const float kEosBiasRate = 0.5f;   // per step after bias onset
-  const float kEosBiasMax = 25.0f;
-  int bias_onset = pf.n_trailing * 3;  // delay: let model generate audio first
-  // Hard cap: max 10 frames per text token
-  int text_based_max = std::max(50, pf.n_trailing * 10);
+  const float kEosBiasBase = Qwen3TTSEnvFloat("QWEN3_TTS_EOS_BIAS_BASE", 5.0f);
+  const float kEosBiasRate = Qwen3TTSEnvFloat("QWEN3_TTS_EOS_BIAS_RATE", 0.5f);
+  const float kEosBiasMax = Qwen3TTSEnvFloat("QWEN3_TTS_EOS_BIAS_MAX", 25.0f);
+  int bias_onset_mult = std::max(1, Qwen3TTSEnvInt("QWEN3_TTS_EOS_BIAS_ONSET_MULT", 6));
+  int max_frames_mult = std::max(bias_onset_mult + 1,
+                                 Qwen3TTSEnvInt("QWEN3_TTS_TEXT_MAX_FRAMES_MULT", 14));
+  int bias_onset = pf.n_trailing * bias_onset_mult;
+  int text_based_max = std::max(80, pf.n_trailing * max_frames_mult);
   int effective_max = std::min(max_frames, text_based_max);
+  int min_eos_step = std::max(2, pf.n_trailing);
   std::cerr << "  EOS params: n_trailing=" << pf.n_trailing
             << " bias_onset=" << bias_onset
+            << " min_eos_step=" << min_eos_step
             << " effective_max=" << effective_max << std::endl;
 
   for (int step = 0; step < effective_max; ++step) {
@@ -638,7 +776,10 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     int primary_code = SampleWithPenalty(
         logits.data(), cfg_.vocab_size,
         primary_history.data(), (int)primary_history.size(),
-        50, 0.9f, step < 2, cfg_.codec_eos_token_id, eos_bias);
+        50, 0.9f, step < min_eos_step, cfg_.codec_eos_token_id, eos_bias);
+    if (step == 0) {
+      Qwen3TTSDumpVector("frame0_primary_i32.bin", std::vector<int>{primary_code});
+    }
     if (primary_code == cfg_.codec_eos_token_id) {
       std::cout << "  EOS at step " << step << " (bias=" << eos_bias << ")" << std::endl;
       break;
@@ -681,9 +822,36 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
       std::vector<int> cp_codes(n_groups_full, 0);
       {
         std::lock_guard<std::mutex> lock(talker_mutex_);
+        if (step == 0) {
+          Qwen3TTSDumpVector("cp_input_hidden_f32.bin", last_hidden);
+          Qwen3TTSDumpVector("cp_input_primary_emb_f32.bin",
+                             std::vector<float>(primary_e_ptr, primary_e_ptr + D));
+        }
+        if (step < 2) {
+          Qwen3TTSDumpVector("cp_frame" + std::to_string(step) + "_input_hidden_f32.bin",
+                             last_hidden);
+          Qwen3TTSDumpVector("cp_frame" + std::to_string(step) + "_input_primary_emb_f32.bin",
+                             std::vector<float>(primary_e_ptr, primary_e_ptr + D));
+        }
+        std::function<double()> uniform01;
+        std::function<double()>* uniform01_ptr = nullptr;
+        bool cp_external_uniforms = false;
+        if (const char* env = std::getenv("QWEN3_TTS_CP_EXTERNAL_UNIFORMS")) {
+          std::string v(env);
+          cp_external_uniforms = !(v == "0" || v == "false" || v == "False" || v == "no");
+        }
+        const char* fixed_cp_uniform = std::getenv("QWEN3_TTS_CP_FIXED_UNIFORM");
+        if (fixed_cp_uniform) {
+          double u = std::atof(fixed_cp_uniform);
+          uniform01 = [u]() { return u; };
+          uniform01_ptr = &uniform01;
+        } else if (use_sampling_uniforms_ && cp_external_uniforms) {
+          uniform01 = [this]() { return this->NextUniform01(); };
+          uniform01_ptr = &uniform01;
+        }
         cp_kv->RunFrameAutoregressive(
             last_hidden.data(), primary_e_ptr, cp_codes.data(),
-            cp_embed_table_.data(), cp_embed_vocab_, n_groups);
+            cp_embed_table_.data(), cp_embed_vocab_, n_groups, uniform01_ptr);
       }
 
       // Accumulate codec_sum from active residuals only; inactive slots
@@ -735,16 +903,31 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     ct_times.push_back(
         std::chrono::duration<double, std::milli>(Clock::now() - t_cp).count());
     all_codes.push_back(frame_codes);
+    if (step == 0) {
+      Qwen3TTSDumpVector("frame0_codes_i32.bin", frame_codes);
+    }
     
 
     // Next talker input: codec_sum + trailing_text (or tts_pad after text)
     // Official: inputs_embeds = codec_sum + trailing_text[step] or + tts_pad_embed
     std::vector<float> next_emb(D);
     if (step < pf.n_trailing) {
+      if (step < 12) {
+        Qwen3TTSDumpVector("frame" + std::to_string(step) + "_addend_f32.bin",
+                           std::vector<float>(pf.trailing_text.data() + step * D,
+                                              pf.trailing_text.data() + (step + 1) * D));
+      }
       VecAdd(next_emb.data(), codec_sum.data(),
              pf.trailing_text.data() + step * D, D);
     } else {
+      if (step < 12) {
+        Qwen3TTSDumpVector("frame" + std::to_string(step) + "_addend_f32.bin",
+                           pf.tts_pad_e);
+      }
       VecAdd(next_emb.data(), codec_sum.data(), pf.tts_pad_e.data(), D);
+    }
+    if (step < 12) {
+      Qwen3TTSDumpVector("frame" + std::to_string(step) + "_residual_f32.bin", next_emb);
     }
 
     // Talker decode
@@ -752,6 +935,10 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
     {
       std::lock_guard<std::mutex> lock(talker_mutex_);
       talker_->DecodeStep(next_emb.data(), logits.data(), last_hidden.data());
+    }
+    if (step < 12) {
+      Qwen3TTSDumpVector("talker_decode" + std::to_string(step + 1) + "_logits_f32.bin", logits);
+      Qwen3TTSDumpVector("talker_decode" + std::to_string(step + 1) + "_hidden_f32.bin", last_hidden);
     }
     dt_times.push_back(
         std::chrono::duration<double, std::milli>(Clock::now() - t_d).count());
@@ -765,6 +952,14 @@ SynthResult TTSPipeline::GenerateInternal(const std::string& text,
   if (n == 0) {
     std::cerr << "  No frames generated!" << std::endl;
     return result;
+  }
+  {
+    std::vector<int> flat_codes;
+    flat_codes.reserve((size_t)n * 16);
+    for (const auto& frame : all_codes) {
+      flat_codes.insert(flat_codes.end(), frame.begin(), frame.end());
+    }
+    Qwen3TTSDumpVector("all_codes_i32.bin", flat_codes);
   }
 
   // Dump primary codes for debugging
@@ -1150,11 +1345,13 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
   TRTCPKVEngine* cp_kv = cp_lease.get();
   if (talker_) talker_->ResetCapturedEvents();
 
-  if (config.seed == 0) {
-    rng_.seed(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-  } else {
-    rng_.seed(config.seed);
-  }
+  unsigned long long request_seed = config.seed == 0
+      ? (unsigned long long)std::chrono::high_resolution_clock::now()
+            .time_since_epoch()
+            .count()
+      : (unsigned long long)config.seed;
+  rng_.seed(static_cast<std::mt19937::result_type>(request_seed));
+  if (cp_kv) cp_kv->SetSamplingSeed(request_seed);
   int D = cfg_.hidden_dim;
 
   // Build prefill
@@ -1216,14 +1413,19 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
   int next_chunk_at = config.first_chunk_frames;
 
   // EOS bias: progressive boost, delayed until expected audio length
-  const float kEosBiasBase = 5.0f;
-  const float kEosBiasRate = 0.5f;
-  const float kEosBiasMax = 25.0f;
-  int bias_onset = pf.n_trailing * 3;
-  int text_based_max = std::max(50, pf.n_trailing * 10);
+  const float kEosBiasBase = Qwen3TTSEnvFloat("QWEN3_TTS_EOS_BIAS_BASE", 5.0f);
+  const float kEosBiasRate = Qwen3TTSEnvFloat("QWEN3_TTS_EOS_BIAS_RATE", 0.5f);
+  const float kEosBiasMax = Qwen3TTSEnvFloat("QWEN3_TTS_EOS_BIAS_MAX", 25.0f);
+  int bias_onset_mult = std::max(1, Qwen3TTSEnvInt("QWEN3_TTS_EOS_BIAS_ONSET_MULT", 6));
+  int max_frames_mult = std::max(bias_onset_mult + 1,
+                                 Qwen3TTSEnvInt("QWEN3_TTS_TEXT_MAX_FRAMES_MULT", 14));
+  int bias_onset = pf.n_trailing * bias_onset_mult;
+  int text_based_max = std::max(80, pf.n_trailing * max_frames_mult);
   int effective_max = std::min(config.max_frames, text_based_max);
+  int min_eos_step = std::max(2, pf.n_trailing);
   std::cerr << "  EOS params: n_trailing=" << pf.n_trailing
             << " bias_onset=" << bias_onset
+            << " min_eos_step=" << min_eos_step
             << " effective_max=" << effective_max << std::endl;
 
   for (int step = 0; step < effective_max; ++step) {
@@ -1239,7 +1441,7 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
     int primary_code = SampleWithPenalty(
         logits.data(), cfg_.vocab_size,
         primary_history.data(), (int)primary_history.size(),
-        50, 0.9f, step < 2, cfg_.codec_eos_token_id, eos_bias);
+        50, 0.9f, step < min_eos_step, cfg_.codec_eos_token_id, eos_bias);
     if (primary_code == cfg_.codec_eos_token_id) {
       std::cout << "  EOS at step " << step << " (bias=" << eos_bias << ")" << std::endl;
       break;
@@ -1267,9 +1469,25 @@ void TTSPipeline::GenerateStreaming(const std::string& text,
       std::vector<int> cp_codes(n_groups_full, 0);
       {
         std::lock_guard<std::mutex> lock(talker_mutex_);
+        std::function<double()> uniform01;
+        std::function<double()>* uniform01_ptr = nullptr;
+        bool cp_external_uniforms = false;
+        if (const char* env = std::getenv("QWEN3_TTS_CP_EXTERNAL_UNIFORMS")) {
+          std::string v(env);
+          cp_external_uniforms = !(v == "0" || v == "false" || v == "False" || v == "no");
+        }
+        const char* fixed_cp_uniform = std::getenv("QWEN3_TTS_CP_FIXED_UNIFORM");
+        if (fixed_cp_uniform) {
+          double u = std::atof(fixed_cp_uniform);
+          uniform01 = [u]() { return u; };
+          uniform01_ptr = &uniform01;
+        } else if (use_sampling_uniforms_ && cp_external_uniforms) {
+          uniform01 = [this]() { return this->NextUniform01(); };
+          uniform01_ptr = &uniform01;
+        }
         cp_kv->RunFrameAutoregressive(
             last_hidden.data(), primary_e_ptr, cp_codes.data(),
-            cp_embed_table_.data(), cp_embed_vocab_, n_groups);
+            cp_embed_table_.data(), cp_embed_vocab_, n_groups, uniform01_ptr);
       }
 
       for (int j = 0; j < n_groups_full; ++j) {
