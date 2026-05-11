@@ -108,7 +108,12 @@ def create_backend(backend_name: Optional[str] = None) -> TTSBackend:
     """
     if backend_name is None:
         language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
-        default = "matcha_trt" if language_mode == "zh_en" else "qwen3_trt"
+        if language_mode == "zh_en":
+            default = "matcha_trt"
+        elif language_mode == "multilanguage":
+            default = "trt_edgellm"
+        else:
+            default = "qwen3_trt"
         backend_name = os.environ.get("TTS_BACKEND", default)
 
     if backend_name == "sherpa":

@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +91,12 @@ def _download_and_extract(url: str, dest_dir: str) -> None:
 
 def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") -> None:
     """Ensure all required models for the given language mode are present."""
+    if language_mode == "multilanguage":
+        _ensure_qwen3_artifacts()
+        return
+
     required = {}
     required.update(MODELS.get(language_mode, {}))
-    # multilanguage mode uses Qwen3 TRT engines baked into the image — no CDN pull needed.
     # SenseVoice is optional — don't block startup for it (lazy-loaded)
 
     missing = []
@@ -138,6 +142,35 @@ def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") 
 
     if language_mode == "en":
         _patch_kokoro_voices(model_dir)
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _ensure_qwen3_artifacts() -> None:
+    """Verify or download Qwen3 artifacts for the active multilanguage profile."""
+    if os.environ.get("QWEN3_ARTIFACT_AUTO_DOWNLOAD", "1").lower() in ("0", "false", "no"):
+        logger.info("Qwen3 artifact auto-download disabled.")
+        return
+
+    script = _project_root() / "scripts" / "deploy_qwen3_artifacts.py"
+    manifest = os.environ.get("QWEN3_ARTIFACT_MANIFEST", "deploy/artifacts/qwen3_manifest.json")
+    artifact_set = os.environ.get("QWEN3_ARTIFACT_SET") or "orin-nano-highperf-2026-05-10"
+    root = os.environ.get("QWEN3_ARTIFACT_ROOT")
+    if not script.exists():
+        logger.warning("Qwen3 artifact deploy script missing: %s", script)
+        return
+
+    cmd = [sys.executable, str(script), "--manifest", manifest, "--set", artifact_set]
+    if root:
+        cmd.extend(["--root", root])
+    logger.info("Ensuring Qwen3 artifact set %s via %s", artifact_set, manifest)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        logger.error("Qwen3 artifact check/download failed with exit code %s", exc.returncode)
+        sys.exit(exc.returncode)
 
 
 # Custom voice patches: replace unused speakers in voices.bin with custom voices.

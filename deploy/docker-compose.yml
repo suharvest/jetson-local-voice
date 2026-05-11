@@ -2,9 +2,11 @@
 #
 # Usage:
 #   LANGUAGE_MODE=en docker compose -f deploy/docker-compose.yml up -d
+#   JETSON_VOICE_PROFILE=multilanguage-qwen-highperf docker compose -f deploy/docker-compose.yml up -d
 #
 # Models auto-download on first start (~1-2 min) and persist in a Docker volume.
-# Set LANGUAGE_MODE to "zh_en" (default, Chinese+English) or "en" (English only).
+# Set LANGUAGE_MODE to "zh_en" (default, Chinese+English), "en" (English only),
+# or JETSON_VOICE_PROFILE=multilanguage-qwen-highperf for Qwen3 ASR/TTS.
 
 services:
   speech:
@@ -15,6 +17,13 @@ services:
       - "8621:8000"
     environment:
       - LANGUAGE_MODE=${LANGUAGE_MODE:-zh_en}
+      - JETSON_VOICE_PROFILE=${JETSON_VOICE_PROFILE:-}
+      - JETSON_VOICE_PROFILE_JSON=${JETSON_VOICE_PROFILE_JSON:-}
+      - QWEN3_ARTIFACT_MANIFEST=${QWEN3_ARTIFACT_MANIFEST:-deploy/artifacts/qwen3_manifest.json}
+      - QWEN3_ARTIFACT_SET=${QWEN3_ARTIFACT_SET:-}
+      - QWEN3_ARTIFACT_ROOT=${QWEN3_ARTIFACT_ROOT:-/opt/models/qwen3-edgellm}
+      - QWEN3_HF_REPO_ID=${QWEN3_HF_REPO_ID:-}
+      - QWEN3_HF_REVISION=${QWEN3_HF_REVISION:-main}
       - TTS_PROVIDER=${TTS_PROVIDER:-cuda}
       - TTS_DEFAULT_SID=${TTS_DEFAULT_SID:-0}
       - TTS_DEFAULT_SPEED=${TTS_DEFAULT_SPEED:-0.85}
@@ -29,7 +38,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 6G
+          memory: ${JETSON_VOICE_MEMORY_LIMIT:-6G}
 
 volumes:
   speech-models:

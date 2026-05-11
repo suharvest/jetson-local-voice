@@ -32,6 +32,19 @@ def _inject_mock_sherpa(monkeypatch):
     return mock_cls
 
 
+def _inject_mock_paraformer(monkeypatch):
+    """Inject a fake backends.paraformer_trt module into sys.modules."""
+    mock_cls = _make_mock_backend_class("ParaformerTRTBackend")
+    mock_mod = types.ModuleType("backends.paraformer_trt")
+    mock_mod.ParaformerTRTBackend = mock_cls
+
+    if "backends" not in sys.modules:
+        parent = types.ModuleType("backends")
+        monkeypatch.setitem(sys.modules, "backends", parent)
+    monkeypatch.setitem(sys.modules, "backends.paraformer_trt", mock_mod)
+    return mock_cls
+
+
 def _inject_mock_qwen3(monkeypatch):
     """Inject a fake backends.qwen3_asr module into sys.modules."""
     mock_cls = _make_mock_backend_class("Qwen3ASRBackend")
@@ -45,6 +58,19 @@ def _inject_mock_qwen3(monkeypatch):
 
     # Ensure jetson_qwen3_speech is NOT importable so the local fallback is used
     monkeypatch.setitem(sys.modules, "jetson_qwen3_speech", None)
+    return mock_cls
+
+
+def _inject_mock_trt_edgellm(monkeypatch):
+    """Inject a fake backends.trt_edge_llm_asr module into sys.modules."""
+    mock_cls = _make_mock_backend_class("TRTEdgeLLMASRBackend")
+    mock_mod = types.ModuleType("backends.trt_edge_llm_asr")
+    mock_mod.TRTEdgeLLMASRBackend = mock_cls
+
+    if "backends" not in sys.modules:
+        parent = types.ModuleType("backends")
+        monkeypatch.setitem(sys.modules, "backends", parent)
+    monkeypatch.setitem(sys.modules, "backends.trt_edge_llm_asr", mock_mod)
     return mock_cls
 
 
@@ -70,24 +96,37 @@ def _load_factory(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_default_is_sherpa(monkeypatch):
-    """No env vars set → backend defaults to SherpaASRBackend."""
-    sherpa_cls = _inject_mock_sherpa(monkeypatch)
+def test_default_is_paraformer_for_zh_en(monkeypatch):
+    """No env vars set → LANGUAGE_MODE default zh_en uses Paraformer TRT."""
+    paraformer_cls = _inject_mock_paraformer(monkeypatch)
     monkeypatch.delenv("LANGUAGE_MODE", raising=False)
     monkeypatch.delenv("ASR_BACKEND", raising=False)
 
     create_asr_backend = _load_factory(monkeypatch)
     result = create_asr_backend()
 
-    sherpa_cls.assert_called_once()
-    assert result is sherpa_cls.return_value
+    paraformer_cls.assert_called_once()
+    assert result is paraformer_cls.return_value
 
 
-def test_multilanguage_selects_qwen3(monkeypatch):
-    """LANGUAGE_MODE=multilanguage → backend resolves to Qwen3ASRBackend."""
-    qwen3_cls = _inject_mock_qwen3(monkeypatch)
+def test_multilanguage_selects_trt_edgellm(monkeypatch):
+    """LANGUAGE_MODE=multilanguage → backend resolves to EdgeLLM worker ASR."""
+    trt_cls = _inject_mock_trt_edgellm(monkeypatch)
     monkeypatch.setenv("LANGUAGE_MODE", "multilanguage")
     monkeypatch.delenv("ASR_BACKEND", raising=False)
+
+    create_asr_backend = _load_factory(monkeypatch)
+    result = create_asr_backend()
+
+    trt_cls.assert_called_once()
+    assert result is trt_cls.return_value
+
+
+def test_multilanguage_can_explicitly_select_legacy_qwen3(monkeypatch):
+    """ASR_BACKEND=qwen3 keeps the old local/package backend as an explicit override."""
+    qwen3_cls = _inject_mock_qwen3(monkeypatch)
+    monkeypatch.setenv("LANGUAGE_MODE", "multilanguage")
+    monkeypatch.setenv("ASR_BACKEND", "qwen3")
 
     create_asr_backend = _load_factory(monkeypatch)
     result = create_asr_backend()

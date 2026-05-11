@@ -86,6 +86,13 @@ def _get_asr_executor() -> ThreadPoolExecutor:
 async def startup():
     global _asr_backend
 
+    try:
+        from profile_loader import apply_profile_from_env
+        apply_profile_from_env()
+    except Exception as exc:
+        logger.error("Failed to apply Jetson Voice profile: %s", exc)
+        raise
+
     # Log language mode configuration
     language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
     logger.info("=" * 60)
@@ -160,7 +167,12 @@ async def startup():
                 try:
                     # Run one tiny streaming synthesis on the executor
                     # thread to materialize CUDA context state.
-                    for _ in backend.generate_streaming("你好"):
+                    stream_kwargs = {}
+                    profile = os.environ.get("EDGE_LLM_TTS_WARMUP_STREAMING_PROFILE")
+                    if profile:
+                        stream_kwargs["streaming_profile"] = profile
+                    warmup_text = os.environ.get("EDGE_LLM_TTS_WARMUP_TEXT", "你好")
+                    for _ in backend.generate_streaming(warmup_text, **stream_kwargs):
                         pass
                 except Exception as exc:  # pragma: no cover
                     logger.warning("TTS streaming warm-up failed: %s", exc)

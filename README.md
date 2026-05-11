@@ -77,6 +77,11 @@ docker compose -f deploy/docker-compose.yml up -d
 
 # English only
 LANGUAGE_MODE=en docker compose -f deploy/docker-compose.yml up -d
+
+# Qwen3 multilingual ASR/TTS
+JETSON_VOICE_PROFILE=multilanguage-qwen-highperf \
+QWEN3_HF_REPO_ID=<your-org/qwen3-edgellm-jetson-artifacts> \
+docker compose -f deploy/docker-compose.yml up -d
 ```
 
 **Build from source** (for development):
@@ -141,14 +146,34 @@ The service is model-agnostic at the API level — clients send audio/text, get 
 
 ## Qwen3 Multilanguage Paths
 
-Qwen3-ASR and Qwen3-TTS have two maintained runtime profiles. They share the same API surface; select the profile with `EDGE_LLM_QWEN3_PROFILE`.
+Qwen3-ASR and Qwen3-TTS are exposed to Jetson Voice as the `multilanguage`
+mode. The product service stays in this repository; Qwen-specific export,
+engine build, worker/runtime glue, and performance scripts should live in the
+standalone Qwen project. Large model artifacts should live in the Hugging Face
+artifact repository described by [`deploy/artifacts/qwen3_manifest.json`](deploy/artifacts/qwen3_manifest.json).
+
+For deployment, prefer selecting one JSON profile:
+
+```bash
+JETSON_VOICE_PROFILE=multilanguage-qwen-highperf uvicorn app.main:app --host 0.0.0.0 --port 8621
+```
+
+Profiles live in [`configs/profiles`](configs/profiles). They set environment
+defaults only; explicit env vars still override them. Qwen3-ASR and Qwen3-TTS
+have two maintained runtime profiles under the same API surface:
 
 | Profile | Goal | Default behavior |
 |---------|------|------------------|
 | `official` | Minimal-diff EdgeLLM example path. Keep it close enough to upstream that it can be reviewed or upstreamed as an official Qwen3 ASR/TTS example. | Only semantic/correctness fixes belong here: tokenizer/control-token layout, sampling semantics, runtime contract fixes, and stream callback correctness. It uses regular exported Talker/CodePredictor/Code2Wav directories and does not enable our Orin memory/latency strategies by default. |
 | `highperf` | Product low-latency dual-resident path for our Orin deployment. | Full ASR/TTS vocab, ASR FP8 embedding directory when present, TTS W8A16 Talker support, CP BF16 I/O + `lm_head` pretranspose, stateful Code2Wav, CP decode CUDA graph, `ACTIVE_CP_GROUPS=13`. |
 
-The repo default is `highperf` for Qwen3 because it is the measured product path. Use `official` when preparing or validating an EdgeLLM-upstream-compatible example:
+The repo default Qwen profile is `highperf` because it is the measured product
+path. `LANGUAGE_MODE=multilanguage` now defaults to the EdgeLLM worker backend
+(`ASR_BACKEND=trt_edgellm`, `TTS_BACKEND=trt_edgellm`). Older local Qwen
+backends can still be selected explicitly for legacy reproduction, but they are
+not product runtime choices.
+
+Use `official` when preparing or validating an EdgeLLM-upstream-compatible example:
 
 Branch ownership:
 
@@ -159,6 +184,8 @@ Branch ownership:
 
 ```bash
 EDGE_LLM_QWEN3_PROFILE=official \
+ASR_BACKEND=trt_edgellm \
+TTS_BACKEND=trt_edgellm \
 EDGE_LLM_TTS_BACKEND=edgellm_worker \
 EDGE_LLM_ASR_VOCAB_PRUNED=0 \
 EDGE_LLM_TTS_VOCAB_PRUNED=0 \
@@ -169,6 +196,8 @@ Use the high-performance path for Orin low-latency V2V:
 
 ```bash
 EDGE_LLM_QWEN3_PROFILE=highperf \
+ASR_BACKEND=trt_edgellm \
+TTS_BACKEND=trt_edgellm \
 EDGE_LLM_TTS_BACKEND=edgellm_worker \
 EDGE_LLM_TTS_STATEFUL_CODE2WAV=1 \
 EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR=/tmp/qwen3_code2wav_stateful_engine \
@@ -194,6 +223,20 @@ Regression scope:
 
 - `official`: semantic correctness and upstream-compatibility checks only. It should stay small and reviewable; do not add W8A16, FP8 embedding, pruned/full-vocab policy changes, stateful Code2Wav, CP graph, or engine-specific Orin tuning here.
 - `highperf`: full product regression, including Qwen3 ASR + Qwen3 TTS dual residency, V2V latency, memory floor, and ASR round-trip quality. This is where our Orin-specific memory and latency work belongs.
+
+Artifact handling:
+
+```bash
+python3 scripts/deploy_qwen3_artifacts.py \
+  --manifest deploy/artifacts/qwen3_manifest.json \
+  --set orin-nano-highperf-2026-05-10 \
+  --root /opt/models/qwen3-edgellm \
+  --check-only
+```
+
+Without `--check-only`, the script downloads the missing files from the HF repo
+identified by `QWEN3_HF_REPO_ID` or the manifest. Fill the manifest repo id,
+checksums, and file sizes when the artifact repo is created.
 
 ## API Reference
 

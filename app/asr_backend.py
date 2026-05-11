@@ -99,8 +99,8 @@ def create_asr_backend(backend_name: Optional[str] = None) -> ASRBackend:
         # Check LANGUAGE_MODE for automatic backend selection
         language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
         if language_mode == "multilanguage":
-            backend_name = "qwen3"
-            logger.info("LANGUAGE_MODE=multilanguage → using qwen3 ASR backend")
+            backend_name = os.environ.get("ASR_BACKEND", "trt_edgellm")
+            logger.info("LANGUAGE_MODE=multilanguage → using %s ASR backend", backend_name)
         elif language_mode == "zh_en":
             backend_name = os.environ.get("ASR_BACKEND", "paraformer_trt")
             logger.info("LANGUAGE_MODE=zh_en → using %s ASR backend", backend_name)

@@ -1,0 +1,26 @@
+{
+  "name": "multilanguage-qwen-official",
+  "description": "Qwen3 ASR + Qwen3 TTS minimal-diff EdgeLLM profile for correctness/upstream checks.",
+  "artifact_set": "orin-nano-official-2026-05-10",
+  "env": {
+    "LANGUAGE_MODE": "multilanguage",
+    "ASR_BACKEND": "trt_edgellm",
+    "TTS_BACKEND": "trt_edgellm",
+    "EDGE_LLM_QWEN3_PROFILE": "official",
+    "EDGE_LLM_ASR_WORKER": "1",
+    "EDGE_LLM_TTS_WORKER": "1",
+    "EDGE_LLM_TTS_BACKEND": "edgellm_worker",
+    "EDGE_LLM_ASR_VOCAB_PRUNED": "0",
+    "EDGE_LLM_TTS_VOCAB_PRUNED": "0",
+    "EDGE_LLM_TTS_STATEFUL_CODE2WAV": "0",
+    "QWEN3_ARTIFACT_MANIFEST": "deploy/artifacts/qwen3_manifest.json",
+    "QWEN3_ARTIFACT_SET": "orin-nano-official-2026-05-10",
+    "QWEN3_ARTIFACT_ROOT": "/opt/models/qwen3-edgellm",
+    "EDGE_LLM_ASR_ENGINE_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/asr_thinker",
+    "EDGE_LLM_ASR_AUDIO_ENC_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/asr_audio_encoder",
+    "EDGE_LLM_TTS_TALKER_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/talker",
+    "EDGE_LLM_TTS_CP_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/code_predictor",
+    "EDGE_LLM_TTS_CODE2WAV_DIR": "/opt/models/qwen3-edgellm/engines/orin-nano/official/code2wav",
+    "EDGE_LLM_TTS_TOKENIZER_DIR": "/opt/models/qwen3-edgellm/tts/tokenizer"
+  }
+}
