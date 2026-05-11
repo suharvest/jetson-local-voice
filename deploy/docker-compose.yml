@@ -19,7 +19,12 @@ services:
       - LANGUAGE_MODE=${LANGUAGE_MODE:-zh_en}
       - JETSON_VOICE_PROFILE=${JETSON_VOICE_PROFILE:-}
       - JETSON_VOICE_PROFILE_JSON=${JETSON_VOICE_PROFILE_JSON:-}
-      - QWEN3_ARTIFACT_MANIFEST=${QWEN3_ARTIFACT_MANIFEST:-deploy/artifacts/qwen3_manifest.json}
+      # Manifest + deploy script live in the sibling qwen3-edgellm-jetson repo.
+      # Mount that repo into the container (e.g. -v ~/project/qwen3-edgellm-jetson:/opt/qej:ro)
+      # and set QWEN3_EDGELLM_JETSON_ROOT=/opt/qej; QWEN3_ARTIFACT_MANIFEST then resolves
+      # via QWEN3_EDGELLM_JETSON_ROOT + /deploy/artifacts/qwen3_manifest.json.
+      - QWEN3_EDGELLM_JETSON_ROOT=${QWEN3_EDGELLM_JETSON_ROOT:-/opt/qwen3-edgellm-jetson}
+      - QWEN3_ARTIFACT_MANIFEST=${QWEN3_ARTIFACT_MANIFEST:-}
       - QWEN3_ARTIFACT_SET=${QWEN3_ARTIFACT_SET:-}
       - QWEN3_ARTIFACT_ROOT=${QWEN3_ARTIFACT_ROOT:-/opt/models/qwen3-edgellm}
       - QWEN3_HF_REPO_ID=${QWEN3_HF_REPO_ID:-}

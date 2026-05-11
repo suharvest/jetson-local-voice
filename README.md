@@ -153,7 +153,7 @@ standalone Qwen project
 [`suharvest/qwen3-edgellm-jetson`](https://github.com/suharvest/qwen3-edgellm-jetson).
 Large model artifacts live in the Hugging Face artifact repository
 [`harvestsu/qwen3-edgellm-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-edgellm-jetson-artifacts)
-described by [`deploy/artifacts/qwen3_manifest.json`](deploy/artifacts/qwen3_manifest.json).
+described by the manifest in `qwen3-edgellm-jetson/deploy/artifacts/qwen3_manifest.json`.
 
 For deployment, prefer selecting one JSON profile:
 
@@ -234,16 +234,19 @@ Regression scope:
 Artifact handling:
 
 ```bash
+# scripts and manifest live in the sibling qwen3-edgellm-jetson repo
+cd ~/project/qwen3-edgellm-jetson
 python3 scripts/deploy_qwen3_artifacts.py \
-  --manifest deploy/artifacts/qwen3_manifest.json \
   --set orin-nano-highperf-2026-05-10 \
   --root /opt/models/qwen3-edgellm \
   --check-only
 ```
 
 Without `--check-only`, the script downloads the missing files from the HF repo
-identified by `QWEN3_HF_REPO_ID` or the manifest. Fill the manifest repo id,
-checksums, and file sizes when the artifact repo is created.
+identified by `QWEN3_HF_REPO_ID` or the manifest. `app/model_downloader.py`
+auto-invokes the same script at service startup; set `QWEN3_EDGELLM_JETSON_ROOT`
+if your checkout is not at `~/project/qwen3-edgellm-jetson`. Use
+`--verify-sha256` to enforce the SHA-256 sidecar (catches partial downloads).
 
 ## API Reference
 

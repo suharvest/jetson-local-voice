@@ -149,17 +149,36 @@ def _project_root() -> Path:
 
 
 def _ensure_qwen3_artifacts() -> None:
-    """Verify or download Qwen3 artifacts for the active multilanguage profile."""
+    """Verify or download Qwen3 artifacts for the active multilanguage profile.
+
+    The deploy script + manifest live in the sibling `qwen3-edgellm-jetson`
+    repo so they are not duplicated here. Set `QWEN3_EDGELLM_JETSON_ROOT` to
+    override the default `~/project/qwen3-edgellm-jetson` lookup path.
+    """
     if os.environ.get("QWEN3_ARTIFACT_AUTO_DOWNLOAD", "1").lower() in ("0", "false", "no"):
         logger.info("Qwen3 artifact auto-download disabled.")
         return
 
-    script = _project_root() / "scripts" / "deploy_qwen3_artifacts.py"
-    manifest = os.environ.get("QWEN3_ARTIFACT_MANIFEST", "deploy/artifacts/qwen3_manifest.json")
+    qej_root = Path(
+        os.environ.get(
+            "QWEN3_EDGELLM_JETSON_ROOT",
+            os.path.expanduser("~/project/qwen3-edgellm-jetson"),
+        )
+    )
+    script = qej_root / "scripts" / "deploy_qwen3_artifacts.py"
+    manifest = os.environ.get(
+        "QWEN3_ARTIFACT_MANIFEST",
+        str(qej_root / "deploy" / "artifacts" / "qwen3_manifest.json"),
+    )
     artifact_set = os.environ.get("QWEN3_ARTIFACT_SET") or "orin-nano-highperf-2026-05-10"
     root = os.environ.get("QWEN3_ARTIFACT_ROOT")
     if not script.exists():
-        logger.warning("Qwen3 artifact deploy script missing: %s", script)
+        logger.warning(
+            "Qwen3 artifact deploy script missing at %s. Clone "
+            "https://github.com/suharvest/qwen3-edgellm-jetson.git as a sibling "
+            "of jetson-voice or set QWEN3_EDGELLM_JETSON_ROOT to point at it.",
+            script,
+        )
         return
 
     cmd = [sys.executable, str(script), "--manifest", manifest, "--set", artifact_set]
