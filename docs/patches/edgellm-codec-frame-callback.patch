@@ -1,0 +1,57 @@
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@
+ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+     TalkerGenerationRequest const& request, TalkerGenerationResponse& response, cudaStream_t stream)
++{
++    return handleAudioGeneration(request, response, stream, CodecFrameCallback{});
++}
++
++bool Qwen3OmniTTSRuntime::handleAudioGeneration(TalkerGenerationRequest const& request,
++    TalkerGenerationResponse& response, cudaStream_t stream, CodecFrameCallback const& onCodecFrame)
+ {
+@@
+             // Store RVQ codes for this frame
+             rvqCodes.push_back(frameCodes);
++            if (onCodecFrame)
++            {
++                onCodecFrame(rvqCodes.back(), static_cast<int32_t>(rvqCodes.size()));
++            }
+ 
+             // Compute residual connection using pre-allocated buffer
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@
+ #include "runtime/llmEngineRunner.h"
+ #include "runtime/llmRuntimeUtils.h"
+ #include "tokenizer/tokenizer.h"
++#include <functional>
+ #include <memory>
+@@
+     };
+ 
++    //! \brief Optional callback invoked after each generated codec frame.
++    //!
++    //! The callback is intentionally limited to generated codec frames so that
++    //! callers can build their own streaming policy without binding the runtime
++    //! to a transport protocol or audio chunking strategy.
++    using CodecFrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
++
+@@
+     bool handleAudioGeneration(
+         TalkerGenerationRequest const& request, TalkerGenerationResponse& response, cudaStream_t stream);
+ 
++    /*!
++     * @brief Generate audio with RVQ codes and receive frames as they are produced
++     *
++     * @param request Request containing sampling parameters and input data
++     * @param response Response containing generated RVQ codes
++     * @param stream CUDA stream for execution
++     * @param onCodecFrame Optional callback invoked once per generated codec frame
++     * @return True if generation succeeded, false otherwise
++     */
++    bool handleAudioGeneration(TalkerGenerationRequest const& request, TalkerGenerationResponse& response,
++        cudaStream_t stream, CodecFrameCallback const& onCodecFrame);
++

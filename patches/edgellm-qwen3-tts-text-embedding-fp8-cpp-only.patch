@@ -1,0 +1,66 @@
+--- cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@
+-    check::check(!textEmbedTensors.empty(), "text_embedding.safetensors is empty");
+-    check::check(
+-        textEmbedTensors[0].getShape().getNumDims() == 2, "text_embedding tensor should be 2D [vocabSize, hiddenSize]");
+-    mTextEmbeddingTable = std::move(textEmbedTensors[0]);
+-    LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
+-        mTextEmbeddingTable.getShape()[1]);
++    rt::Tensor* textEmbeddingPtr = nullptr;
++    rt::Tensor* textEmbeddingScalesPtr = nullptr;
++    for (auto& tensor : textEmbedTensors)
++    {
++        if (tensor.getName() == "text_embedding" || tensor.getName() == "embedding")
++        {
++            textEmbeddingPtr = &tensor;
++        }
++        else if (tensor.getName() == "text_embedding_scale" || tensor.getName() == "embedding_scale")
++        {
++            textEmbeddingScalesPtr = &tensor;
++        }
++    }
++    if (textEmbeddingPtr == nullptr && textEmbedTensors.size() == 1)
++    {
++        textEmbeddingPtr = &textEmbedTensors[0];
++    }
++    check::check(textEmbeddingPtr != nullptr, "text_embedding.safetensors is missing text_embedding tensor");
++    check::check(
++        textEmbeddingPtr->getShape().getNumDims() == 2, "text_embedding tensor should be 2D [vocabSize, hiddenSize]");
++    if (textEmbeddingPtr->getDataType() == nvinfer1::DataType::kFP8)
++    {
++        check::check(textEmbeddingScalesPtr != nullptr, "FP8 text_embedding requires text_embedding_scale tensor");
++        check::check(textEmbeddingScalesPtr->getDataType() == nvinfer1::DataType::kFLOAT,
++            "text_embedding_scale tensor should be FP32");
++        check::check(
++            textEmbeddingScalesPtr->getShape().getNumDims() == 2, "text_embedding_scale tensor should be 2D");
++        int64_t const hiddenSize = textEmbeddingPtr->getShape()[1];
++        check::check(hiddenSize % kFP8EmbeddingBlockSize == 0,
++            "FP8 text_embedding hidden size should be divisible by FP8 embedding block size");
++        check::check(textEmbeddingScalesPtr->getShape()[0] == textEmbeddingPtr->getShape()[0],
++            "text_embedding_scale vocab size should match text_embedding");
++        check::check(textEmbeddingScalesPtr->getShape()[1] == hiddenSize / kFP8EmbeddingBlockSize,
++            "text_embedding_scale group count should match text_embedding hidden size");
++        mTextEmbeddingTable = std::move(*textEmbeddingPtr);
++        mTextEmbeddingScales = std::move(*textEmbeddingScalesPtr);
++        LOG_INFO("FP8 text embedding table loaded: [%lld, %lld], scales: [%lld, %lld]",
++            mTextEmbeddingTable.getShape()[0], mTextEmbeddingTable.getShape()[1], mTextEmbeddingScales.getShape()[0],
++            mTextEmbeddingScales.getShape()[1]);
++    }
++    else
++    {
++        mTextEmbeddingTable = std::move(*textEmbeddingPtr);
++        mTextEmbeddingScales = rt::Tensor{};
++        LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
++            mTextEmbeddingTable.getShape()[1]);
++    }
+@@
+-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
++    auto const textEmbeddingScales
++        = mTextEmbeddingScales.getShape().volume() > 0 ? rt::OptionalInputTensor{mTextEmbeddingScales} : std::nullopt;
++    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, textEmbeddingScales, ttsRaw, stream);
+@@
+-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
++    auto const textEmbeddingScales
++        = mTextEmbeddingScales.getShape().volume() > 0 ? rt::OptionalInputTensor{mTextEmbeddingScales} : std::nullopt;
++    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, textEmbeddingScales, mThinkerEmbedBuffer, stream);

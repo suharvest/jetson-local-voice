@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Seeed Studio 语音方案产品排布图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0a0e1a;
+    color: #e0e6f0;
+    padding: 40px 20px;
+    min-height: 100vh;
+  }
+  h1 {
+    text-align: center;
+    font-size: 28px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, #60a5fa, #a78bfa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    text-align: center;
+    color: #64748b;
+    font-size: 14px;
+    margin-bottom: 36px;
+  }
+  .table-wrapper {
+    max-width: 1400px;
+    margin: 0 auto;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+  }
+  th, td {
+    padding: 12px 14px;
+    text-align: center;
+    border-bottom: 1px solid #1e293b;
+    font-size: 13px;
+    vertical-align: middle;
+  }
+  thead th {
+    background: #111827;
+    font-size: 14px;
+    font-weight: 700;
+    color: #f1f5f9;
+    border-bottom: 2px solid #2563eb;
+    padding: 16px 14px;
+  }
+  thead th:first-child {
+    text-align: left;
+    color: #94a3b8;
+    font-weight: 500;
+  }
+  /* tier header row */
+  .tier-row td {
+    background: #0f172a;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: #475569;
+    padding: 8px 14px;
+    border-bottom: 1px solid #1e293b;
+  }
+  /* section header row */
+  .section-row td {
+    background: #0c1425;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #3b82f6;
+    padding: 10px 14px;
+    border-bottom: 1px solid #1e3a5f;
+    border-top: 2px solid #1e3a5f;
+    text-align: left;
+  }
+  .section-row td:not(:first-child) {
+    text-align: center;
+  }
+  /* first column */
+  td:first-child {
+    text-align: left;
+    font-weight: 500;
+    color: #94a3b8;
+    background: #0d1322;
+    white-space: nowrap;
+    padding-left: 24px;
+  }
+  .section-row td:first-child {
+    padding-left: 14px;
+  }
+  /* alternating rows */
+  tbody tr:not(.tier-row):not(.section-row):nth-child(odd) td:not(:first-child) { background: #111827; }
+  tbody tr:not(.tier-row):not(.section-row):nth-child(even) td:not(:first-child) { background: #0f172a; }
+  tbody tr:not(.tier-row):not(.section-row):hover td:not(:first-child) { background: #1a2236; }
+
+  /* tier colors */
+  .tier-micro { border-top: 3px solid #475569; }
+  .tier-basic { border-top: 3px solid #64748b; }
+  .tier-mid { border-top: 3px solid #3b82f6; }
+  .tier-pro { border-top: 3px solid #a78bfa; }
+
+  /* badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    margin: 2px;
+  }
+  .badge-green { background: #064e3b; color: #6ee7b7; }
+  .badge-blue { background: #1e3a5f; color: #7dd3fc; }
+  .badge-purple { background: #3b1f6e; color: #c4b5fd; }
+  .badge-yellow { background: #713f12; color: #fde68a; }
+  .badge-gray { background: #1e293b; color: #94a3b8; }
+  .badge-red { background: #7f1d1d; color: #fca5a5; }
+  .badge-dark { background: #111827; color: #64748b; }
+
+  .yes { color: #4ade80; font-weight: 700; }
+  .partial { color: #fbbf24; font-weight: 600; }
+  .no { color: #6b7280; }
+
+  .note {
+    font-size: 11px;
+    color: #64748b;
+    margin-top: 3px;
+    line-height: 1.4;
+  }
+  .highlight {
+    color: #60a5fa;
+    font-weight: 600;
+  }
+
+  .footer {
+    max-width: 1400px;
+    margin: 24px auto 0;
+    padding: 16px 20px;
+    background: #111827;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #64748b;
+    line-height: 1.8;
+  }
+  .footer strong { color: #94a3b8; }
+
+  .legend {
+    max-width: 1400px;
+    margin: 16px auto 0;
+    display: flex;
+    gap: 24px;
+    font-size: 12px;
+    color: #64748b;
+    flex-wrap: wrap;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    display: inline-block;
+  }
+  .dot-green { background: #4ade80; }
+  .dot-yellow { background: #fbbf24; }
+  .dot-gray { background: #6b7280; }
+
+  .device-name { font-size: 15px; font-weight: 700; }
+  .device-sub { font-size: 11px; color: #64748b; margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<h1>Seeed Studio Edge Voice Solutions</h1>
+<p class="subtitle">语音方案产品排布图 &mdash; 面向客户 &amp; 销售培训</p>
+
+<div class="table-wrapper">
+<table>
+<thead>
+  <tr>
+    <th style="width:150px;">能力维度</th>
+    <th class="tier-micro" style="width:140px;">
+      <div class="device-name">XIAO ESP32S3</div>
+      <div class="device-sub">微控制器</div>
+    </th>
+    <th class="tier-basic" style="width:150px;">
+      <div class="device-name">reRouter</div>
+      <div class="device-sub">CM4 级别</div>
+    </th>
+    <th class="tier-mid" style="width:150px;">
+      <div class="device-name">RK3576</div>
+      <div class="device-sub">reComputer RK</div>
+    </th>
+    <th class="tier-mid" style="width:150px;">
+      <div class="device-name">RK3588</div>
+      <div class="device-sub">reComputer RK</div>
+    </th>
+    <th class="tier-pro" style="width:150px;">
+      <div class="device-name">Orin Nano</div>
+      <div class="device-sub">reComputer J30</div>
+    </th>
+    <th class="tier-pro" style="width:150px;">
+      <div class="device-name">Orin NX</div>
+      <div class="device-sub">reComputer J40</div>
+    </th>
+    <th class="tier-pro" style="width:150px;">
+      <div class="device-name">AGX Orin</div>
+      <div class="device-sub">reComputer J50</div>
+    </th>
+  </tr>
+</thead>
+<tbody>
+  <!-- Tier labels -->
+  <tr class="tier-row">
+    <td></td>
+    <td><span class="badge badge-dark">前端</span></td>
+    <td><span class="badge badge-gray">入门级</span></td>
+    <td colspan="2"><span class="badge badge-blue">主流级</span></td>
+    <td colspan="3"><span class="badge badge-purple">专业级</span></td>
+  </tr>
+
+  <!-- 核心定位 -->
+  <tr>
+    <td>核心定位</td>
+    <td>唤醒词前端</td>
+    <td>低成本本地转录</td>
+    <td>轻量语音交互</td>
+    <td>多语言语音交互</td>
+    <td>高品质语音 + 克隆</td>
+    <td>全能语音方案</td>
+    <td>语音 + LLM 一体</td>
+  </tr>
+
+  <!-- ==================== VAD ==================== -->
+  <tr class="section-row">
+    <td colspan="8">VAD &mdash; 语音活动检测</td>
+  </tr>
+  <tr>
+    <td>VAD 能力</td>
+    <td><span class="no">&times;</span></td>
+    <td>
+      <span class="yes">&#10003;</span> Silero VAD
+      <div class="note">CPU 运行</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> Silero VAD
+      <div class="note">CPU 运行</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> Silero VAD
+      <div class="note">CPU 运行</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> Silero VAD
+      <div class="note">CPU 运行</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> Silero VAD
+      <div class="note">CPU 运行</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> Silero VAD
+      <div class="note">CPU 运行</div>
+    </td>
+  </tr>
+
+  <!-- ==================== Wake Word ==================== -->
+  <tr class="section-row">
+    <td colspan="8">Wake Word &mdash; 唤醒词</td>
+  </tr>
+  <tr>
+    <td>唤醒词检测</td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">ESP-SR<br/>低功耗常驻</div>
+    </td>
+    <td>
+      <span class="partial">&#9679;</span>
+      <div class="note">可运行但非最佳<br/>功耗偏高</div>
+    </td>
+    <td>
+      <span class="partial">&#9679;</span>
+      <div class="note">可运行<br/>功耗偏高</div>
+    </td>
+    <td>
+      <span class="partial">&#9679;</span>
+      <div class="note">可运行<br/>功耗偏高</div>
+    </td>
+    <td>
+      <span class="partial">&#9679;</span>
+      <div class="note">可运行<br/>功耗偏高</div>
+    </td>
+    <td>
+      <span class="partial">&#9679;</span>
+      <div class="note">可运行<br/>功耗偏高</div>
+    </td>
+    <td>
+      <span class="partial">&#9679;</span>
+      <div class="note">可运行<br/>功耗偏高</div>
+    </td>
+  </tr>
+  <tr>
+    <td>典型搭配</td>
+    <td>
+      <span class="badge badge-green">唤醒前端</span>
+      <div class="note">搭配上位机使用</div>
+    </td>
+    <td colspan="6" style="color:#64748b; font-size:12px;">
+      &larr; ESP32S3 作为低功耗唤醒前端，检测到唤醒词后通知上位机启动 ASR/TTS 流水线
+    </td>
+  </tr>
+
+  <!-- ==================== ASR ==================== -->
+  <tr class="section-row">
+    <td colspan="8">ASR &mdash; 语音识别 (Speech-to-Text)</td>
+  </tr>
+  <tr>
+    <td>ASR 引擎</td>
+    <td><span class="no">&times;</span></td>
+    <td>SenseVoice</td>
+    <td>Qwen3-ASR</td>
+    <td>Qwen3-ASR</td>
+    <td>Qwen3-ASR</td>
+    <td>Qwen3-ASR</td>
+    <td>Qwen3-ASR</td>
+  </tr>
+  <tr>
+    <td>支持语言数</td>
+    <td><span class="no">&mdash;</span></td>
+    <td><span class="badge badge-gray">~5</span></td>
+    <td><span class="badge badge-blue">52+</span></td>
+    <td><span class="badge badge-blue">52+</span></td>
+    <td><span class="badge badge-purple">52+</span></td>
+    <td><span class="badge badge-purple">52+</span></td>
+    <td><span class="badge badge-purple">52+</span></td>
+  </tr>
+  <tr>
+    <td>实时性 (RTF)</td>
+    <td><span class="no">&mdash;</span></td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF &lt; 1.0</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.44</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.35</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.20</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.15</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.10</div>
+    </td>
+  </tr>
+  <tr>
+    <td>流式输出</td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span>
+      <div class="note">仅整段</div>
+    </td>
+    <td><span class="yes">&#10003;</span>
+      <div class="note">逐 token</div>
+    </td>
+    <td><span class="yes">&#10003;</span>
+      <div class="note">逐 token</div>
+    </td>
+    <td><span class="yes">&#10003;</span>
+      <div class="note">逐 token</div>
+    </td>
+    <td><span class="yes">&#10003;</span>
+      <div class="note">逐 token</div>
+    </td>
+    <td><span class="yes">&#10003;</span>
+      <div class="note">逐 token</div>
+    </td>
+  </tr>
+
+  <!-- ==================== TTS ==================== -->
+  <tr class="section-row">
+    <td colspan="8">TTS &mdash; 语音合成 (Text-to-Speech)</td>
+  </tr>
+  <tr>
+    <td>TTS 引擎</td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td>Piper / Matcha</td>
+    <td>Piper / Matcha</td>
+    <td>Qwen3-TTS <span style="color:#fbbf24;">?</span></td>
+    <td>Qwen3-TTS <span style="color:#fbbf24;">?</span></td>
+    <td>Qwen3-TTS</td>
+  </tr>
+  <tr>
+    <td>TTS 语言</td>
+    <td><span class="no">&mdash;</span></td>
+    <td><span class="no">&mdash;</span></td>
+    <td>
+      <span class="badge badge-blue">17 种可选</span>
+      <div class="note">需预选单一语言<br/>不可实时切换</div>
+    </td>
+    <td>
+      <span class="badge badge-blue">17 种可选</span>
+      <div class="note">需预选单一语言<br/>不可实时切换</div>
+    </td>
+    <td>
+      <span class="badge badge-purple">多语言</span>
+      <div class="note">待验证</div>
+    </td>
+    <td>
+      <span class="badge badge-purple">多语言</span>
+      <div class="note">待验证</div>
+    </td>
+    <td>
+      <span class="badge badge-purple">多语言</span>
+      <div class="note"><span class="highlight">实时多语言切换</span></div>
+    </td>
+  </tr>
+  <tr>
+    <td>TTS 音质</td>
+    <td><span class="no">&mdash;</span></td>
+    <td><span class="no">&mdash;</span></td>
+    <td>
+      <span class="badge badge-yellow">机械感</span>
+      <div class="note">轻量模型限制</div>
+    </td>
+    <td>
+      <span class="badge badge-yellow">机械感</span>
+      <div class="note">轻量模型限制</div>
+    </td>
+    <td>
+      <span class="badge badge-green">自然</span> <span style="color:#fbbf24;">?</span>
+      <div class="note">待验证</div>
+    </td>
+    <td>
+      <span class="badge badge-green">自然</span> <span style="color:#fbbf24;">?</span>
+      <div class="note">待验证</div>
+    </td>
+    <td>
+      <span class="badge badge-green">自然</span>
+      <div class="note">大模型 + 声码器</div>
+    </td>
+  </tr>
+  <tr>
+    <td>声音克隆</td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td>
+      <span class="yes">&#10003;</span> PSR
+      <div class="note">~10s 音频即可</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> PSR
+      <div class="note">~10s 音频即可</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span> PSR
+      <div class="note">~10s 音频即可</div>
+    </td>
+  </tr>
+  <tr>
+    <td>TTS 实时性 (RTF)</td>
+    <td><span class="no">&mdash;</span></td>
+    <td><span class="no">&mdash;</span></td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.07</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.05</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.33</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.25</div>
+    </td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">RTF ~0.20</div>
+    </td>
+  </tr>
+
+  <!-- ==================== LLM ==================== -->
+  <tr class="section-row">
+    <td colspan="8">LLM &mdash; 本地大语言模型</td>
+  </tr>
+  <tr>
+    <td>本地 LLM</td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td><span class="no">&times;</span></td>
+    <td>
+      <span class="yes">&#10003;</span>
+      <div class="note">可运行 7B~14B 模型<br/>语音 + LLM 同机部署</div>
+    </td>
+  </tr>
+
+  <!-- ==================== 综合 ==================== -->
+  <tr class="section-row">
+    <td colspan="8">综合信息</td>
+  </tr>
+  <tr>
+    <td>典型场景</td>
+    <td>
+      <span class="badge badge-dark">唤醒前端</span>
+      <span class="badge badge-dark">语音触发</span>
+    </td>
+    <td>
+      <span class="badge badge-gray">会议转录</span>
+      <span class="badge badge-gray">语音笔记</span>
+    </td>
+    <td>
+      <span class="badge badge-blue">语音助手</span>
+      <span class="badge badge-blue">广播播报</span>
+      <span class="badge badge-blue">IoT 网关</span>
+    </td>
+    <td>
+      <span class="badge badge-blue">多语言客服</span>
+      <span class="badge badge-blue">智能终端</span>
+      <span class="badge badge-blue">教育</span>
+    </td>
+    <td>
+      <span class="badge badge-purple">个性化助手</span>
+      <span class="badge badge-purple">内容创作</span>
+      <span class="badge badge-purple">有声书</span>
+    </td>
+    <td>
+      <span class="badge badge-purple">多语言克隆</span>
+      <span class="badge badge-purple">实时翻译</span>
+      <span class="badge badge-purple">数字人</span>
+    </td>
+    <td>
+      <span class="badge badge-purple">语音 + LLM</span>
+      <span class="badge badge-purple">智能体</span>
+      <span class="badge badge-purple">多模态</span>
+    </td>
+  </tr>
+  <tr>
+    <td>设备参考价格</td>
+    <td>~$5</td>
+    <td>$200 &ndash; $300</td>
+    <td>$200 &ndash; $250</td>
+    <td>$350 &ndash; $400</td>
+    <td>$600 &ndash; $700</td>
+    <td>$800 &ndash; $900</td>
+    <td>~$2,000</td>
+  </tr>
+</tbody>
+</table>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><span class="legend-dot dot-green"></span> 完全支持</div>
+  <div class="legend-item"><span class="legend-dot dot-yellow"></span> 有限支持 / 有约束</div>
+  <div class="legend-item"><span class="legend-dot dot-gray"></span> 不支持</div>
+</div>
+
+<div class="footer">
+  <strong>档次速记：</strong><br/>
+  <strong>前端</strong>（ESP32S3 ~$5）&mdash; 低功耗唤醒词检测，搭配上位机使用<br/>
+  <strong>入门级</strong>（reRouter / CM4 $200-300）&mdash; 纯转录，~5 种语言，无合成，适合简单记录场景<br/>
+  <strong>主流级</strong>（RK3576 $200+ / RK3588 $350+）&mdash; ASR 52+ 语言 + 轻量 TTS（17 种语言可选但一次只能用一种），音色机械、无克隆<br/>
+  <strong>专业级</strong>（Orin Nano $600+ / Orin NX $800+）&mdash; 52+ 语言 ASR + Qwen3-TTS（待验证）+ 声音克隆<br/>
+  <strong>旗舰级</strong>（AGX Orin ~$2000）&mdash; 全部语音能力 + 本地 LLM，语音与大模型同机部署<br/><br/>
+  <strong>选型建议：</strong>只需唤醒 → ESP32S3；只需转录 → reRouter；需要双向语音交互 → RK 系列；需要克隆或高品质多语言 → Orin Nano/NX；需要语音 + LLM 一体 → AGX Orin
+</div>
+
+</body>
+</html>
