@@ -256,6 +256,17 @@ def _wav_duration_and_samples(wav_bytes: bytes) -> tuple[float, int]:
     return (samples / rate if rate > 0 else 0.0), samples
 
 
+def _pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
+    """Wrap raw mono int16 little-endian PCM in a minimal WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
 # Default sampling parameters
 _DEFAULT_TEMPERATURE = float(os.environ.get("TTS_TALKER_TEMPERATURE", "0.9"))
 _DEFAULT_TOP_K = int(os.environ.get("TTS_TALKER_TOP_K", "50"))
@@ -477,6 +488,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         self._worker_ready_meta = ready
 
     def _synthesize_worker(self, text: str, language: Optional[str], **kwargs) -> tuple[bytes, dict]:
+        if _tts_stateful_code2wav_enabled():
+            # The C++ worker rejects oneshot requests with "Stateful Code2Wav
+            # currently requires stream=true". Drive the same streaming path
+            # that /tts/stream uses, accumulate raw PCM, and wrap as a single
+            # WAV so the public non-streaming /tts endpoint stays usable.
+            return self._synthesize_worker_via_stream(text, language=language, **kwargs)
         req_id = uuid.uuid4().hex
         with tempfile.NamedTemporaryFile(prefix="trt_edgellm_tts_", suffix=".wav", delete=False) as f:
             output_file = f.name
@@ -532,6 +549,42 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         }
         return wav_bytes, meta
 
+    def _synthesize_worker_via_stream(
+        self, text: str, language: Optional[str] = None, **kwargs
+    ) -> tuple[bytes, dict]:
+        """Aggregate streaming PCM chunks into a single WAV.
+
+        Used by the non-streaming /tts endpoint when stateful Code2Wav is on
+        (the C++ worker only accepts stream=true in that mode).
+        """
+        t0 = time.time()
+        done_meta: dict = {}
+        # Force segment_text=False so we drive a single streaming request
+        # here; outer synthesize() already split into segments if needed.
+        stream_kwargs = dict(kwargs)
+        stream_kwargs["segment_text"] = False
+        stream_kwargs["language"] = language
+        pcm = bytearray()
+        for chunk in self._generate_streaming_single(text, meta_out=done_meta, **stream_kwargs):
+            pcm.extend(chunk)
+        elapsed = time.time() - t0
+        sample_rate = int(done_meta.get("sample_rate", 24000))
+        wav_bytes = _pcm16_to_wav(bytes(pcm), sample_rate=sample_rate)
+        meta = {
+            "inference_time_s": round(elapsed, 3),
+            "sample_rate": sample_rate,
+            "duration_s": float(done_meta.get("audio_s", 0.0)),
+            "samples": int(done_meta.get("samples", len(pcm) // 2)),
+            "rtf": round(float(done_meta.get("rtf", 0.0)), 3),
+            "generation_ms": round(float(done_meta.get("generation_ms", 0.0)), 1),
+            "code2wav_ms": round(float(done_meta.get("code2wav_ms", 0.0)), 1),
+            "first_chunk_ms": round(float(done_meta.get("first_chunk_ms", 0.0)), 1),
+            "chunk_count": int(done_meta.get("chunk_count", 0)),
+            "stateful_code2wav": bool(done_meta.get("stateful_code2wav", True)),
+            "worker_init_ms": round(float(self._worker_ready_meta.get("init_ms", 0.0)), 1),
+        }
+        return wav_bytes, meta
+
     def generate_streaming(self, text: str, **kwargs):
         """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
         if self._product_backend is not None:
@@ -549,8 +602,14 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
         yield from self._generate_streaming_single(text, **kwargs)
 
-    def _generate_streaming_single(self, text: str, **kwargs):
-        """Yield raw PCM int16 chunks for one already-bounded TTS request."""
+    def _generate_streaming_single(self, text: str, meta_out: Optional[dict] = None, **kwargs):
+        """Yield raw PCM int16 chunks for one already-bounded TTS request.
+
+        If ``meta_out`` is a dict, the worker's terminal ``done`` event JSON
+        (rtf, total_ms, first_chunk_ms, etc.) is merged into it before the
+        generator returns. Used by ``_synthesize_worker`` to assemble a
+        single-shot WAV in stateful Code2Wav mode.
+        """
         req_id = uuid.uuid4().hex
         streaming_profile = str(
             kwargs.get("streaming_profile", os.environ.get("EDGE_LLM_TTS_STREAMING_PROFILE", "continuous_playback"))
@@ -666,6 +725,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                             payload = payload[44:]
                         yield payload
                 elif event.get("event") == "done":
+                    # Surface the worker's terminal metadata to callers that
+                    # passed a `meta_out` dict (used by _synthesize_worker in
+                    # stateful Code2Wav mode to assemble a single-shot WAV).
+                    if meta_out is not None and isinstance(meta_out, dict):
+                        meta_out.update(event)
                     break
 
     def synthesize(

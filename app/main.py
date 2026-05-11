@@ -261,9 +261,9 @@ async def tts(req: TTSRequest):
         content=wav_bytes,
         media_type="audio/wav",
         headers={
-            "X-Audio-Duration": str(meta["duration"]),
-            "X-Inference-Time": str(meta["inference_time"]),
-            "X-RTF": str(meta["rtf"]),
+            "X-Audio-Duration": str(meta.get("duration", meta.get("duration_s", 0))),
+            "X-Inference-Time": str(meta.get("inference_time", meta.get("inference_time_s", 0))),
+            "X-RTF": str(meta.get("rtf", 0)),
         },
     )
 
@@ -351,9 +351,9 @@ async def tts_clone(req: CloneRequest):
         content=wav_bytes,
         media_type="audio/wav",
         headers={
-            "X-Audio-Duration": str(meta["duration"]),
-            "X-Inference-Time": str(meta["inference_time"]),
-            "X-RTF": str(meta["rtf"]),
+            "X-Audio-Duration": str(meta.get("duration", meta.get("duration_s", 0))),
+            "X-Inference-Time": str(meta.get("inference_time", meta.get("inference_time_s", 0))),
+            "X-RTF": str(meta.get("rtf", 0)),
         },
     )
 
