@@ -81,7 +81,7 @@ docker compose -f deploy/docker-compose.yml up -d
 LANGUAGE_MODE=en docker compose -f deploy/docker-compose.yml up -d
 
 # Qwen3 multilingual ASR/TTS
-SEEED_LOCAL_VOICE_PROFILE=multilanguage-qwen-highperf \
+SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf \
 QWEN3_HF_REPO_ID=<your-org/qwen3-edgellm-jetson-artifacts> \
 docker compose -f deploy/docker-compose.yml up -d
 ```
@@ -186,11 +186,11 @@ bash qwen3-edgellm-jetson/scripts/verify_reproduction.sh \
 For manual deployments, profile selection follows the existing pattern:
 
 ```bash
-SEEED_LOCAL_VOICE_PROFILE=multilanguage-qwen-highperf uvicorn app.main:app --host 0.0.0.0 --port 8621
+SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf uvicorn app.main:app --host 0.0.0.0 --port 8621
 ```
 
-Use `multilanguage-qwen-highperf-nx` on Orin NX when consuming the NX-native
-engine set; the default `multilanguage-qwen-highperf` profile targets the Nano
+Use `jetson-multilang-highperf-nx` on Orin NX when consuming the NX-native
+engine set; the default `jetson-multilang-highperf` profile targets the Nano
 artifact set.
 
 Profiles live in [`configs/profiles`](configs/profiles). They set environment

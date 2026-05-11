@@ -1,6 +1,12 @@
 {
-  "name": "multilanguage-qwen-official",
+  "name": "jetson-multilang-official",
   "description": "Qwen3 ASR + Qwen3 TTS minimal-diff EdgeLLM profile for correctness/upstream checks. Engine paths use ${QWEN3_ARTIFACT_ROOT} for portability when /opt/models needs sudo.",
+  "asr_backend": "jetson.trt_edge_llm",
+  "tts_backend": "jetson.trt_edge_llm",
+  "execution_policy": {
+    "mode": "serialized",
+    "shared_resource": "trt"
+  },
   "artifact_set": "orin-nano-official-2026-05-10",
   "env": {
     "LANGUAGE_MODE": "multilanguage",

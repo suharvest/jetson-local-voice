@@ -14,7 +14,7 @@
 #   -e EDGE_LLM_TTS_WORKER_BIN=/opt/edgellm-bin/qwen3_tts_worker
 #   -e EDGELLM_PLUGIN_PATH=/opt/edgellm-bin/libNvInfer_edgellm_plugin.so
 #   -e QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm
-#   -e SEEED_LOCAL_VOICE_PROFILE=multilanguage-qwen-highperf-nx
+#   -e SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf-nx
 
 ARG BUILDER_IMAGE=jetson-voice-speech:v3.5-clean
 FROM ${BUILDER_IMAGE} AS builder

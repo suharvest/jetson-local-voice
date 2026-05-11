@@ -2,11 +2,11 @@
 #
 # Usage:
 #   LANGUAGE_MODE=en docker compose -f deploy/docker-compose.yml up -d
-#   SEEED_LOCAL_VOICE_PROFILE=multilanguage-qwen-highperf docker compose -f deploy/docker-compose.yml up -d
+#   SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf docker compose -f deploy/docker-compose.yml up -d
 #
 # Models auto-download on first start (~1-2 min) and persist in a Docker volume.
 # Set LANGUAGE_MODE to "zh_en" (default, Chinese+English), "en" (English only),
-# or SEEED_LOCAL_VOICE_PROFILE=multilanguage-qwen-highperf for Qwen3 ASR/TTS.
+# or SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf for Qwen3 ASR/TTS.
 
 services:
   speech:
