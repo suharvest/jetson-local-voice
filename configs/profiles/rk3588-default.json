@@ -1,11 +1,27 @@
 {
   "name": "rk3588-default",
-  "description": "Stub profile for Rockchip RK3588 NPU. Backend registry keys rk.asr/rk.tts are wired in Step 4; selecting this profile before Step 4 lands will fail at factory time.",
+  "description": "Rockchip RK3588 NPU profile. Same backend stack as rk3576 (rkvoice-stream submodule); only RK_PLATFORM differs. Override TTS_BACKEND / matcha vars if you build platform-specific .rknn artifacts.",
   "asr_backend": "rk.asr",
   "tts_backend": "rk.tts",
   "execution_policy": {
     "mode": "serialized",
     "shared_resource": "npu"
   },
-  "env": {}
+  "env": {
+    "RK_PLATFORM": "rk3588",
+    "ASR_BACKEND": "qwen3_asr_rk",
+    "ASR_DECODER_TYPE": "rkllm",
+    "ASR_MODEL_DIR": "/opt/asr/models",
+    "RKLLM_LIB_PATH": "/opt/asr/lib/librkllmrt.so",
+    "QWEN3_ASR_STREAM_TRUE": "1",
+    "TTS_BACKEND": "matcha_rknn",
+    "TTS_MODEL_DIR": "/opt/tts/models",
+    "MODEL_DIR": "/opt/tts/models",
+    "MATCHA_USE_ORT": "1",
+    "MATCHA_MODEL": "matcha-s64.rknn",
+    "MATCHA_MAX_PHONEMES": "64",
+    "MATCHA_MODEL_SEQ_LEN": "80",
+    "VOCOS_MODEL": "vocos-16khz-600.rknn",
+    "VOCOS_FRAMES": "600"
+  }
 }
