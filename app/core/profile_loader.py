@@ -13,9 +13,25 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache of the most recently loaded profile dict.
+# apply_profile_from_env() populates this; current_profile() reads it.
+# Empty dict means "no profile loaded" (current_profile() returns {}).
+_CURRENT_PROFILE: dict = {}
+
+
+def current_profile() -> dict:
+    """Return the most recently loaded profile dict.
+
+    If no profile has been applied (apply_profile_from_env returned early
+    because no SEEED_LOCAL_VOICE_PROFILE env was set, or it raised), this
+    returns an empty dict. Callers that require a key should raise on miss.
+    """
+    return _CURRENT_PROFILE
+
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    # __file__ = <repo>/app/core/profile_loader.py → parents[2] = <repo>
+    return Path(__file__).resolve().parents[2]
 
 
 def _profile_path(name_or_path: str) -> Path:
@@ -40,6 +56,9 @@ def apply_profile_from_env() -> dict:
     path = _profile_path(profile_ref)
     with open(path, "r", encoding="utf-8") as f:
         profile = json.load(f)
+
+    global _CURRENT_PROFILE
+    _CURRENT_PROFILE = profile
 
     env_defaults = profile.get("env", {})
     applied = []
