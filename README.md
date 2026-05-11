@@ -34,16 +34,16 @@ Pull and run. Models auto-download on first start (~1 min) and are cached in a D
 
 ```bash
 # Chinese + English (default)
-docker run -d --name jetson-voice \
+docker run -d --name seeed-local-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
-  -v jetson-voice-models:/opt/models \
+  -v seeed-local-voice-models:/opt/models \
   -v /usr/local/cuda/lib64:/host-cuda:ro \
   -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
   -v /lib/aarch64-linux-gnu:/host-libs:ro \
   -e LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-nvidia-libs:/host-libs:/host-cuda \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v3.0-slim
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v3.0-slim
 
 # Verify (wait ~40s for warmup)
 curl http://localhost:8621/health
@@ -53,17 +53,17 @@ curl http://localhost:8621/health
 **English-only mode** (Kokoro TTS + Zipformer ASR):
 
 ```bash
-docker run -d --name jetson-voice \
+docker run -d --name seeed-local-voice \
   --runtime nvidia --ipc host \
   -p 8621:8000 \
   -e LANGUAGE_MODE=en \
-  -v jetson-voice-models:/opt/models \
+  -v seeed-local-voice-models:/opt/models \
   -v /usr/local/cuda/lib64:/host-cuda:ro \
   -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
   -v /lib/aarch64-linux-gnu:/host-libs:ro \
   -e LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-nvidia-libs:/host-libs:/host-cuda \
   --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/jetson-voice:v3.0-slim
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v3.0-slim
 ```
 
 **Deploy with compose** (recommended for production):

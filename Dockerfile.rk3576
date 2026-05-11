@@ -1,8 +1,8 @@
 # Jetson Voice — RK3576 (CPU onnxruntime)
 # Target: Debian 12 aarch64 with sherpa-onnx Python API
 #
-# Build: docker build -f Dockerfile.rk3576 -t jetson-voice:rk3576 .
-# Run:   docker run -p 8621:8000 -v speech-models:/opt/models jetson-voice:rk3576
+# Build: docker build -f Dockerfile.rk3576 -t seeed-local-voice:rk3576 .
+# Run:   docker run -p 8621:8000 -v speech-models:/opt/models seeed-local-voice:rk3576
 
 FROM debian:12-slim
 

@@ -1,8 +1,8 @@
 # Build target: Raspberry Pi 5 (linux/arm64, ONNX Runtime CPU EP)
 # Paraformer streaming ASR + Matcha TTS via sherpa-onnx (CPU only).
 #
-# Build: docker build -f Dockerfile.rpi -t jetson-voice:rpi5 .
-# Run:   docker run -p 8000:8000 -v ~/jetson-voice-rpi/models:/opt/models jetson-voice:rpi5
+# Build: docker build -f Dockerfile.rpi -t seeed-local-voice:rpi5 .
+# Run:   docker run -p 8000:8000 -v ~/seeed-local-voice-rpi/models:/opt/models seeed-local-voice:rpi5
 
 FROM debian:12-slim
 

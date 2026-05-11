@@ -9,7 +9,7 @@
 
 # === Build stage: extract runtime deps from the existing fat image ===
 # Uses the already-pulled v2.2 image (no network needed for builder)
-ARG BUILDER_IMAGE=sensecraft-missionpack.seeed.cn/solution/jetson-voice:v2.2
+ARG BUILDER_IMAGE=sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v2.2
 FROM ${BUILDER_IMAGE} AS builder
 
 # Everything is already installed in v2.2 — just verify

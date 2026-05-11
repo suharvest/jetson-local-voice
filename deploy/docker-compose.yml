@@ -10,7 +10,7 @@
 
 services:
   speech:
-    image: sensecraft-missionpack.seeed.cn/solution/jetson-voice:v3.0-slim
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v3.0-slim
     runtime: nvidia
     ipc: host
     ports:
