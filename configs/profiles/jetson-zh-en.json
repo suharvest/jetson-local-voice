@@ -1,0 +1,16 @@
+{
+  "name": "jetson-zh-en",
+  "description": "Jetson Orin (Nano/NX/AGX) zh_en default: Paraformer streaming ASR (TRT encoder + ORT decoder) + Matcha TTS (ORT acoustic + TRT vocos). Uses sherpa-onnx tokenizer/lexicon shipped under /opt/models.",
+  "asr_backend": "jetson.paraformer_trt",
+  "tts_backend": "jetson.matcha_trt",
+  "execution_policy": {
+    "mode": "serialized",
+    "shared_resource": "gpu"
+  },
+  "env": {
+    "LANGUAGE_MODE": "zh_en",
+    "MODEL_DIR": "/opt/models",
+    "PARAFORMER_MODEL_DIR": "/opt/models/paraformer-streaming",
+    "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en"
+  }
+}
