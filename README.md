@@ -161,6 +161,10 @@ For deployment, prefer selecting one JSON profile:
 JETSON_VOICE_PROFILE=multilanguage-qwen-highperf uvicorn app.main:app --host 0.0.0.0 --port 8621
 ```
 
+Use `multilanguage-qwen-highperf-nx` on Orin NX when consuming the NX-native
+engine set; the default `multilanguage-qwen-highperf` profile targets the Nano
+artifact set.
+
 Profiles live in [`configs/profiles`](configs/profiles). They set environment
 defaults only; explicit env vars still override them. Qwen3-ASR and Qwen3-TTS
 have two maintained runtime profiles under the same API surface:
