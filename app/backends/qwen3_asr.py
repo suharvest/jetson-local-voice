@@ -181,6 +181,69 @@ def _split_at_silence_vad(audio: np.ndarray, sr: int = 16000) -> list[np.ndarray
     return [audio[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
 
 
+def _split_at_silence_energy(audio: np.ndarray, sr: int = 16000) -> list[np.ndarray]:
+    """Dependency-free fallback splitter for generated TTS audio.
+
+    TTS product output inserts short zero/silence gaps between text segments.
+    When webrtcvad is unavailable, use frame RMS to find those gaps instead of
+    falling back to a single long decode, which Qwen3-ASR truncates.
+    """
+    max_seg = int(VAD_MAX_SEG_SEC * sr)
+    min_seg = int(VAD_MIN_SEG_SEC * sr)
+    if len(audio) <= max_seg:
+        return [audio]
+
+    frame_len = int(VAD_FRAME_MS * sr / 1000)
+    n_frames = len(audio) // frame_len
+    if n_frames == 0:
+        return [audio]
+
+    framed = audio[:n_frames * frame_len].reshape(n_frames, frame_len)
+    rms = np.sqrt(np.mean(framed * framed, axis=1))
+    threshold = float(os.environ.get("ASR_ENERGY_SPLIT_RMS", "0.003"))
+    is_silence = rms < threshold
+    min_run = max(1, int(os.environ.get("ASR_ENERGY_MIN_SILENCE_MS", "80")) // VAD_FRAME_MS)
+
+    cut_candidates = []
+    run_start = None
+    for i, silent in enumerate(is_silence):
+        if silent:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and i - run_start >= min_run:
+                cut_candidates.append(((run_start + i) // 2) * frame_len)
+            run_start = None
+    if run_start is not None and n_frames - run_start >= min_run:
+        cut_candidates.append(((run_start + n_frames) // 2) * frame_len)
+    cut_candidates = np.array(cut_candidates, dtype=np.int64)
+
+    cuts = [0]
+    while len(audio) - cuts[-1] > max_seg:
+        target = cuts[-1] + max_seg
+        lo = cuts[-1] + min_seg
+        hi = target
+        mask = (cut_candidates >= lo) & (cut_candidates <= hi)
+        if mask.any():
+            pick = int(cut_candidates[mask][np.argmax(cut_candidates[mask])])
+        else:
+            pick = int(target)
+        cuts.append(pick)
+    cuts.append(len(audio))
+
+    min_frag = int(1.0 * sr)
+    min_tail = int(2.0 * sr)
+    i = 1
+    while i < len(cuts) - 1:
+        if (cuts[i + 1] - cuts[i]) < min_frag:
+            cuts.pop(i)
+        else:
+            i += 1
+    while len(cuts) >= 3 and (cuts[-1] - cuts[-2]) < min_tail:
+        cuts.pop(-2)
+    return [audio[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
+
+
 def _join_segments(parts: list[str]) -> str:
     """Concatenate segment transcripts, stripping duplicate trailing
     punctuation that each segment's decoder may have added.
@@ -529,6 +592,8 @@ class Qwen3StreamingASRStream(ASRStream):
         # Partial decode (skip if endpoint already finalized)
         if self._episode_final or not self._encoder_frames:
             return
+        if os.environ.get("QWEN3_ASR_STREAM_PARTIAL", "1").lower() in ("0", "false", "no"):
+            return
 
         all_frames = np.concatenate(self._encoder_frames, axis=1)
         t0 = time.perf_counter()
@@ -552,9 +617,36 @@ class Qwen3StreamingASRStream(ASRStream):
         audio = np.concatenate(self._utterance_audio_buffer)
         return self._backend.transcribe_audio(audio, language=self._language).text
 
+    def _streaming_final_text(self) -> str:
+        """Decode the already accumulated streaming encoder frames.
+
+        This avoids re-running full-audio mel/encoder on utterance finalization.
+        It is intended for low-latency V2V where chunk processing has already
+        kept the encoder state current.  The offline final path remains the
+        default until quality gates explicitly enable this mode.
+        """
+        if not self._encoder_frames:
+            return ""
+        all_frames = np.concatenate(self._encoder_frames, axis=1)
+        final_ids = self._decode_final(all_frames)
+        if not final_ids:
+            return self._partial_text
+        decoded = self._backend._tokenizer.decode(final_ids)
+        if "<asr_text>" in decoded:
+            decoded = decoded.split("<asr_text>", 1)[1]
+        return decoded.strip()
+
+    def _final_text(self) -> str:
+        mode = os.environ.get("QWEN3_ASR_STREAM_FINAL_MODE", "offline").strip().lower()
+        if mode in ("reuse", "stream", "streaming", "encoder"):
+            text = self._streaming_final_text()
+            if text:
+                return text
+        return self._offline_final_text()
+
     def _do_final_decode(self) -> None:
-        """Run final decode via offline full-audio single-pass decode."""
-        self._archive_text = self._offline_final_text()
+        """Run final decode and reset state for the next utterance."""
+        self._archive_text = self._final_text()
 
         # Reset state for next utterance
         self._partial_text = ""
@@ -1102,9 +1194,8 @@ class Qwen3ASRBackend(ASRBackend):
         try:
             segments = _split_at_silence_vad(audio)
         except Exception as e:
-            logger.warning("VAD split failed (%s); falling back to single-pass", e)
-            mel = self._compute_mel(audio)
-            return self._transcribe_python(mel, audio, language, t_total)
+            logger.warning("VAD split failed (%s); falling back to energy split", e)
+            segments = _split_at_silence_energy(audio)
 
         logger.info("Long audio %.2fs split into %d segments: %s",
                     len(audio) / 16000, len(segments),
