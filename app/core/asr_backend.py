@@ -100,6 +100,7 @@ _ASR_REGISTRY: Dict[str, Tuple[str, str]] = {
     "jetson.paraformer_trt": ("app.backends.jetson.paraformer_trt",   "ParaformerTRTBackend"),
     "jetson.qwen3_asr":      ("app.backends.jetson.qwen3_asr",        "Qwen3ASRBackend"),
     "cpu.sherpa_asr":        ("app.backends.cpu.sherpa_asr",          "SherpaASRBackend"),
+    "rk.asr":                ("app.backends.rk.asr",                  "RKASRBackend"),
 }
 
 
