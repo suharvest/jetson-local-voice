@@ -98,7 +98,12 @@ class ASRBackend(ABC):
 _ASR_REGISTRY: Dict[str, Tuple[str, str]] = {
     "jetson.trt_edge_llm":   ("app.backends.jetson.trt_edge_llm_asr", "TRTEdgeLLMASRBackend"),
     "jetson.paraformer_trt": ("app.backends.jetson.paraformer_trt",   "ParaformerTRTBackend"),
-    "jetson.qwen3_asr":      ("app.backends.jetson.qwen3_asr",        "Qwen3ASRBackend"),
+    # NOTE: jetson.qwen3_asr (standalone ORT-CUDA / TRT-native Python backend)
+    # is intentionally NOT registered. Production multilanguage runs through
+    # jetson.trt_edge_llm (subprocess workers). The file
+    # app/backends/jetson/qwen3_asr.py is kept for test fixtures
+    # (Qwen3StreamingASRStream, _is_cjk, etc.) but its preload code path is
+    # dead in the deployed image.
     "cpu.sherpa_asr":        ("app.backends.cpu.sherpa_asr",          "SherpaASRBackend"),
     "rk.asr":                ("app.backends.rk.asr",                  "RKASRBackend"),
 }
