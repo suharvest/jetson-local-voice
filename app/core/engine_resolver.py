@@ -308,11 +308,14 @@ def _try_hf_resolve(spec: EngineSpec, host: HostSignature) -> bool:
         logger.info("no HF manifest for %s: %s", spec.model_id, exc)
         return False
 
-    bundle_rel = f"models/{spec.model_id}/engines/{host.key}.tar.gz"
-    file_info = (manifest.get("files") or {}).get(bundle_rel)
+    # manifest.json keys are model-relative ("engines/<host_sig>.tar.gz");
+    # the HF fetch URL needs the full "models/<id>/..." path.
+    manifest_key = f"engines/{host.key}.tar.gz"
+    file_info = (manifest.get("files") or {}).get(manifest_key)
     if not file_info:
         logger.info("HF manifest has no bundle for %s @ %s", spec.model_id, host.key)
         return False
+    bundle_rel = f"models/{spec.model_id}/{manifest_key}"
 
     try:
         hf_artifacts.download_and_extract_tarball(
@@ -350,9 +353,10 @@ def _ensure_onnx_for_compile(spec: EngineSpec) -> Path:
     if onnx_path.exists():
         return onnx_path
     from app.core import hf_artifacts
-    rel = f"models/{spec.model_id}/onnx/{spec.onnx_input}"
+    manifest_key = f"onnx/{spec.onnx_input}"
+    rel = f"models/{spec.model_id}/{manifest_key}"
     manifest = hf_artifacts.fetch_manifest(spec.model_id)  # raises if no manifest
-    info = (manifest.get("files") or {}).get(rel) or {}
+    info = (manifest.get("files") or {}).get(manifest_key) or {}
     hf_artifacts.download_file(rel, onnx_path, expected_sha256=info.get("sha256"))
     return onnx_path
 
