@@ -93,11 +93,21 @@ def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") 
     """Ensure all required models for the given language mode are present."""
     if language_mode == "multilanguage":
         _ensure_qwen3_artifacts()
+        # multilang preset (jetson-qwen3asr-matcha) pairs Qwen3 ASR with
+        # Matcha TTS, so the matcha-icefall-zh-en bundle is required as
+        # well for the acoustic ONNX (model-steps-3.onnx) + lexicon.
+        # vocos engine is fetched separately by engine_resolver from HF.
+        matcha = MODELS.get("zh_en", {}).get("matcha-icefall-zh-en")
+        if matcha:
+            required = {"matcha-icefall-zh-en": matcha}
+        else:
+            return
+    else:
+        required = {}
+        required.update(MODELS.get(language_mode, {}))
+        # SenseVoice is optional — don't block startup for it (lazy-loaded)
+    if not required:
         return
-
-    required = {}
-    required.update(MODELS.get(language_mode, {}))
-    # SenseVoice is optional — don't block startup for it (lazy-loaded)
 
     missing = []
     for dir_name, (cdn_file, desc) in required.items():
