@@ -10,9 +10,22 @@ Branch: `qwen3tts-accurate-20260507` (latest commit ≥ `f3ab241`).
 
 | Device class | Image | Size |
 |---|---|---|
-| Jetson Orin (Nano/NX/AGX) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.7` | 3.14 GB |
+| Jetson Orin (Nano/NX/AGX) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.9` | 3.14 GB |
 | RK3576 / RK3588 | `seeed-local-voice:rk-v1.1` (local on radxa; not yet pushed to registry) | 1.38 GB |
 | RPi 4 / 5 (CM4 / CM5) | `seeed-local-voice:rpi-v1.1` (local on harvest-pi) | 560 MB |
+
+History — Jetson image patches (each fix forced a rebake):
+- v1.0 → first slim bake (CMD `sleep 9999` bug, no TRT libs)
+- v1.1 → tensorrt + cuda-python + EdgeLLM workers added
+- v1.2 → CMD fixed + NVIDIA_DRIVER_CAPABILITIES=all
+- v1.3 → TRT runtime libs added but 1.14 GB layer rejected by registry (413)
+- v1.4 → layered TRT/CUDA libs (all < 500 MB), passes registry
+- v1.5 → EdgeLLM plugin replaced with W8A16-capable build
+- v1.6 → engine_resolver + profile fixes added (missed full app/ refresh)
+- v1.7 → full app/ + configs/ refresh, baked SEEED_LOCAL_VOICE_PROFILE blanked
+- v1.8 → hf_artifacts User-Agent fix (hf-mirror 403)
+- v1.9 → engine_resolver manifest key alignment (model-relative vs full path)
+Use v1.9 going forward.
 
 All three are self-contained for their device family. Pull jetson-v1.7 from
 the registry; rk-v1.1 / rpi-v1.1 are on-device builds — `docker save` or
@@ -35,13 +48,12 @@ artifact fetch (HF) on first start. ☐ profile exists, smoke pending.
 
 After today's sweep:
 
-| Device | Container | Image | Port | Preset |
-|---|---|---|---|---|
-| orin-nano | `seeed-nano-v17` | jetson-v1.7 | 8000 (host net) | voice_clone |
-| orin-nano | `seeed-nano-ml` | jetson-v1.7 | 8000 | multilang (re-test) |
-| radxa | `seeed-rk-v11` | rk-v1.1 | 8000 (host net) | multilang |
-| harvest-pi | `seeed-rpi-litezhen` | rpi-v1.1 | 8765 | rpi5-default (lite_zh_en) |
-| harvest-pi | `seeed-rpi-asronly` | rpi-v1.1 | 8766 | asr_zh_en |
+| Device | Container | Image | Port | Preset | /health |
+|---|---|---|---|---|---|
+| orin-nano | `seeed-nano-v19` | jetson-v1.9 | 8000 (host net) | voice_clone | ✅ both ready |
+| radxa | `seeed-rk-v11` | rk-v1.1 | 8000 (host net) | multilang | ✅ both ready |
+| harvest-pi | `seeed-rpi-litezhen` | rpi-v1.1 | 8765 | rpi5-default (lite_zh_en) | ✅ both ready |
+| harvest-pi | `seeed-rpi-asronly` | rpi-v1.1 | 8766 | asr_zh_en | ✅ asr ready, tts:null |
 
 `docker ps` on each device confirms current state.
 
@@ -61,7 +73,7 @@ docker run -d --name seeed-jetson --runtime nvidia --network host \
   -e SEEED_LOCAL_VOICE_PRESET=voice_clone \
   -e HF_ENDPOINT=https://hf-mirror.com \
   -e QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.7
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.9
 ```
 
 **multilang (Qwen3 ASR + Matcha TTS — supports multi-stream)**
@@ -72,7 +84,7 @@ docker run -d --name seeed-jetson-ml --runtime nvidia --network host \
   -e SEEED_LOCAL_VOICE_PRESET=multilang \
   -e HF_ENDPOINT=https://hf-mirror.com \
   -e QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.7
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.9
 ```
 
 Engine resolver downloads Matcha vocos engine bundle from
@@ -84,7 +96,7 @@ docker run -d --name seeed-jetson-lite --runtime nvidia --network host \
   -v seeed-models:/opt/models \
   -e SEEED_LOCAL_VOICE_PRESET=lite_zh_en \
   -e HF_ENDPOINT=https://hf-mirror.com \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.7
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.9
 ```
 
 First start downloads sherpa Matcha (~120 MB) + Paraformer (~900 MB) ONNX
