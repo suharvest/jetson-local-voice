@@ -103,10 +103,19 @@ def _detect_jetson_tier() -> Optional[str]:
 def _detect_rk_tier() -> Optional[str]:
     # Some boards (e.g. Radxa ROCK 5T) put only a marketing name in
     # /proc/device-tree/model and expose the SoC family via the
-    # `compatible` node instead. Check both.
+    # `compatible` node instead. Check both. Inside Docker neither
+    # /proc/device-tree nor /sys/firmware is exposed by default, so
+    # also fall back to /proc/cpuinfo's "Hardware" field (kernel-
+    # populated, visible inside containers).
     model = _read("/proc/device-tree/model").lower()
     compat = _read("/proc/device-tree/compatible").lower()
-    haystack = model + " " + compat
+    cpuinfo_hw = ""
+    if not model and not compat:
+        for line in _read("/proc/cpuinfo").splitlines():
+            if line.lower().startswith(("hardware", "model")):
+                _, _, val = line.partition(":")
+                cpuinfo_hw += " " + val.strip().lower()
+    haystack = model + " " + compat + " " + cpuinfo_hw
     if "rk3588" in haystack:
         return TIER_RK3588
     if "rk3576" in haystack:
@@ -115,7 +124,16 @@ def _detect_rk_tier() -> Optional[str]:
 
 
 def _detect_rpi_tier() -> Optional[str]:
+    # /proc/device-tree is not exposed inside an unprivileged Docker
+    # container; fall back to /proc/cpuinfo's "Model" field which IS
+    # visible (kernel-populated, not bind-mounted).
     model = _read("/proc/device-tree/model").lower()
+    if not model:
+        for line in _read("/proc/cpuinfo").splitlines():
+            if line.lower().startswith("model"):
+                _, _, val = line.partition(":")
+                model = val.strip().lower()
+                break
     if "raspberry pi 5" in model or "raspberry pi compute module 5" in model:
         return TIER_RPI5
     if "raspberry pi 4" in model or "raspberry pi compute module 4" in model:
