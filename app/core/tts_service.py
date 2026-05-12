@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 _backend: Optional[TTSBackend] = None
 
 
+def is_configured() -> bool:
+    """Profiles can declare tts_backend = null / omit it to run in ASR-only
+    mode (e.g. RPi4/CM4 with no spare CPU budget for TTS). Returns False in
+    that case; callers should skip preload and let /tts endpoints return 503.
+    """
+    try:
+        from app.core.profile_loader import current_profile
+    except Exception:
+        return False
+    profile = current_profile() or {}
+    return bool(profile.get("tts_backend"))
+
+
 def get_backend() -> TTSBackend:
     global _backend
     if _backend is None:

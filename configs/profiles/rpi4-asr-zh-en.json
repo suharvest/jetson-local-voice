@@ -1,0 +1,16 @@
+{
+  "name": "rpi4-asr-zh-en",
+  "description": "ASR-only preset for Raspberry Pi 4 / CM4 (4GB or less). Paraformer-zh streaming (sherpa-onnx) — no TTS. Inspired by https://github.com/Allenkzl/Local-Automatic-Speech-Recognition (CM4 CLI ASR demo). Use this when the device has no headroom for a TTS pipeline.",
+  "asr_backend": "cpu.sherpa_asr",
+  "tts_backend": null,
+  "execution_policy": {
+    "mode": "exclusive"
+  },
+  "env": {
+    "LANGUAGE_MODE": "zh_en",
+    "MODEL_DIR": "/opt/models",
+    "ASR_BACKEND": "sherpa",
+    "STREAMING_ASR_PROVIDER": "cpu",
+    "STREAMING_ASR_NUM_THREADS": "2"
+  }
+}

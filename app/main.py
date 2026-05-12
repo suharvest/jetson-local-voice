@@ -173,7 +173,9 @@ async def startup():
         logger.warning("ASR backend failed: %s", e)
 
     from app.core import tts_service
-    if os.environ.get("LAZY_TTS", "").lower() in ("1", "true", "yes"):
+    if not tts_service.is_configured():
+        logger.info("ASR-only mode: profile declares no tts_backend; TTS endpoints will return 503.")
+    elif os.environ.get("LAZY_TTS", "").lower() in ("1", "true", "yes"):
         logger.info("TTS preload skipped (LAZY_TTS set); will load on first request.")
     else:
         logger.info("Pre-loading TTS model...")
@@ -183,8 +185,10 @@ async def startup():
     # per-thread context is initialized before the first /tts/stream
     # request lands. Without this, the very first streaming request
     # pays a ~30ms cold-context tax on prefill.
-    # Skip when LAZY_TTS — TTS not loaded yet, can't warm what isn't there.
-    if os.environ.get("LAZY_TTS", "").lower() in ("1", "true", "yes"):
+    # Skip when LAZY_TTS or ASR-only — TTS not loaded yet, can't warm what isn't there.
+    if not tts_service.is_configured():
+        pass  # ASR-only mode, no TTS warmup
+    elif os.environ.get("LAZY_TTS", "").lower() in ("1", "true", "yes"):
         logger.info("TTS streaming warmup skipped (LAZY_TTS).")
     else:
       try:

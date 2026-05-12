@@ -159,13 +159,19 @@ PRESET_TABLE: dict[tuple[str, str], str] = {
     (TIER_JETSON_ORIN_NX,   "lite_zh_en"):  "jetson-zh-en",
     (TIER_JETSON_ORIN_AGX,  "lite_zh_en"):  "jetson-zh-en",
 
-    # RK / RPi entries TODO once their profiles are authored and validated:
+    # RPi — ASR-only preset (asr_zh_en) for CM4 / RPi4 with no spare CPU
+    # budget for TTS. Reference: https://github.com/Allenkzl/Local-Automatic-Speech-Recognition
+    (TIER_RPI4, "asr_zh_en"): "rpi4-asr-zh-en",
+    # RPi5 inherits the same ASR-only profile by default; future
+    # rpi5-lite-zh-en would add Matcha TTS on top when validated.
+    (TIER_RPI5, "asr_zh_en"): "rpi4-asr-zh-en",
+
+    # RK / RPi5-lite entries TODO once their profiles are authored and validated:
     #   (TIER_RK3576, "multilang"):  "rk3576-multilang",
     #   (TIER_RK3588, "multilang"):  "rk3588-multilang",
     #   (TIER_RK3576, "lite_zh_en"): "rk3576-lite-zh-en",
     #   (TIER_RK3588, "lite_zh_en"): "rk3588-lite-zh-en",
     #   (TIER_RPI5,   "lite_zh_en"): "rpi5-lite-zh-en",
-    #   (TIER_RPI4,   "asr_zh_en"):  "rpi4-asr-zh-en",
 }
 
 KNOWN_PRESETS = sorted({preset for _, preset in PRESET_TABLE.keys()})
