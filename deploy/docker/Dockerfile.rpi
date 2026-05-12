@@ -44,13 +44,17 @@ RUN mkdir -p /opt/models
 
 ENV MODEL_DIR=/opt/models \
     LANGUAGE_MODE=zh_en \
-    SEEED_LOCAL_VOICE_PROFILE=rpi5-default \
     ASR_BACKEND=sherpa \
     TTS_BACKEND=sherpa \
     STREAMING_ASR_PROVIDER=cpu \
     TTS_PROVIDER=cpu \
     TTS_NUM_THREADS=4 \
     STREAMING_ASR_NUM_THREADS=4
+# NOTE: do NOT bake SEEED_LOCAL_VOICE_PROFILE here. Operator picks via
+# SEEED_LOCAL_VOICE_PRESET at docker run time (auto-resolves via
+# profile_selector). A baked PROFILE default would override the
+# operator's PRESET choice — profile_loader resolves PROFILE before
+# PRESET.
 
 LABEL org.opencontainers.image.title="Seeed Local Voice (Raspberry Pi)" \
       org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \

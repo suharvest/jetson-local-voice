@@ -86,8 +86,12 @@ RUN mkdir -p /opt/tts/models /opt/asr/models /opt/models
 ENV MODEL_DIR=/opt/models \
     TTS_MODEL_DIR=/opt/tts/models \
     ASR_MODEL_DIR=/opt/asr/models \
-    LD_LIBRARY_PATH=/usr/lib \
-    SEEED_LOCAL_VOICE_PROFILE=rk3576-default
+    LD_LIBRARY_PATH=/usr/lib
+# NOTE: do NOT bake SEEED_LOCAL_VOICE_PROFILE here. Operator picks via
+# SEEED_LOCAL_VOICE_PRESET at docker run time (auto-resolves via
+# profile_selector). A baked PROFILE default would silently override
+# the operator's PRESET choice because profile_loader resolves PROFILE
+# before PRESET.
 
 LABEL org.opencontainers.image.title="Seeed Local Voice (Rockchip)" \
       org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \

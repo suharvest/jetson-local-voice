@@ -101,10 +101,15 @@ def _detect_jetson_tier() -> Optional[str]:
 
 
 def _detect_rk_tier() -> Optional[str]:
+    # Some boards (e.g. Radxa ROCK 5T) put only a marketing name in
+    # /proc/device-tree/model and expose the SoC family via the
+    # `compatible` node instead. Check both.
     model = _read("/proc/device-tree/model").lower()
-    if "rk3588" in model:
+    compat = _read("/proc/device-tree/compatible").lower()
+    haystack = model + " " + compat
+    if "rk3588" in haystack:
         return TIER_RK3588
-    if "rk3576" in model:
+    if "rk3576" in haystack:
         return TIER_RK3576
     return None
 
