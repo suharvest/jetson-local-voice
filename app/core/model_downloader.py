@@ -36,6 +36,17 @@ MODELS = {
     },
 }
 
+# Per-model marker file the freshness check insists on seeing.
+# Without this, model dirs that engine_resolver populated with only
+# auxiliary subdirs (engines/, onnx/ skeletons) pass the "non-empty"
+# heuristic but still miss the load-bearing acoustic / decoder file.
+_MARKER_FILES = {
+    "matcha-icefall-zh-en": "model-steps-3.onnx",
+    "paraformer-streaming": "encoder.onnx",
+    "zipformer-en": "encoder.int8.onnx",
+    "kokoro-multi-lang-v1_0": "model.onnx",
+}
+
 
 def _detect_tar_mode(filename: str) -> str:
     """Return tar open mode based on filename extension."""
@@ -112,7 +123,22 @@ def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") 
     missing = []
     for dir_name, (cdn_file, desc) in required.items():
         model_path = os.path.join(model_dir, dir_name)
-        if os.path.isdir(model_path) and os.listdir(model_path):
+        marker = _MARKER_FILES.get(dir_name)
+        # When a marker is declared, look for the actual load-bearing
+        # file recursively under the model dir (the tarball lays files
+        # under subdirs in some upstream variants). Non-empty dir alone
+        # is NOT a sufficient signal — engine_resolver may have written
+        # the engines/ subdir before model_downloader runs.
+        is_ready = False
+        if os.path.isdir(model_path):
+            if marker:
+                for root, _dirs, files in os.walk(model_path):
+                    if marker in files:
+                        is_ready = True
+                        break
+            elif os.listdir(model_path):
+                is_ready = True
+        if is_ready:
             logger.info("Model OK: %s (%s)", dir_name, desc)
         else:
             missing.append((dir_name, cdn_file, desc))
