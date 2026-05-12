@@ -41,6 +41,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_ENDPOINT = "https://huggingface.co"
 DEFAULT_REPO = "harvestsu/seeed-local-voice-artifacts"
 
+# hf-mirror.com rejects Python-urllib/x.y default User-Agent with 403.
+# Use a hf_hub-style UA that mirrors what huggingface_hub sends.
+_UA = "seeed-local-voice/1.0; hf_hub-emulating"
+
+
+def _open(url: str, timeout: float = 30.0):
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    return urllib.request.urlopen(req, timeout=timeout)
+
 
 class ArtifactError(RuntimeError):
     """Raised when an artifact cannot be fetched, verified, or extracted."""
@@ -75,7 +84,7 @@ def fetch_manifest(model_id: str) -> dict:
     rel = f"models/{model_id}/manifest.json"
     url = file_url(rel)
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        with _open(url, timeout=30) as resp:
             data = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -102,7 +111,7 @@ def download_file(rel_path: str, dest: Path, expected_sha256: Optional[str] = No
 
     logger.info("downloading %s → %s", url, dest)
     try:
-        with urllib.request.urlopen(url, timeout=60) as resp:
+        with _open(url, timeout=60) as resp:
             with tmp.open("wb") as out:
                 shutil.copyfileobj(resp, out, length=1 << 20)
     except urllib.error.HTTPError as exc:
