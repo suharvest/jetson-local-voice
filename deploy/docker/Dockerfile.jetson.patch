@@ -22,12 +22,6 @@ COPY app/      /opt/speech/app/
 COPY configs/  /opt/speech/configs/
 COPY scripts/  /opt/speech/scripts/
 
-# voices/ rarely changes; keep behind a build-arg toggle so we don't COPY
-# when only app code moved.
-ARG COPY_VOICES=0
-RUN if [ "$COPY_VOICES" = "1" ]; then echo "Will copy voices/"; fi
-ONBUILD COPY voices/ /opt/speech/voices/
-
 LABEL org.opencontainers.image.title="Seeed Local Voice (Jetson, patched)"
 LABEL build.diff-base="${BASE}"
 LABEL build.diff-type="python-only"

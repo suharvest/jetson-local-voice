@@ -13,6 +13,18 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
+# pysbd — Python Sentence Boundary Disambiguation. Rule-based, no model
+# files, 22 languages, handles abbreviations ("Dr. Smith", "U.S.A."),
+# numbers ("3.14"), URLs ("example.com"). ~100 KB pure Python. If it's
+# missing (older image, dev env), we fall back to a simple regex that
+# over-splits abbreviations but still works.
+try:
+    import pysbd
+    _PYSBD_AVAILABLE = True
+except ImportError:
+    pysbd = None  # type: ignore
+    _PYSBD_AVAILABLE = False
+
 
 # ────────────────────────────────────────────────────────────────────────
 # Client → Server JSON message types
@@ -39,15 +51,38 @@ SERVER_ERROR              = "error"
 # Sentence buffering for streaming TTS input
 # ────────────────────────────────────────────────────────────────────────
 
-# Sentence-ending punctuation: CJK forms always end a sentence; ASCII
-# punct only ends a sentence if followed by whitespace or end-of-buffer.
-# Note: this heuristic correctly handles "3.14" (no space after .) and
-# "U.S.A." (when used mid-sentence), but still over-splits abbreviations
-# like "Dr. Smith arrived." into ["Dr.", "Smith arrived."]. For streaming
-# TTS the over-split is acceptable (brief pause, no quality loss). If
-# your LLM emits abbreviation-heavy English, expect a slightly choppier
-# cadence — proper abbreviation handling would require nltk.sent_tokenize
-# or a maintained abbreviation list, both heavyweight for streaming.
+# Languages pysbd 0.3.4 supports out-of-the-box (ISO-639-1).
+_PYSBD_LANGS = {
+    "am", "ar", "bg", "da", "de", "el", "en", "es", "fa", "fr",
+    "hi", "hy", "it", "ja", "kk", "mr", "my", "nl", "pl", "ru",
+    "ur", "zh",
+}
+
+# Verbose names → ISO codes. Customer configs sometimes pass these.
+_LANG_ALIASES = {
+    "english": "en",    "chinese": "zh",    "japanese": "ja",
+    "korean": "ko",     "spanish": "es",    "french": "fr",
+    "german": "de",     "italian": "it",    "portuguese": "pt",
+    "russian": "ru",    "arabic": "ar",     "hindi": "hi",
+    "dutch": "nl",      "polish": "pl",     "greek": "el",
+    "burmese": "my",    "marathi": "mr",
+}
+
+
+def _normalize_lang(lang: Optional[str]) -> Optional[str]:
+    """Return ISO 639-1 code if pysbd supports it, else None (caller
+    falls back to the regex splitter)."""
+    if not lang:
+        return None
+    lc = str(lang).strip().lower()
+    code = _LANG_ALIASES.get(lc, lc)
+    return code if code in _PYSBD_LANGS else None
+
+
+# Regex-fallback sentence boundary: CJK terminators always count; ASCII
+# `.!?` only count when followed by whitespace or buffer-end (avoids
+# "3.14" but still over-splits "Dr. Smith" — that's why we prefer pysbd
+# when available).
 _SENTENCE_END_RE = re.compile(r"[。！？；\n]+|[!?.](?=\s|$)")
 
 DEFAULT_MIN_SENTENCE_CHARS = 2
@@ -59,36 +94,57 @@ class SentenceBuffer:
     """Accumulates streaming text and emits complete sentences.
 
     Used to bridge a token-streaming source (LLM) to a sentence-batched
-    sink (TTS engine). Designed to maximize streaming latency: emits as
-    soon as a sentence boundary is seen, falls back to a hard flush at
-    MAX_BUFFER_CHARS so a punctuation-less LLM doesn't stall forever.
+    sink (TTS engine). Two implementations:
 
-        buf = SentenceBuffer()
+    1. pysbd-backed (default when language is recognized & pysbd is
+       installed) — correctly handles abbreviations, numbers, URLs.
+    2. regex-backed fallback — splits on punctuation; over-splits
+       abbreviations like "Dr. Smith" but works everywhere.
+
+    Usage::
+
+        buf = SentenceBuffer(language="en")     # or "zh"/"ja"/...
         for token in llm_tokens:
             for sentence in buf.add(token):
                 tts.synthesize(sentence)
-        for sentence in buf.flush():     # at end-of-stream
+        for sentence in buf.flush():            # at end-of-stream
             tts.synthesize(sentence)
+
+    Note on streaming latency: when the pysbd path is active, a sentence
+    is only emitted once the buffer contains the NEXT sentence's first
+    characters (pysbd needs lookahead to confidently split). For typical
+    LLM streams with sub-50 ms inter-token gaps this is invisible. If
+    you have a one-shot final sentence, call `flush()` to force it out.
     """
 
-    min_chars:    int = DEFAULT_MIN_SENTENCE_CHARS
-    max_buffer:   int = DEFAULT_MAX_BUFFER_CHARS
-    _buf:         str = field(default="", init=False, repr=False)
+    language:   Optional[str] = None
+    min_chars:  int = DEFAULT_MIN_SENTENCE_CHARS
+    max_buffer: int = DEFAULT_MAX_BUFFER_CHARS
+    _buf:       str = field(default="", init=False, repr=False)
+    _seg:       object = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        code = _normalize_lang(self.language)
+        if _PYSBD_AVAILABLE and code is not None:
+            try:
+                self._seg = pysbd.Segmenter(language=code, clean=False)
+            except Exception:
+                self._seg = None
+
+    # ─── public API ────────────────────────────────────────────────
 
     def add(self, chunk: str) -> Iterator[str]:
-        """Append `chunk`, yield any sentences now complete."""
+        """Append text, yield any sentences now complete."""
         if not chunk:
             return
         self._buf += chunk
-        while True:
-            sentence = self._extract_next_sentence()
-            if sentence is None:
-                return
-            yield sentence
+        if self._seg is not None:
+            yield from self._emit_pysbd()
+        else:
+            yield from self._emit_regex()
 
     def flush(self) -> Iterator[str]:
-        """Yield any remaining text as a final sentence (regardless of
-        punctuation or min-length)."""
+        """Yield remaining text as a final sentence (no min-length check)."""
         leftover = self._buf.strip()
         self._buf = ""
         if leftover:
@@ -97,20 +153,50 @@ class SentenceBuffer:
     def is_empty(self) -> bool:
         return not self._buf.strip()
 
-    # ----- internals -----
+    @property
+    def using_pysbd(self) -> bool:
+        """For tests / observability — confirms which splitter is active."""
+        return self._seg is not None
 
-    def _extract_next_sentence(self) -> Optional[str]:
-        """Find the smallest prefix of `_buf` that ends at a sentence
-        boundary AND has at least `min_chars` characters. Pops it from
-        the buffer and returns it, or returns None if no such prefix is
-        ready (in which case the buffer is unchanged, unless it grew
-        past `max_buffer` and we forced a flush)."""
+    # ─── pysbd path ────────────────────────────────────────────────
+
+    def _emit_pysbd(self) -> Iterator[str]:
+        # pysbd.segment returns *all* sentences in the input. The LAST
+        # element might be incomplete (still buffering); the prefix
+        # elements are confirmed sentence boundaries.
+        sentences = self._seg.segment(self._buf)   # type: ignore[union-attr]
+        if len(sentences) > 1:
+            for s in sentences[:-1]:
+                stripped = s.strip()
+                if len(stripped) >= self.min_chars:
+                    yield stripped
+                # else: too short, swallow it (rare edge case — pysbd
+                # rarely emits sub-min sentences; merging back would
+                # confuse pysbd state in the next call)
+            self._buf = sentences[-1]
+            return
+        # Single sentence so far — wait for more text. But guard against
+        # runaway buffer (e.g. an LLM with no punctuation).
+        if len(self._buf) >= self.max_buffer:
+            out = self._buf.strip()
+            self._buf = ""
+            if out:
+                yield out
+
+    # ─── regex fallback path ───────────────────────────────────────
+
+    def _emit_regex(self) -> Iterator[str]:
+        while True:
+            sentence = self._extract_next_sentence_regex()
+            if sentence is None:
+                return
+            yield sentence
+
+    def _extract_next_sentence_regex(self) -> Optional[str]:
         pos = 0
         while True:
             m = _SENTENCE_END_RE.search(self._buf, pos)
             if m is None:
-                # No more sentence boundary in scope. Force-flush if
-                # the buffer has grown past the safety threshold.
                 if len(self._buf) >= self.max_buffer:
                     out = self._buf.strip()
                     self._buf = ""
@@ -121,5 +207,4 @@ class SentenceBuffer:
             if len(prefix.strip()) >= self.min_chars:
                 self._buf = self._buf[end:]
                 return prefix.strip()
-            # Too short — try the next boundary out.
             pos = end

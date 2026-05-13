@@ -48,7 +48,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \
         'numpy<2' \
         soundfile \
-        librosa
+        librosa \
+        "pysbd>=0.3.4" \
+        "silero-vad"
 
 # FastAPI stack
 RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \

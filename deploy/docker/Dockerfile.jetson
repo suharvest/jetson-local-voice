@@ -58,7 +58,9 @@ RUN pip3 install --no-cache-dir --index-url ${PIP_INDEX} \
         "webrtcvad-wheels>=2.0.14" \
         "cuda-python>=12,<13" \
         websockets \
-        requests
+        requests \
+        "pysbd>=0.3.4" \
+        "silero-vad"
 
 # ----------------------------------------------------------------------------
 # Mode-specific layer: zh_en (sherpa-onnx + librosa) — Paraformer + Matcha

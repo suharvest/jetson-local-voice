@@ -38,7 +38,9 @@ RUN pip3 install --no-cache-dir --break-system-packages --index-url ${PIP_INDEX}
         sherpa-onnx \
         onnxruntime \
         websockets \
-        requests
+        requests \
+        "pysbd>=0.3.4" \
+        "silero-vad"
 
 # Application code (post-refactor layout: app/core, app/backends/cpu, app/utils)
 COPY app/      /opt/speech/app/

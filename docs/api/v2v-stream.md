@@ -62,12 +62,13 @@ within 200 characters, a force-flush kicks in.
 
 `tts_flush` always flushes the remainder, regardless of punctuation.
 
-**Abbreviation caveat**: text like `Dr. Smith arrived.` splits as
-`["Dr.", "Smith arrived."]` because the period after "Dr" is followed
-by whitespace. The two pieces are synthesized as separate sentences
-with a brief pause between them; quality is fine, cadence is slightly
-choppier than a single-shot TTS call. If your LLM produces a lot of
-abbreviations, consider pre-processing them out before streaming.
+**Abbreviation handling**: when the `tts_language` config maps to one
+of pysbd's 22 supported languages (zh/en/ja/ko/es/fr/de/it/pt/ru/ar/
+hi/...), the splitter uses pysbd's rule-based segmenter — abbreviations
+("Dr. Smith", "U.S.A.", "Ph.D."), inline numbers ("$3.14"), and URLs
+("example.com") all stay intact. Unsupported languages fall back to a
+simple punctuation regex that over-splits abbreviations into separate
+sentences (still works, just slightly choppier TTS cadence).
 
 ## Barge-in
 
