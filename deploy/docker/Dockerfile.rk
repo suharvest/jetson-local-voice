@@ -71,14 +71,14 @@ RUN pip install --no-cache-dir \
 RUN ldconfig
 
 # Copy seeed-local-voice tree + rkvoice-stream submodule into image
-COPY app/                          /app/app/
-COPY configs/                      /app/configs/
-COPY voices/                       /app/voices/
-COPY scripts/                      /app/scripts/
-COPY third_party/rkvoice-stream/   /app/third_party/rkvoice-stream/
+COPY app/                          /opt/speech/app/
+COPY configs/                      /opt/speech/configs/
+COPY voices/                       /opt/speech/voices/
+COPY scripts/                      /opt/speech/scripts/
+COPY third_party/rkvoice-stream/   /opt/speech/third_party/rkvoice-stream/
 
 # Install rkvoice-stream as editable so app/backends/rk/ can import it.
-RUN pip install --no-cache-dir -e /app/third_party/rkvoice-stream
+RUN pip install --no-cache-dir -e /opt/speech/third_party/rkvoice-stream
 
 # Model dirs (bind-mounted at runtime, not baked)
 RUN mkdir -p /opt/tts/models /opt/asr/models /opt/models
@@ -97,8 +97,8 @@ LABEL org.opencontainers.image.title="Seeed Local Voice (Rockchip)" \
       org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \
       org.opencontainers.image.description="Speech service on Rockchip NPU (RK3576 / RK3588)"
 
-WORKDIR /app
-ENV PYTHONPATH=/app
+WORKDIR /opt/speech
+ENV PYTHONPATH=/opt/speech
 EXPOSE 8000
 
 CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
