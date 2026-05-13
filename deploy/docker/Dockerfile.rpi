@@ -40,7 +40,7 @@ RUN pip3 install --no-cache-dir --break-system-packages --index-url ${PIP_INDEX}
         websockets \
         requests \
         "pysbd>=0.3.4" \
-        "silero-vad"
+        "webrtcvad-wheels>=2.0.14"
 
 # Application code (post-refactor layout: app/core, app/backends/cpu, app/utils)
 COPY app/      /opt/speech/app/

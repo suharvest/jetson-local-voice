@@ -50,7 +50,7 @@ RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \
         soundfile \
         librosa \
         "pysbd>=0.3.4" \
-        "silero-vad"
+        "webrtcvad-wheels>=2.0.14"
 
 # FastAPI stack
 RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \

@@ -59,8 +59,7 @@ RUN pip3 install --no-cache-dir --index-url ${PIP_INDEX} \
         "cuda-python>=12,<13" \
         websockets \
         requests \
-        "pysbd>=0.3.4" \
-        "silero-vad"
+        "pysbd>=0.3.4"
 
 # ----------------------------------------------------------------------------
 # Mode-specific layer: zh_en (sherpa-onnx + librosa) — Paraformer + Matcha
