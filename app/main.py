@@ -669,7 +669,20 @@ async def _asr_stream_backend(
     except WebSocketDisconnect:
         logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)
     except Exception as e:
-        logger.error("ASR stream error (backend=%s): %s", asr_be.name, e)
+        logger.error("ASR stream error (backend=%s): %s", asr_be.name, e, exc_info=True)
+        # Surface the error to the client as a structured frame instead of a
+        # silent close. Without this the client's next ws.recv() returns "",
+        # json.loads("") raises JSONDecodeError, and the real cause is hidden.
+        try:
+            await ws.send_json({
+                "type": "error",
+                "error": f"{type(e).__name__}: {e}",
+                "backend": asr_be.name,
+                "is_final": True,
+                "is_stable": True,
+            })
+        except Exception:
+            pass
     finally:
         try:
             await ws.close()
