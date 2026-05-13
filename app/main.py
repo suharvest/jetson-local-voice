@@ -541,12 +541,20 @@ async def asr_stream(
     ws: WebSocket,
     language: str = "auto",
     sample_rate: int = 16000,
+    vad: Optional[str] = None,           # opt-in: "silero" | "webrtcvad" | "none"
+    vad_silence_ms: int = 500,
 ):
     """Streaming ASR via WebSocket.
 
     Client sends: raw int16 PCM bytes
     Client sends: empty bytes b"" to signal end
     Server sends: JSON {"text": "...", "is_final": bool, "is_stable": bool}
+
+    Optional server-side VAD: pass ?vad=silero (or webrtcvad) to have the
+    server auto-finalize on silence — client no longer needs to send the
+    empty b"" frame. ``vad_silence_ms`` controls the silence threshold
+    (default 500 ms). Without the query param this endpoint behaves
+    exactly as before (forced EOS by client).
 
     Requires an ASR backend with STREAMING capability.
     """
@@ -564,10 +572,24 @@ async def asr_stream(
         and asr_be.has_capability(ASRCapability.STREAMING)
     )
 
+    # Lazy-init server-side VAD only if requested. Reuses the shared
+    # singleton model from app.core.vad — no extra model load per
+    # connection.
+    vad_session = None
+    if vad and vad not in ("none", "off", "disabled"):
+        try:
+            from app.core import vad as vad_mod
+            vad_session = vad_mod.create_vad(
+                vad, sample_rate=sample_rate, silence_ms=vad_silence_ms
+            )
+        except Exception as e:
+            logger.warning("VAD '%s' init failed (%s); falling back to forced-EOS", vad, e)
+            vad_session = None
+
     if use_backend_stream:
         from app.core.coordinator import get_coordinator
         async with get_coordinator().acquire("asr"):
-            await _asr_stream_backend(ws, asr_be, language, sample_rate)
+            await _asr_stream_backend(ws, asr_be, language, sample_rate, vad_session)
     else:
         await ws.send_json({"error": "no streaming ASR available"})
         await ws.close()
@@ -578,6 +600,7 @@ async def _asr_stream_backend(
     asr_be,
     language: str,
     sample_rate: int,
+    vad_session=None,
 ):
     """Streaming ASR using ASR backend (accumulate-then-transcribe).
 
@@ -647,6 +670,22 @@ async def _asr_stream_backend(
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             _loop = asyncio.get_event_loop()
             await _loop.run_in_executor(_get_asr_executor(), stream.accept_waveform, sample_rate, samples)
+
+            # Server-side VAD endpoint detection (opt-in via ?vad=)
+            if vad_session is not None:
+                from app.core.vad import VADSession
+                event = vad_session.process(samples)
+                if event == VADSession.SPEECH_END:
+                    await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
+                    final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
+                    await ws.send_json({
+                        "type": "final",
+                        "text": final_text,
+                        "is_final": True,
+                        "is_stable": True,
+                        "endpoint": "vad",
+                    })
+                    break
 
             # Check for partial results
             partial_text, is_endpoint = stream.get_partial()
