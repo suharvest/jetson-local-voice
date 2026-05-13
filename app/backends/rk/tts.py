@@ -72,20 +72,48 @@ class RKTTSBackend(TTSBackend):
 
     def generate_streaming(self, text: str, **kwargs):
         """Bridge our base-class generate_streaming() to rkvoice-stream's
-        synthesize_stream()."""
+        synthesize_stream().
+
+        rkvoice-stream yields ``(audio, metadata)`` tuples where ``audio`` is
+        either float32 [-1,1], int16 PCM, or raw bytes. The wire layer
+        (`/tts/stream`) expects int16 PCM bytes per chunk, so coerce here
+        — starlette's StreamingResponse calls ``.encode()`` on non-bytes
+        items and explodes on tuples (`'tuple' object has no attribute
+        'encode'`).
+        """
         speaker_id = kwargs.pop("speaker_id", 0) or 0
         speed = kwargs.pop("speed", None)
         pitch_shift = kwargs.pop("pitch_shift", None)
         language = kwargs.pop("language", None)
         if language is not None:
             kwargs.setdefault("language", language)
-        yield from self._inner.synthesize_stream(
+        for item in self._inner.synthesize_stream(
             text=text,
             speaker_id=speaker_id,
             speed=speed,
             pitch_shift=pitch_shift,
             **kwargs,
-        )
+        ):
+            audio = item[0] if isinstance(item, tuple) else item
+            if audio is None:
+                continue
+            if isinstance(audio, (bytes, bytearray)):
+                if len(audio) == 0:
+                    continue
+                yield bytes(audio)
+                continue
+            if isinstance(audio, np.ndarray):
+                if audio.size == 0:
+                    continue
+                if audio.dtype == np.int16:
+                    yield audio.tobytes()
+                else:
+                    a = np.asarray(audio, dtype=np.float32)
+                    a = np.clip(a, -1.0, 1.0)
+                    yield (a * 32767.0).astype(np.int16).tobytes()
+                continue
+            # Unknown payload — skip rather than poison the stream.
+            continue
 
     def synthesize_stream(
         self,
