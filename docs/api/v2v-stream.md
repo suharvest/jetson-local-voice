@@ -56,11 +56,18 @@ a 4-byte little-endian uint32 = sample rate (matches `/tts/stream`).
 
 The server buffers text until it sees a sentence-ending punctuation
 (`。！？；\n` always; ASCII `.!?` only when followed by whitespace or
-end-of-buffer, to avoid splitting "Dr. Smith" or "3.14"). Minimum
-sentence length is 2 characters (so "Hi.", "OK." pass through). If no
-punctuation arrives within 200 characters, a force-flush kicks in.
+end-of-buffer, so "3.14" stays intact). Minimum sentence length is
+2 characters (so "Hi.", "OK." pass through). If no punctuation arrives
+within 200 characters, a force-flush kicks in.
 
 `tts_flush` always flushes the remainder, regardless of punctuation.
+
+**Abbreviation caveat**: text like `Dr. Smith arrived.` splits as
+`["Dr.", "Smith arrived."]` because the period after "Dr" is followed
+by whitespace. The two pieces are synthesized as separate sentences
+with a brief pause between them; quality is fine, cadence is slightly
+choppier than a single-shot TTS call. If your LLM produces a lot of
+abbreviations, consider pre-processing them out before streaming.
 
 ## Barge-in
 
@@ -194,3 +201,18 @@ async for msg in ws:
   (audio → text → text → audio). Customer holds LLM context.
 - **HTTPS / auth not included** — see operational hardening section in
   `docs/perf-test-runbook.md`.
+
+## Connection lifetime
+
+- **ASR-only mode**: server emits `asr_final` and closes the WS after
+  the VAD or client `asr_eos` triggers finalization.
+- **TTS-only mode**: server processes `text` frames as long as the
+  client sends them; ships audio until `tts_flush` empties the queue,
+  then emits `tts_done` and closes.
+- **V2V mode**: server waits for *both* ASR work (final emitted) and
+  TTS work (flush received + queue drained) to complete before
+  closing. The client should always send `tts_flush` after the LLM
+  stream ends, otherwise the TTS task lives forever (waiting for
+  more text) even though no more audio will come.
+- WS disconnect from the client side immediately cancels all in-flight
+  tasks (synth threads are signaled to break out of their generators).

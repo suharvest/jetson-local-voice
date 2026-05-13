@@ -40,8 +40,14 @@ SERVER_ERROR              = "error"
 # ────────────────────────────────────────────────────────────────────────
 
 # Sentence-ending punctuation: CJK forms always end a sentence; ASCII
-# punct only ends a sentence if followed by whitespace or end-of-buffer
-# (avoids "Dr. Smith", "3.14", "U.S.A." splitting mid-word).
+# punct only ends a sentence if followed by whitespace or end-of-buffer.
+# Note: this heuristic correctly handles "3.14" (no space after .) and
+# "U.S.A." (when used mid-sentence), but still over-splits abbreviations
+# like "Dr. Smith arrived." into ["Dr.", "Smith arrived."]. For streaming
+# TTS the over-split is acceptable (brief pause, no quality loss). If
+# your LLM emits abbreviation-heavy English, expect a slightly choppier
+# cadence — proper abbreviation handling would require nltk.sent_tokenize
+# or a maintained abbreviation list, both heavyweight for streaming.
 _SENTENCE_END_RE = re.compile(r"[。！？；\n]+|[!?.](?=\s|$)")
 
 DEFAULT_MIN_SENTENCE_CHARS = 2
