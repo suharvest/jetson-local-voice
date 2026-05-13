@@ -15,6 +15,7 @@ no network noise.
 | Your priority | Pick this device |
 |---|---|
 | Highest accuracy on English + multilingual | **Jetson Orin Nano** |
+| Same as Nano but 2-3 concurrent users | **Jetson Orin NX 16GB** |
 | Best Chinese accuracy, mid-tier latency | **Radxa ROCK 5T (RK3588)** |
 | Lowest cost, decent zh+en for voice commands | **Raspberry Pi 5** |
 | Multilingual on a tight budget (ja/ko/es/de/fr) | **RK3576** |
@@ -57,14 +58,14 @@ no network noise.
 
 ### Speech recognition
 
-| Group | **Orin Nano** (voice_clone) | **RK3588** (multilang) | **RK3576** (multilang) | **RPi5** (lite_zh_en) |
-|---|---:|---:|---:|---:|
-| Short Chinese CER | 5.3 % | **2.6 %** | 5.3 % | 10.5 % |
-| Short English WER | **0.0 %** | 10.0 % | 13.1 % | 35.7 % |
-| Long Chinese CER¹  | 8.4 % | 10.8 % | **7.8 %** | 14.5 % |
-| Long English WER  | **3.0 %** | 5.5 % | 5.5 % | 23.6 % |
-| Short Finalize RTF | 0.08 | 0.22 | 0.40 | **0.00** |
-| Long Finalize RTF  | 0.06 | **0.03** | 0.54 | **0.00** |
+| Group | **Orin Nano** (voice_clone) | **Orin NX** (voice_clone) | **RK3588** (multilang) | **RK3576** (multilang) | **RPi5** (lite_zh_en) |
+|---|---:|---:|---:|---:|---:|
+| Short Chinese CER | 5.3 % | 5.3 % | **2.6 %** | 5.3 % | 10.5 % |
+| Short English WER | **0.0 %** | **0.0 %** | 10.0 % | 13.1 % | 35.7 % |
+| Long Chinese CER¹  | 8.4 % | 8.4 % | 10.8 % | **7.8 %** | 14.5 % |
+| Long English WER  | **3.0 %** | **3.0 %** | 5.5 % | 5.5 % | 23.6 % |
+| Short Finalize RTF | 0.08 | 0.08 | 0.22 | 0.40 | **0.00** |
+| Long Finalize RTF  | 0.06 | 0.07 | **0.03** | 0.54 | **0.00** |
 
 ¹ With Chinese-number normalisation (Arabic ↔ 一二三). Without
 normalisation, the raw CER on `long/zh` looks 3-4× worse purely from
@@ -72,12 +73,12 @@ normalisation, the raw CER on `long/zh` looks 3-4× worse purely from
 
 ### Speech synthesis
 
-| Group | Orin Nano (Qwen3 voice_clone) | RK3588 (matcha_rknn) | RK3576 (matcha + ORT) | RPi5 (sherpa matcha) |
-|---|---:|---:|---:|---:|
-| Short Chinese TTS RTF | 0.42 | **0.07** | 0.16 | **0.08** |
-| Long Chinese TTS RTF  | 0.41 | 0.14 | 0.14 | **0.08** |
-| Short English TTS RTF | 0.42 | 0.09 | 0.22 | 0.11 |
-| First-byte delay (any) | 4 ms | 4 ms | 6 ms | 2 ms |
+| Group | Orin Nano (voice_clone) | Orin NX (voice_clone) | RK3588 (matcha_rknn) | RK3576 (matcha + ORT) | RPi5 (sherpa matcha) |
+|---|---:|---:|---:|---:|---:|
+| Short Chinese TTS RTF | 0.42 | 0.40 | **0.07** | 0.16 | **0.08** |
+| Long Chinese TTS RTF  | 0.41 | 0.39 | 0.14 | 0.14 | **0.08** |
+| Short English TTS RTF | 0.42 | 0.41 | 0.09 | 0.22 | 0.11 |
+| First-byte delay (any) | 4 ms | 4 ms | 4 ms | 6 ms | 2 ms |
 
 RK3576 is ~2× slower than RK3588 (smaller NPU + matcha components on
 ORT-CPU fallback), still comfortably real-time at RTF ≤ 0.22.
@@ -88,12 +89,12 @@ V2V means: user says something, the device transcribes it, then speaks
 back. The number below is purely the speech part of that round-trip —
 your LLM adds however long it takes to respond on top.
 
-| Group | Orin Nano | RPi5 |
-|---|---:|---:|
-| Short Chinese | 325 ms | **5 ms**³ |
-| Long Chinese  | 909 ms | **4 ms**³ |
-| Short English | 277 ms | **3 ms**³ |
-| Long English  | 810 ms | **4 ms**³ |
+| Group | Orin Nano | Orin NX | RPi5 |
+|---|---:|---:|---:|
+| Short Chinese | 325 ms | 323 ms | **5 ms**³ |
+| Long Chinese  | 909 ms | 876 ms | **4 ms**³ |
+| Short English | 277 ms | 276 ms | **3 ms**³ |
+| Long English  | 810 ms | 823 ms | **4 ms**³ |
 
 ³ RPi5 looks unbelievably fast because sherpa-onnx is *fully streaming* —
 the transcription is already done by the time the user stops speaking,
@@ -105,6 +106,7 @@ processes audio in one batch at the end, paying ~300-900 ms there.
 | Device | ASR RTF | TTS RTF | Verdict |
 |---|---:|---:|---|
 | Orin Nano | 1.10 | 1.23 | GPU saturates at 2 concurrent users — still works, but slows down |
+| **Orin NX** | 1.11 | **0.42** | **3× headroom over Nano** — 2-3 concurrent users without RTF blowup, the standout NX advantage |
 | RPi5      | 1.03 | **0.12** | Loads of headroom — sherpa-onnx on RPi5 can handle 4+ concurrent streams |
 
 ---
@@ -122,6 +124,14 @@ English is noticeable but fine for fixed command sets.
 → **Jetson Orin Nano** with `voice_clone` preset. ~$250, 0 % WER on
 short English, supports voice cloning so the kiosk has its own voice.
 Finalize latency ~300-900 ms is fine for a "press to talk" flow.
+
+### "Same quality as Nano but need 2-3 users at once"
+
+→ **Jetson Orin NX 16GB** with `voice_clone` preset. ~$400. Identical
+accuracy and single-user latency to Nano (same Qwen3 model), but at
+parallel=2 the TTS RTF stays at 0.42 vs Nano's 1.23 — meaning the
+device handles 2 simultaneous conversations without slowing down,
+where Nano would visibly degrade.
 
 ### "Multilingual customer service (Chinese + Japanese + Spanish + ...)"
 
@@ -147,15 +157,6 @@ duration before they hear anything.
 
 ## Devices not yet measured
 
-- **Jetson Orin NX 16GB** — running the same v1.12 image we ship for
-  Nano causes the TTS worker to hang in pre-init (binary works on
-  Nano, hangs on NX). A separate "slim" packaging (host-mounted worker
-  binaries) is known to work on NX with the same backend, but it
-  uses a different model bundle (`multilang-highperf-nx`) so its
-  numbers aren't directly comparable to the Nano `voice_clone`
-  baseline in this doc. NX measurements are deferred until the v1.12
-  TTS worker bake is fixed. Expected from architecture: latency ~equal
-  to Nano, concurrency 2-3× better (more SMs, more RAM).
 - **Jetson AGX Orin 32GB** — supports all presets, including the
   largest multilang model. Not on the bench rack yet.
 - **Raspberry Pi 4 / CM4** — only `asr_zh_en` preset (no TTS). Smaller

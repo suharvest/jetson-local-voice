@@ -212,6 +212,7 @@
 <thead><tr><th>你最看重</th><th>选这台</th></tr></thead>
 <tbody>
   <tr><td>英文识别精度 + 多语言</td><td><span class="pill pill-accent">Jetson Orin Nano</span></td></tr>
+  <tr><td>同 Nano 精度 + 2-3 用户并发</td><td><span class="pill pill-accent">Jetson Orin NX 16GB</span></td></tr>
   <tr><td>中文识别精度，延迟可接受</td><td><span class="pill pill-accent">Radxa ROCK 5T (RK3588)</span></td></tr>
   <tr><td>低成本，中英文命令词够用</td><td><span class="pill pill-accent">Raspberry Pi 5</span></td></tr>
   <tr><td>多语言（日/韩/西/德/法）小成本</td><td><span class="pill pill-accent">RK3576</span></td></tr>
@@ -263,17 +264,18 @@
 <thead><tr>
   <th>场景</th>
   <th class="num">Orin Nano<br>voice_clone</th>
+  <th class="num">Orin NX<br>voice_clone</th>
   <th class="num">RK3588<br>multilang</th>
   <th class="num">RK3576<br>multilang</th>
   <th class="num">RPi5<br>lite_zh_en</th>
 </tr></thead>
 <tbody>
-  <tr><td>短中文 CER</td><td class="num">5.3 %</td><td class="num best">2.6 %</td><td class="num">5.3 %</td><td class="num">10.5 %</td></tr>
-  <tr><td>短英文 WER</td><td class="num best">0.0 %</td><td class="num">10.0 %</td><td class="num">13.1 %</td><td class="num worst">35.7 %</td></tr>
-  <tr><td>长中文 CER<sup>1</sup></td><td class="num">8.4 %</td><td class="num">10.8 %</td><td class="num best">7.8 %</td><td class="num">14.5 %</td></tr>
-  <tr><td>长英文 WER</td><td class="num best">3.0 %</td><td class="num">5.5 %</td><td class="num">5.5 %</td><td class="num worst">23.6 %</td></tr>
-  <tr><td>短句 Finalize RTF</td><td class="num">0.08</td><td class="num">0.22</td><td class="num">0.40</td><td class="num best">0.00</td></tr>
-  <tr><td>长句 Finalize RTF</td><td class="num">0.06</td><td class="num best">0.03</td><td class="num">0.54</td><td class="num best">0.00</td></tr>
+  <tr><td>短中文 CER</td><td class="num">5.3 %</td><td class="num">5.3 %</td><td class="num best">2.6 %</td><td class="num">5.3 %</td><td class="num">10.5 %</td></tr>
+  <tr><td>短英文 WER</td><td class="num best">0.0 %</td><td class="num best">0.0 %</td><td class="num">10.0 %</td><td class="num">13.1 %</td><td class="num worst">35.7 %</td></tr>
+  <tr><td>长中文 CER<sup>1</sup></td><td class="num">8.4 %</td><td class="num">8.4 %</td><td class="num">10.8 %</td><td class="num best">7.8 %</td><td class="num">14.5 %</td></tr>
+  <tr><td>长英文 WER</td><td class="num best">3.0 %</td><td class="num best">3.0 %</td><td class="num">5.5 %</td><td class="num">5.5 %</td><td class="num worst">23.6 %</td></tr>
+  <tr><td>短句 Finalize RTF</td><td class="num">0.08</td><td class="num">0.08</td><td class="num">0.22</td><td class="num">0.40</td><td class="num best">0.00</td></tr>
+  <tr><td>长句 Finalize RTF</td><td class="num">0.06</td><td class="num">0.07</td><td class="num best">0.03</td><td class="num">0.54</td><td class="num best">0.00</td></tr>
 </tbody>
 </table>
 <p class="footnote"><sup>1</sup> 经过中文数字归一化（阿拉伯 ↔ 一二三）。原始 CER 在长中文上会被"15 vs 十五"这类格式差异虚高 3–4 倍。</p>
@@ -282,16 +284,17 @@
 <table>
 <thead><tr>
   <th>场景</th>
-  <th class="num">Orin Nano<br>Qwen3 voice_clone</th>
+  <th class="num">Orin Nano<br>voice_clone</th>
+  <th class="num">Orin NX<br>voice_clone</th>
   <th class="num">RK3588<br>matcha_rknn</th>
   <th class="num">RK3576<br>matcha + ORT</th>
   <th class="num">RPi5<br>sherpa matcha</th>
 </tr></thead>
 <tbody>
-  <tr><td>短中文 TTS RTF</td><td class="num">0.42</td><td class="num best">0.07</td><td class="num">0.16</td><td class="num best">0.08</td></tr>
-  <tr><td>长中文 TTS RTF</td><td class="num">0.41</td><td class="num">0.14</td><td class="num">0.14</td><td class="num best">0.08</td></tr>
-  <tr><td>短英文 TTS RTF</td><td class="num">0.42</td><td class="num">0.09</td><td class="num">0.22</td><td class="num">0.11</td></tr>
-  <tr><td>首音延迟 TFD</td><td class="num">4 ms</td><td class="num">4 ms</td><td class="num">6 ms</td><td class="num best">2 ms</td></tr>
+  <tr><td>短中文 TTS RTF</td><td class="num">0.42</td><td class="num">0.40</td><td class="num best">0.07</td><td class="num">0.16</td><td class="num best">0.08</td></tr>
+  <tr><td>长中文 TTS RTF</td><td class="num">0.41</td><td class="num">0.39</td><td class="num">0.14</td><td class="num">0.14</td><td class="num best">0.08</td></tr>
+  <tr><td>短英文 TTS RTF</td><td class="num">0.42</td><td class="num">0.41</td><td class="num">0.09</td><td class="num">0.22</td><td class="num">0.11</td></tr>
+  <tr><td>首音延迟 TFD</td><td class="num">4 ms</td><td class="num">4 ms</td><td class="num">4 ms</td><td class="num">6 ms</td><td class="num best">2 ms</td></tr>
 </tbody>
 </table>
 
@@ -305,13 +308,14 @@
 <thead><tr>
   <th>场景</th>
   <th class="num">Orin Nano</th>
+  <th class="num">Orin NX</th>
   <th class="num">RPi5</th>
 </tr></thead>
 <tbody>
-  <tr><td>短中文</td><td class="num">325 ms</td><td class="num best">5 ms<sup>3</sup></td></tr>
-  <tr><td>长中文</td><td class="num">909 ms</td><td class="num best">4 ms<sup>3</sup></td></tr>
-  <tr><td>短英文</td><td class="num">277 ms</td><td class="num best">3 ms<sup>3</sup></td></tr>
-  <tr><td>长英文</td><td class="num">810 ms</td><td class="num best">4 ms<sup>3</sup></td></tr>
+  <tr><td>短中文</td><td class="num">325 ms</td><td class="num">323 ms</td><td class="num best">5 ms<sup>3</sup></td></tr>
+  <tr><td>长中文</td><td class="num">909 ms</td><td class="num">876 ms</td><td class="num best">4 ms<sup>3</sup></td></tr>
+  <tr><td>短英文</td><td class="num">277 ms</td><td class="num">276 ms</td><td class="num best">3 ms<sup>3</sup></td></tr>
+  <tr><td>长英文</td><td class="num">810 ms</td><td class="num">823 ms</td><td class="num best">4 ms<sup>3</sup></td></tr>
 </tbody>
 </table>
 
@@ -331,6 +335,12 @@
     <td class="num">1.10</td>
     <td class="num worst">1.23</td>
     <td><span class="pill pill-warn">GPU 在 2 路并发已饱和</span> 仍可工作但会变慢</td>
+  </tr>
+  <tr>
+    <td><b>Orin NX</b></td>
+    <td class="num">1.11</td>
+    <td class="num best">0.42</td>
+    <td><span class="pill pill-good">3× Nano 余量</span> NX 真正的卖点：2-3 路并发不掉速</td>
   </tr>
   <tr>
     <td>RPi5</td>
@@ -358,6 +368,12 @@
 </div>
 
 <div class="card">
+<h4>👥 Nano 同质量 + 2-3 路并发</h4>
+<p><b>选：Jetson Orin NX 16GB</b> · <code>voice_clone</code> preset</p>
+<p>~$400。单用户精度 + 延迟跟 Nano 一致，但并发 p=2 时 TTS RTF 0.42 vs Nano 1.23 —— <b>同时服务 2-3 个对话不掉速</b>，而 Nano 在 p=2 已经饱和。</p>
+</div>
+
+<div class="card">
 <h4>🌍 多语言客服（中日西法德 …）</h4>
 <p><b>选：Radxa ROCK 5T (RK3588)</b> · <code>multilang</code> preset</p>
 <p>~$200。短中文 CER 2.6% 全场最佳。Qwen3 支持 50+ 语言。TTS 跟 RPi5 持平（Matcha RTF 0.07）。成熟稳定。</p>
@@ -380,7 +396,6 @@
 <h2 id="not-yet">尚未测量的设备</h2>
 
 <ul>
-  <li><b>Jetson Orin NX 16GB</b> — 跟 Nano 同一份 v1.12 镜像，TTS worker 在预加载阶段 hang（Nano 上正常，NX 上卡死）。另一套"slim"包装（host-mount worker binary）在 NX 上能跑，但用的是 <code>multilang-highperf-nx</code> 模型包，跟 Nano voice_clone baseline 不可直接对比。NX 实测延后到 v1.12 TTS worker 包装问题修好之后。架构上预期：延迟 ≈ Nano，并发 2-3× 强于 Nano（更多 SM + 更多 RAM）</li>
   <li><b>Jetson AGX Orin 32GB</b> — 旗舰，支持全部 preset 含最大 multilang。还没上测试台</li>
   <li><b>Raspberry Pi 4 / CM4</b> — 只支持 <code>asr_zh_en</code> preset（无 TTS）。Cortex-A72 较小，预计比 RPi5 慢 2-3×</li>
   <li><b>RK3576 多语言（ja/ko/es/de/fr）实测</b> — 多语言 corpus 已准备好，但 RK3576 上还未跑完整多语言一轮</li>

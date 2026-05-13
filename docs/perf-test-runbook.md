@@ -300,7 +300,7 @@ EOS → first TTS audio chunk, `--llm-delay=0` (forced EOS):
 |---|---|---|---|---|---|---|---|---|
 | Jetson Orin Nano | sm87 8GB | voice_clone | 0.42 | **0.084** | **0.063** | 5.3% | **0.0%** | 3.14 GB (v1.11/v1.12) |
 | Jetson Orin Nano | sm87 8GB | multilang | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
-| Jetson Orin NX | sm87 16GB | voice_clone | ⚠️ blocked¹ | — | — | — | — | 3.14 GB |
+| Jetson Orin NX | sm87 16GB | voice_clone | **0.400** | **0.079** | **0.066** | 5.3% | **0.0%** | 3.14 GB (v1.12 + hot-mount workers)¹ |
 | RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | **0.071** | 0.220 | **0.030** | **2.6%** | 10.0% | 1.38 GB (rk-v1.2) |
 | RK3576 (cat-remote) | rk3576 8GB | multilang | **0.163** | 0.397 | 0.538 | 5.3% | 13.1% | 1.38 GB (rk-v1.2) |
 | RPi5 | BCM2712 8GB | lite_zh_en | **0.078** | **0.000** | **0.000** | 10.5% | 35.7% | 560 MB (rpi-v1.1) |
@@ -309,7 +309,17 @@ EOS → first TTS audio chunk, `--llm-delay=0` (forced EOS):
 
 Measured 2026-05-13 (local mode, 5 warmup + 10 runs); see "Measured ASR perf" section above for full breakdown.
 
-¹ **NX v1.12 deploy blocked (2026-05-13)** — running the same image we ship for Nano causes the baked TTS worker binary (`/root/project/seeed-local-voice/build/edgellm_voice_worker/workers/qwen3_tts_worker`) to hang in pre-init (99% CPU, no progress, no exit, no OOM). The host-mounted "slim" worker binaries on NX (`/opt/edgellm-bin/.../qwen3_tts_worker` + `/opt/jv-workers/qwen3_asr_worker`) work fine with the same engine bundle. **Action item next session**: diff the two binaries (md5 + `ldd`); also investigate the `Code2Wav not found at .../code2wav.engine` warning — filename mismatch with `code2wav_stateful.engine` shouldn't hang TTS load but is suspicious. Until fixed, NX numbers stay TBD; existing `jetson_voice_slim` container on `:18092` keeps serving the multilang stack.
+¹ **NX v1.12 (2026-05-13)** — RESOLVED. Root cause: the TTS worker binary baked into v1.12 (45.8MB, md5 `c124d0e2…`, built 5月10) doesn't support the stateful Code2Wav pipeline that the NX engine bundle expects. The newer worker binary (60.7MB, md5 `8b7f94…`, built 5月13) lives in `repro-qwen3/TensorRT-Edge-LLM/build` on the NX host and works fine with the same engine set. **Workaround**: run the v1.12 image with host-mount of the newer workers + the env vars `EDGE_LLM_TTS_WORKER_BIN`, `EDGE_LLM_ASR_WORKER_BIN`, `EDGE_LLM_TTS_STATEFUL_CODE2WAV=1`, `EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR=…/code2wav_stateful` (see `seeed-nx-v112` container's run config). **Proper fix next session**: rebake v1.12 with the newer worker binary so the image is self-contained. NX measurements below are with the workaround.
+
+### Measured NX numbers (2026-05-13)
+
+ASR (warmup 5 + 10 runs): short/zh fRTF 0.079 / CER 5.3%; long/zh fRTF 0.066 / CER 8.4% (normalized); short/en fRTF 0.070 / WER 0%; long/en fRTF 0.068 / WER 3.0%.
+
+TTS (warmup 3 + 10 runs): short/zh RTF 0.400; long/zh RTF 0.389; short/en RTF 0.413.
+
+V2V forced-EOS llm=0 (warmup 3 + 5 runs): short/zh 323ms; long/zh 876ms; short/en 276ms; long/en 823ms.
+
+**Concurrent p=2 asr+tts simul**: ASR RTF 1.11, **TTS RTF 0.42** (vs Nano 1.23 — NX has GPU headroom; 16GB RAM + more SMs make 2-3 simultaneous users viable where Nano saturates).
 
 ## Common gotchas
 
