@@ -211,21 +211,60 @@ Numbers to record into the perf table:
 - **Memory** — `docker stats <name> --no-stream`
 - **Image size** — `docker images --format "{{.Size}}" seeed-local-voice:...`
 
+## Measured ASR perf (local mode, 2026-05-13)
+
+All numbers from **local-mode smoke** (`bench/perf/run_on_device.sh <node> -- asr --warmup 5 --runs 10`):
+client runs on the device, talks to `127.0.0.1:8000`, eliminating Mac↔device network from measurements.
+Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-level for zh, WER is word-level for en; both computed with Chinese-number normalization (cn2an) so "15米" and "十五米" compare equal.
+
+### Latency: Finalize RTF p50 (compute-bound, lower=better)
+
+`fRTF = eos_to_final_ms / audio_dur_ms`. Independent of client-side realtime pacing.
+
+| Group | **Jetson Orin Nano** (Qwen3 TRT, voice_clone) | **RK3588** (Qwen3 RKNN w8a8, multilang) | **RK3576** (Qwen3 RKNN w4a16, multilang) | **RPi5** (sherpa-onnx, lite_zh_en) |
+|---|---:|---:|---:|---:|
+| short/zh (~3s) | **0.084** | 0.220 | 0.397 | **0.000** |
+| short/en (~3s) | **0.072** | 0.254 | 0.386 | **0.000** |
+| long/zh (~13s)  | 0.063 | **0.030** | 0.538 | **0.000** |
+| long/en (~12s)  | 0.064 | 0.063 | 0.666 | **0.000** |
+
+- **RPi5 ≈ 0**: sherpa is fully streaming, encoder + decoder both emit during chunk send; finalize is just a flush
+- **Nano/RK3588 long-audio ~0.03-0.06**: both run Qwen3 ASR, encoder is fast for long content because mel batches stack efficiently
+- **RK3576 ~0.4-0.7**: smaller NPU + w4a16 (4-bit) quant trade speed for fit; still well under realtime (RTF<1.0)
+- **Nano short-after-long was a 4× cold-tactic regression**, fixed by pre-warming TRT shapes 1..6 at boot (see `EDGE_LLM_ASR_PREWARM_MAX`)
+
+### Quality: CER/WER p50 (lower=better)
+
+| Group | Nano | RK3588 | RK3576 | RPi5 |
+|---|---:|---:|---:|---:|
+| short/zh CER | 5.3% | **2.6%** | 5.3% | 10.5% |
+| short/en WER | **0.0%** | 10.0% | 13.1% | 35.7% |
+| long/zh CER (normalized) | 8.4% | 10.8% | **7.8%** | 14.5% |
+| long/en WER | **3.0%** | 5.5% | 5.5% | 23.6% |
+
+- **English short**: Nano wins (0%) — Qwen3 + TRT-EdgeLLM clearly better than RKNN port + sherpa
+- **Chinese**: Nano/RK3588/RK3576 (all Qwen3 family) within ~5pp of each other; RPi5 (sherpa) trails by ~10pp
+- **All Qwen3 variants share the same proper-noun limitation** ("Oravec" → "Work" on zh_long_03); fixing requires model-side tuning, not a device problem
+
+### Known shared issues (today, not blocking)
+
+1. **Mixed-script proper nouns**: "Oravec" / "Smith" in Chinese context → all Qwen3 variants mis-hear identically (~5 chars/error)
+2. **FLEURS reference uses Arabic numerals** ("15米") while Chinese ASR speaks Chinese ("十五米"); perf tool's `cn2an` normalizer corrects for this — raw CER may show 30-40pp inflation if you bypass normalization
+
 ## Suggested perf table (template)
 
-| Device | SoC | Preset | TTS RTF | TTS TTFA | ASR e2e (1.5s) | ASR e2e (5s) | Preload | Memory (steady) | Image |
-|---|---|---|---|---|---|---|---|---|---|
-| Jetson Orin Nano | sm87 8GB | voice_clone | 0.69 (measured) | TBD | TBD | TBD | ~125s | TBD | 3.14 GB |
-| Jetson Orin Nano | sm87 8GB | multilang | TBD | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
-| Jetson Orin NX | sm87 16GB | voice_clone | TBD | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
-| RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | 0.19 (measured) | TBD | TBD | TBD | TBD | TBD | 1.38 GB |
-| RPi5 | BCM2712 8GB | rpi5-default | TBD | TBD | TBD | TBD | TBD | TBD | 560 MB |
-| RPi5 | BCM2712 8GB | asr_zh_en | — | — | TBD | TBD | TBD | TBD | 560 MB |
-| RPi4 / CM4 | BCM2711 4GB | asr_zh_en | — | — | TBD | TBD | TBD | TBD | 560 MB |
+| Device | SoC | Preset | TTS RTF | ASR fRTF p50 (short) | ASR fRTF p50 (long) | CER zh-short | WER en-short | Image |
+|---|---|---|---|---|---|---|---|---|
+| Jetson Orin Nano | sm87 8GB | voice_clone | 0.69 | **0.084** | **0.063** | 5.3% | **0.0%** | 3.14 GB (v1.11/v1.12) |
+| Jetson Orin Nano | sm87 8GB | multilang | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
+| Jetson Orin NX | sm87 16GB | voice_clone | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
+| RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | 0.19 | 0.220 | **0.030** | **2.6%** | 10.0% | 1.38 GB (rk-v1.2) |
+| RK3576 (cat-remote) | rk3576 8GB | multilang | TBD | 0.397 | 0.538 | 5.3% | 13.1% | 1.38 GB (rk-v1.2) |
+| RPi5 | BCM2712 8GB | lite_zh_en | TBD | **0.000** | **0.000** | 10.5% | 35.7% | 560 MB (rpi-v1.1) |
+| RPi5 | BCM2712 8GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |
+| RPi4 / CM4 | BCM2711 4GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |
 
-Already-measured baselines (smoke runs today):
-- Orin Nano voice_clone: TTS RTF 0.719, 1.04s audio, 0.748s infer
-- RK3588 multilang:    TTS RTF 0.189, 1.536s audio, 0.29s infer
+Measured 2026-05-13 (local mode, 5 warmup + 10 runs); see "Measured ASR perf" section above for full breakdown.
 
 ## Common gotchas
 
