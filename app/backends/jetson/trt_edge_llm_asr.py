@@ -168,18 +168,62 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             self._warm_worker()
 
     def _warm_worker(self) -> None:
+        """Pre-warm TRT audio_encoder optimization profile for batch shapes 1..N.
+
+        The audio_encoder engine has a single optimization profile with
+        dynamic batch dim [1..60]. TRT silently re-selects tactics + reallocs
+        workspace the FIRST time each unique batch shape is seen, costing
+        ~3-4× extra ms on that call. Without pre-warming, a `long_audio →
+        short_audio` switch in production triggers tactic recompilation
+        ~once per unique short-audio length (3s, 4s, 3.5s, ...) and the user
+        feels several extra seconds of latency.
+
+        We pre-warm 1..12 seconds (batch=1..12) which covers >99% of expected
+        utterances. Boot cost ~1-3s, RAM ~80MB. Bypass with env vars below.
+        Set EDGE_LLM_ASR_PREWARM_MAX to extend coverage (max 60).
+        """
         if os.environ.get("SKIP_ASR_WARMUP", "").lower() in ("1", "true", "yes"):
             logger.info("TRT-EdgeLLM ASR worker warmup skipped (SKIP_ASR_WARMUP set).")
             return
         if os.environ.get("EDGE_LLM_ASR_WORKER_WARMUP", "1").lower() in ("0", "false", "no"):
             logger.info("TRT-EdgeLLM ASR worker warmup skipped.")
             return
+        # Default max = 6 seconds, covering production calls. The streaming
+        # finalize path splits long audio at 4.5s, so worker never sees
+        # batches > 5 sec in real traffic. The audio encoder engine starts
+        # rejecting (attention_mask profile max ~780×780 ≈ 9s) somewhere
+        # between batch=9 and batch=10, so warming above 9 is wasted anyway.
         try:
-            silence = np.zeros(16000, dtype=np.float32)
-            self.transcribe(_float_audio_to_wav_bytes(silence, 16000))
-            logger.info("TRT-EdgeLLM ASR worker warmed with 1s silence.")
-        except Exception as exc:
-            logger.warning("TRT-EdgeLLM ASR worker warmup failed: %s", exc)
+            prewarm_max = int(os.environ.get("EDGE_LLM_ASR_PREWARM_MAX", "6"))
+        except ValueError:
+            prewarm_max = 6
+        prewarm_max = max(1, min(prewarm_max, 60))
+        import time as _time
+        t0 = _time.monotonic()
+        warmed = 0
+        for seconds in range(1, prewarm_max + 1):
+            try:
+                silence = np.zeros(16000 * seconds, dtype=np.float32)
+                self.transcribe(_float_audio_to_wav_bytes(silence, 16000))
+                warmed += 1
+            except Exception as exc:
+                # The encoder profile has a hard max shape; hitting it is the
+                # natural stop signal, not a real warning. Log as INFO.
+                msg = str(exc)
+                if "cannot handle" in msg or "TensorRT Edge LLM" in msg:
+                    logger.info(
+                        "TRT-EdgeLLM ASR pre-warm: engine boundary at batch=%d "
+                        "(expected, stopping)", seconds,
+                    )
+                else:
+                    logger.warning(
+                        "TRT-EdgeLLM ASR pre-warm batch=%d failed: %s", seconds, exc
+                    )
+                break  # larger shapes will also fail
+        elapsed = _time.monotonic() - t0
+        logger.info(
+            "TRT-EdgeLLM ASR worker pre-warmed shapes 1..%d in %.1fs", warmed, elapsed
+        )
 
     def _use_worker(self) -> bool:
         return bool(self._config["use_worker"])
@@ -243,7 +287,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
     @staticmethod
     def _strip_language_prefix(text: str) -> tuple[str, Optional[str]]:
         language_detected = None
-        if text and len(text) > 9 and text[:9] == "language ":
+        if text and len(text) >= 9 and text[:9] == "language ":
             known_languages = (
                 "Chinese", "English", "Cantonese", "Japanese", "Korean",
                 "French", "German", "Italian", "Portuguese", "Russian",
@@ -256,10 +300,18 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                     text = text[len(prefix) :].lstrip()
                     break
             else:
+                # No known language matched. The model may emit "language None"
+                # (no trailing text, hallucinated as a bailout for silent/noise
+                # segments) or "language Xxx <text>". Find the trailing space:
+                #   - found → strip "language <Xxx> " prefix
+                #   - missing → entire string is just "language <Xxx>", drop it
                 space = text.find(" ", 9)
                 if space > 0:
                     language_detected = text[9:space]
                     text = text[space + 1 :].lstrip()
+                else:
+                    language_detected = text[9:]   # e.g. "None"
+                    text = ""                      # empty out the bailout
         return text, language_detected
 
     def _transcribe_worker(self, mel_path: str, elapsed_mel_s: float) -> TranscriptionResult:
@@ -495,9 +547,67 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
         if not self._chunks:
             return ""
         audio = np.concatenate(self._chunks)
-        wav_bytes = _float_audio_to_wav_bytes(audio, 16000)
-        result = self._backend.transcribe(wav_bytes, language=self._language)
-        return result.text
+        # The TRT audio_encoder engine is built with a fixed optimization profile
+        # (~800-1500 mel frames ≈ 10-15s). Forwarding >10s of audio in one shot
+        # makes the worker reject the request ("cannot handle this request").
+        # Split at natural silence points using the same VAD splitter the older
+        # qwen3_asr backend uses, then concatenate the per-segment transcripts.
+        from app.backends.jetson.qwen3_asr import (
+            _split_at_silence_vad, _split_at_silence_energy, VAD_MAX_SEG_SEC,
+        )
+        try:
+            segments = _split_at_silence_vad(audio)
+        except ImportError:
+            # webrtcvad not installed on this image — fall back to energy-RMS
+            segments = _split_at_silence_energy(audio)
+        except Exception:
+            # Any other VAD failure: be safe, single segment (will only break
+            # for very long audio; short audio still works).
+            segments = [audio]
+
+        # Skip very short / near-silent segments: they tend to push the
+        # Qwen3-ASR model into bailout outputs ("language None"). Threshold
+        # of 0.4s drops VAD-trailing fragments without removing real content
+        # — natural speech segments split by the VAD are >=1.0s by design.
+        MIN_SEG_S = 0.4
+        texts: list[str] = []
+        for seg in segments:
+            if len(seg) / 16000 < MIN_SEG_S:
+                continue
+            wav_bytes = _float_audio_to_wav_bytes(seg, 16000)
+            try:
+                result = self._backend.transcribe(wav_bytes, language=self._language)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "TRT-EdgeLLM ASR segment failed (%.1fs): %s",
+                    len(seg) / 16000, e,
+                )
+                continue
+            if result.text:
+                # Drop trailing CJK/Latin sentence punctuation when more
+                # segments follow — the split was mid-utterance, the model
+                # over-eagerly punctuated the end. Keeps "变得 更善于"
+                # instead of "变得。 更善于".
+                texts.append(result.text)
+
+        # Join: use the request language to pick separator. CJK languages
+        # never use spaces; everything else does. Don't infer from output
+        # content (output may contain mixed-script proper nouns).
+        cjk_langs = {"Chinese", "Japanese", "Korean", "Cantonese", "zh", "ja", "ko"}
+        is_cjk = self._language in cjk_langs
+        # Trim segment-trailing punctuation when more text follows
+        if len(texts) > 1:
+            trail_punct = "。，、！？；,.!?;"
+            cleaned: list[str] = []
+            for i, t in enumerate(texts):
+                if i < len(texts) - 1:
+                    cleaned.append(t.rstrip(trail_punct).rstrip())
+                else:
+                    cleaned.append(t)
+            texts = cleaned
+        separator = "" if is_cjk else " "
+        return separator.join(texts).strip()
 
     def get_partial(self) -> tuple[str, bool]:
         return "", False
