@@ -253,24 +253,22 @@ Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-
 
 ## Measured TTS perf (local mode, 2026-05-13)
 
-| Group | Nano (Qwen3 TRT voice_clone) | RK3588 (matcha_rknn) | RK3576 (qwen3_rknn) | RPi5 (sherpa matcha) |
+| Group | Nano (Qwen3 TRT voice_clone) | RK3588 (matcha_rknn) | RK3576 (matcha_rknn + ORT) | RPi5 (sherpa matcha) |
 |---|---:|---:|---:|---:|
-| short/zh RTF | 0.425 | **0.071** | ⚠️ slow | **0.078** |
-| long/zh RTF  | 0.410 | **0.135** | ⚠️ slow | **0.077** |
-| short/en RTF | 0.420 | 0.085 | ⚠️ slow | 0.105 |
-| short/zh TFD | 4ms | 4ms | — | 2ms |
-| long/zh total | 6738ms | 812ms | — | 941ms |
+| short/zh RTF | 0.425 | **0.071** | 0.163 | **0.078** |
+| long/zh RTF  | 0.410 | **0.135** | 0.144 | **0.077** |
+| short/en RTF | 0.420 | 0.085 | 0.220 | 0.105 |
+| short/zh TFD | 4ms | 4ms | 6ms | 2ms |
+| long/zh total | 6738ms | 812ms | 1560ms | 941ms |
 
 - **RK3588 matcha_rknn ≈ RPi5 sherpa matcha** (both ~0.07-0.08 RTF) — RK NPU lifts Matcha decoder ~3-5× faster than ARM CPU, but Matcha's CNN backbone is small enough that sherpa-onnx on RPi5 stays competitive
+- **RK3576 ~2× slower than RK3588**: smaller NPU (2 cores @ 2 TOPS vs 6 TOPS on RK3588) + matcha encoder/estimator/decoder on ORT-CPU fallback (only vocos on NPU). Still well under realtime (0.14-0.22 RTF).
 - **Nano Qwen3 TTS slowest** (0.4× RTF) because it's a much bigger model targeting voice cloning + multi-language; tradeoff: highest quality (voice clone)
-- **RK3576 TTS: known issue, no working in-tree path right now**:
-  - `qwen3_rknn`: 1.8 fps (74.9s / 137 frames). Benchmark too slow to complete; vocoder reloads NPU per chunk on RK3576 (qwen3_tts.py:_reload_vocoder workaround for an NPU Conv hang bug, project_rk3576_tts_vocoder_bug)
-  - `matcha_rknn`: faster in isolation (memory project_matcha_vocos_rk3576 measured 0.054 RTF) but **crashes when co-loaded with the RKLLM ASR decoder** — vocos `RKNN_ERR_PARAM_INVALID` at set_inputs, `outputs[0][0]` = NoneType. Root cause: NPU memory/IOMMU conflict between RKLLM (ASR decoder) and RKNN (vocos). base_domain_id=1 + ASR_NPU_CORE_MASK=NPU_CORE_1 attempted, did not resolve. Memory entry: project_matcha_rknn_npu_conflict.
-  - **Workaround being considered**: sherpa-onnx matcha CPU TTS on RK3576 (avoids NPU entirely, ARM A72 should hit RTF ~0.2-0.4). Would require switching `TTS_BACKEND=sherpa` for RK3576 multilang preset.
 
 ### Resolved bugs (2026-05-13)
 
 - **Radxa rk:matcha_rknn TTS `'tuple'.encode` crash** — adapter `app/backends/rk/tts.py::generate_streaming` now unwraps `(audio, meta)` tuples to PCM bytes. Fixed in commit `1aa7976`.
+- **RK3576 TTS `RKNN_ERR_PARAM_INVALID` vocos crash** — `rk3576-multilang.json` profile had `VOCOS_FRAMES=256` but the deployed vocos engine is `vocos-16khz-600.rknn` (expects 600 mel frames). Profile updated to `VOCOS_FRAMES=600`. Required `MATCHA_USE_ORT=1` to route matcha encoder/estimator/decoder through ORT-CPU (reduces RKNN model count on NPU domain 0). With both fixes: RTF 0.14-0.22 on RK3576. Initial misdiagnosis as "NPU IOMMU conflict" was wrong — actual root cause was a shape-mismatch + Matcha component count.
 
 ## Measured V2V perf (local mode, 2026-05-13)
 
@@ -304,7 +302,7 @@ EOS → first TTS audio chunk, `--llm-delay=0` (forced EOS):
 | Jetson Orin Nano | sm87 8GB | multilang | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
 | Jetson Orin NX | sm87 16GB | voice_clone | TBD | TBD | TBD | TBD | TBD | 3.14 GB |
 | RK3588 (Radxa ROCK 5T) | rk3588 16GB | multilang | **0.071** | 0.220 | **0.030** | **2.6%** | 10.0% | 1.38 GB (rk-v1.2) |
-| RK3576 (cat-remote) | rk3576 8GB | multilang | ⚠️ slow | 0.397 | 0.538 | 5.3% | 13.1% | 1.38 GB (rk-v1.2) |
+| RK3576 (cat-remote) | rk3576 8GB | multilang | **0.163** | 0.397 | 0.538 | 5.3% | 13.1% | 1.38 GB (rk-v1.2) |
 | RPi5 | BCM2712 8GB | lite_zh_en | **0.078** | **0.000** | **0.000** | 10.5% | 35.7% | 560 MB (rpi-v1.1) |
 | RPi5 | BCM2712 8GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |
 | RPi4 / CM4 | BCM2711 4GB | asr_zh_en | — | TBD | TBD | TBD | TBD | 560 MB |

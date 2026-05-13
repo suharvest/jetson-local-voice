@@ -28,6 +28,6 @@
     "MATCHA_MAX_PHONEMES": "64",
     "MATCHA_MODEL_SEQ_LEN": "80",
     "VOCOS_MODEL": "vocos-16khz-600.rknn",
-    "VOCOS_FRAMES": "256"
+    "VOCOS_FRAMES": "600"
   }
 }

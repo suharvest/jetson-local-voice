@@ -17,7 +17,7 @@ no network noise.
 | Highest accuracy on English + multilingual | **Jetson Orin Nano** |
 | Best Chinese accuracy, mid-tier latency | **Radxa ROCK 5T (RK3588)** |
 | Lowest cost, decent zh+en for voice commands | **Raspberry Pi 5** |
-| Multilingual on a tight budget (ja/ko/es/de/fr) | **RK3576** (ASR only — TTS limitation, see below) |
+| Multilingual on a tight budget (ja/ko/es/de/fr) | **RK3576** |
 | Voice cloning (your own voice synthesised) | **Jetson Orin Nano** (the only platform that supports it today) |
 
 ---
@@ -72,19 +72,15 @@ normalisation, the raw CER on `long/zh` looks 3-4× worse purely from
 
 ### Speech synthesis
 
-| Group | Orin Nano (Qwen3 voice_clone) | RK3588 (matcha_rknn) | RK3576 (multilang) | RPi5 (sherpa matcha) |
+| Group | Orin Nano (Qwen3 voice_clone) | RK3588 (matcha_rknn) | RK3576 (matcha + ORT) | RPi5 (sherpa matcha) |
 |---|---:|---:|---:|---:|
-| Short Chinese TTS RTF | 0.42 | **0.07** | n/a² | **0.08** |
-| Long Chinese TTS RTF  | 0.41 | 0.14 | n/a² | **0.08** |
-| Short English TTS RTF | 0.42 | 0.09 | n/a² | 0.11 |
-| First-byte delay (any) | 4 ms | 4 ms | n/a² | 2 ms |
+| Short Chinese TTS RTF | 0.42 | **0.07** | 0.16 | **0.08** |
+| Long Chinese TTS RTF  | 0.41 | 0.14 | 0.14 | **0.08** |
+| Short English TTS RTF | 0.42 | 0.09 | 0.22 | 0.11 |
+| First-byte delay (any) | 4 ms | 4 ms | 6 ms | 2 ms |
 
-² **RK3576 has a known TTS limitation today** — neither in-tree backend
-ships a working setup: the lightweight `matcha_rknn` model crashes when
-co-loaded with the RKLLM ASR decoder (NPU resource conflict that we're
-tracking), and the heavyweight `qwen3_rknn` runs at ~1.8 fps which is
-not usable. Workaround in development: ARM-CPU sherpa-onnx Matcha as the
-RK3576 TTS path. RK3576 ASR is unaffected and works well.
+RK3576 is ~2× slower than RK3588 (smaller NPU + matcha components on
+ORT-CPU fallback), still comfortably real-time at RTF ≤ 0.22.
 
 ### End-to-end conversation latency (LLM excluded)
 
@@ -133,11 +129,12 @@ Finalize latency ~300-900 ms is fine for a "press to talk" flow.
 on Chinese short sentences (2.6 %), supports 50+ languages via Qwen3.
 TTS is on par with RPi5 (Matcha 0.07 RTF). Mature, well-tested.
 
-### "Tightest BOM, multilingual ASR only (push-to-talk transcription)"
+### "Tightest BOM, multilingual end-to-end"
 
 → **RK3576**. ~$80, multilingual Qwen3 ASR works well (5.3 % short
-Chinese CER, 7.8 % long Chinese CER). **Plan around the current TTS
-limitation** if you need synthesis — see footnote 2.
+Chinese CER, 7.8 % long Chinese CER), TTS via Matcha + ORT-CPU
+fallback (RTF 0.14-0.22, comfortably real-time). The slowest device in
+the matrix but the cheapest with multilingual coverage.
 
 ### "I need voice cloning"
 

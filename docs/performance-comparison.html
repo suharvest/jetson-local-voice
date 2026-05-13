@@ -213,7 +213,7 @@
   <tr><td>英文识别精度 + 多语言</td><td><span class="pill pill-accent">Jetson Orin Nano</span></td></tr>
   <tr><td>中文识别精度，延迟可接受</td><td><span class="pill pill-accent">Radxa ROCK 5T (RK3588)</span></td></tr>
   <tr><td>低成本，中英文命令词够用</td><td><span class="pill pill-accent">Raspberry Pi 5</span></td></tr>
-  <tr><td>多语言（日/韩/西/德/法）小成本</td><td><span class="pill pill-accent">RK3576</span> · 仅 ASR（TTS 待修，见下）</td></tr>
+  <tr><td>多语言（日/韩/西/德/法）小成本</td><td><span class="pill pill-accent">RK3576</span></td></tr>
   <tr><td>声音克隆（说话人定制）</td><td><span class="pill pill-accent">Jetson Orin Nano</span> · 当前唯一支持</td></tr>
 </tbody>
 </table>
@@ -283,18 +283,18 @@
   <th>场景</th>
   <th class="num">Orin Nano<br>Qwen3 voice_clone</th>
   <th class="num">RK3588<br>matcha_rknn</th>
-  <th class="num">RK3576<br>multilang</th>
+  <th class="num">RK3576<br>matcha + ORT</th>
   <th class="num">RPi5<br>sherpa matcha</th>
 </tr></thead>
 <tbody>
-  <tr><td>短中文 TTS RTF</td><td class="num">0.42</td><td class="num best">0.07</td><td class="num">n/a<sup>2</sup></td><td class="num best">0.08</td></tr>
-  <tr><td>长中文 TTS RTF</td><td class="num">0.41</td><td class="num">0.14</td><td class="num">n/a<sup>2</sup></td><td class="num best">0.08</td></tr>
-  <tr><td>短英文 TTS RTF</td><td class="num">0.42</td><td class="num">0.09</td><td class="num">n/a<sup>2</sup></td><td class="num">0.11</td></tr>
-  <tr><td>首音延迟 TFD</td><td class="num">4 ms</td><td class="num">4 ms</td><td class="num">n/a<sup>2</sup></td><td class="num best">2 ms</td></tr>
+  <tr><td>短中文 TTS RTF</td><td class="num">0.42</td><td class="num best">0.07</td><td class="num">0.16</td><td class="num best">0.08</td></tr>
+  <tr><td>长中文 TTS RTF</td><td class="num">0.41</td><td class="num">0.14</td><td class="num">0.14</td><td class="num best">0.08</td></tr>
+  <tr><td>短英文 TTS RTF</td><td class="num">0.42</td><td class="num">0.09</td><td class="num">0.22</td><td class="num">0.11</td></tr>
+  <tr><td>首音延迟 TFD</td><td class="num">4 ms</td><td class="num">4 ms</td><td class="num">6 ms</td><td class="num best">2 ms</td></tr>
 </tbody>
 </table>
 
-<div class="warn-box"><sup>2</sup> <b>RK3576 当前 TTS 限制</b>：内置两条路径目前都不可用 —— 轻量的 <code>matcha_rknn</code> 跟 RKLLM ASR 共载时 NPU 资源冲突（vocos 推理崩）；重量的 <code>qwen3_rknn</code> 只能跑 ~1.8 fps，无法实时。变通方案研发中（改用 sherpa-onnx Matcha 的 ARM CPU 路径，绕开 NPU）。<b>RK3576 的 ASR 不受影响，工作正常</b>。</div>
+<p class="footnote">RK3576 比 RK3588 慢约 2 倍（NPU 较小 + matcha 主要组件走 ORT-CPU 回退路径），但仍稳定在实时之内（RTF ≤ 0.22）。</p>
 
 <h3>端到端对话延迟（不含 LLM）</h3>
 
@@ -363,9 +363,9 @@
 </div>
 
 <div class="card">
-<h4>📝 多语言推转录（按键说话）</h4>
-<p><b>选：RK3576</b> · 仅 ASR</p>
-<p>~$80。多语言 Qwen3 ASR 工作正常（短中文 CER 5.3%，长中文 7.8%）。如果产品需要语音回话，请预留 TTS 限制的应对（见上文 footnote 2）。</p>
+<h4>📝 多语言端到端（最低 BOM）</h4>
+<p><b>选：RK3576</b></p>
+<p>~$80。多语言 Qwen3 ASR 工作正常（短中文 CER 5.3%，长中文 7.8%）；TTS 走 Matcha + ORT-CPU 回退路径，RTF 0.14-0.22 稳定实时。本矩阵里最慢的，但也是带多语言能力中最便宜的。</p>
 </div>
 
 <div class="card">
