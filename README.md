@@ -339,7 +339,26 @@ GET /health  →  {"asr": bool, "tts": bool, "streaming_asr": bool}
 
 ## Performance
 
-### Latency (Jetson Orin NX 16GB, CUDA 12.6, MAXN)
+### Cross-device comparison (measured 2026-05-13)
+
+Full measured numbers across Jetson Orin Nano / Radxa ROCK 5T (RK3588) /
+RK3576 / Raspberry Pi 5, plus a use-case-driven device picker, live in
+**[`docs/performance-comparison.md`](docs/performance-comparison.md)**.
+
+Headline summary:
+
+| Use case | Pick | Why |
+|---|---|---|
+| Best English accuracy + voice clone | **Jetson Orin Nano** | 0 % WER short English, only platform with voice cloning |
+| Best Chinese accuracy | **Radxa RK3588** | 2.6 % CER short, 5 % Long-EN WER |
+| Lowest cost (zh+en commands) | **RPi5** | Real-time streaming, $80 BOM |
+| Multilingual ASR (ja/ko/es/de/fr) | **RK3576** | Qwen3 ASR works; TTS still WIP |
+
+Cross-device speech-recognition Finalize-RTF and CER/WER tables, full
+TTS results, V2V latency, and concurrency numbers are all in the
+comparison doc above.
+
+### Latency on Jetson Orin NX 16GB (representative baseline)
 
 | | ASR TTFT | TTS TTFT | ASR + TTS | vs Cloud |
 |---|---------|---------|-----------|----------|
