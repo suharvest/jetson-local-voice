@@ -37,6 +37,9 @@ services:
       # ── ASR ─────────────────────────────────────────────────────────
       - ASR_BACKEND=qwen3_asr_rk
       - ASR_DECODER_TYPE=rkllm
+      - ASR_PLATFORM=rk3588
+      - ASR_ENABLED_CPUS=4
+      - ASR_NPU_CORE_MASK=NPU_CORE_AUTO
       - ASR_MODEL_DIR=/opt/asr/models
       - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
       # True streaming: 400 ms chunks + left-context encoder + webrtcvad
