@@ -1,0 +1,67 @@
+# Seeed Local Voice — Rockchip RK3576 / RK3588 deployment.
+#
+# Usage (on the target board, repo root mounted as cwd):
+#   docker compose -f deploy/docker-compose.rk.yml up -d
+#
+# Model mounts assume the conventions used on cat-remote / radxa hosts:
+#   /home/cat/models/*           — TTS (matcha + vocos)
+#   /home/cat/qwen3-asr-models/  — ASR (Qwen3 ASR encoder/decoder + tokenizer)
+#   /home/cat/rk3576-build/      — librkllmrt.so prebuilt
+# Override any of these via the host paths on the left of the colon.
+#
+# Hardware: needs /dev (RKNN NPU char devs) and host networking. The image
+# is built against Debian 12 slim; see deploy/docker/Dockerfile.rk.
+
+services:
+  speech:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.rk
+    image: seeed-local-voice:rk
+    container_name: seeed-local-voice
+    privileged: true
+    init: true
+    network_mode: host
+    mem_limit: 7500m
+    memswap_limit: 7500m
+    volumes:
+      - /dev:/dev
+      - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so:ro
+      # TTS assets (matcha-icefall + vocos)
+      - /home/cat/models/matcha-icefall-zh-en:/opt/tts/models/matcha-icefall-zh-en:ro
+      - /home/cat/models/matcha-s64.rknn:/opt/tts/models/matcha-s64.rknn:ro
+      - /home/cat/models/vocos-16khz-600.rknn:/opt/tts/models/vocos-16khz-600.rknn:ro
+      - /home/cat/models/matcha-split:/opt/tts/models/matcha-split:ro
+      - /home/cat/matcha-data:/home/cat/matcha-data:ro
+      # ASR assets
+      - /home/cat/qwen3-asr-models:/opt/asr/models:ro
+      - /home/cat/rk3576-build/librkllmrt.so:/opt/asr/lib/librkllmrt.so:ro
+      # NPU matmul parallel helper (PYTHONPATH below)
+      - /home/cat/project/rknn-matmul-parallel:/opt/rknn-matmul-parallel:ro
+    environment:
+      - SEEED_LOCAL_VOICE_PROFILE=${SEEED_LOCAL_VOICE_PROFILE:-rk3576-default}
+      # ── ASR ─────────────────────────────────────────────────────────
+      - ASR_BACKEND=qwen3_asr_rk
+      - ASR_DECODER_TYPE=rkllm
+      - ASR_MODEL_DIR=/opt/asr/models
+      - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
+      # True streaming: 400 ms chunks + left-context encoder + webrtcvad
+      # endpoint pre-fire → near-zero stop→final latency. Required for the
+      # multi_utterance V2V path (see docs/api/v2v-stream.md) to surface
+      # per-utterance VAD endpoints. Set to 0 to fall back to legacy
+      # StreamSession (window / reuse / kv_streaming modes).
+      - QWEN3_ASR_STREAM_TRUE=1
+      # ── TTS ─────────────────────────────────────────────────────────
+      - TTS_BACKEND=matcha_rknn
+      - TTS_MODEL_DIR=/opt/tts/models
+      - MATCHA_MAX_PHONEMES=64
+      - MATCHA_MODEL_SEQ_LEN=80
+      - MATCHA_USE_ORT=1
+      - MATCHA_MODEL=matcha-s64.rknn
+      - VOCOS_MODEL=vocos-16khz-600.rknn
+      - VOCOS_FRAMES=600
+      - MATCHA_ONNX_PATH=/home/cat/matcha-data/model-steps-3.onnx
+      # ── Misc ────────────────────────────────────────────────────────
+      - PYTHONPATH=/opt/rknn-matmul-parallel
+      - MODEL_DIR=/opt/tts/models
+    restart: unless-stopped

@@ -16,9 +16,9 @@ services:
       dockerfile: deploy/docker/Dockerfile.jetson
       args:
         LANGUAGE_MODE: ${LANGUAGE_MODE:-zh_en}
-    # TODO: add separate compose entries for RK (deploy/docker/Dockerfile.rk)
-    # and Raspberry Pi (deploy/docker/Dockerfile.rpi) — these targets run on
-    # different hosts and don't share this compose file's nvidia runtime.
+    # NOTE: this file covers the Jetson target. RK and Raspberry Pi run on
+    # different hosts (different runtime, different volumes) and have their
+    # own compose files: deploy/docker-compose.rk.yml, deploy/docker-compose.rpi.yml.
     runtime: nvidia
     ipc: host
     ports:
