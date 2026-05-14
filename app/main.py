@@ -816,6 +816,7 @@ async def v2v_stream(ws: WebSocket):
     sample_rate     = int(cfg.get("sample_rate", 16000))
     vad_backend     = cfg.get("vad", "silero" if asr_language else "none")
     vad_silence_ms  = int(cfg.get("vad_silence_ms", 500))
+    multi_utterance = bool(cfg.get("multi_utterance", False))
 
     if not asr_language and not tts_language:
         await ws.send_json({"type": v2v_proto.SERVER_ERROR,
@@ -874,6 +875,9 @@ async def v2v_stream(ws: WebSocket):
         "vad_endpoint":     False,   # set ONLY when VAD detected speech-end
                                      # (so we emit asr_endpoint frame in the
                                      # VAD case but not on client-driven eos)
+        "vad_endpoint_pending": False,  # multi_utterance: VAD speech-end fired;
+                                        # asr_out_task should emit endpoint+final
+                                        # but keep listening for the next utterance
         "tts_flush":        False,   # set when client tts_flush
         "current_tts_task": None,    # running TTS synth task (cancellable)
         "current_tts_stop": None,    # threading.Event to signal synth thread
@@ -935,8 +939,14 @@ async def v2v_stream(ws: WebSocket):
                             if stop is not None:
                                 stop.set()
                         elif event == vad_mod.VADSession.SPEECH_END:
-                            state["asr_eos"] = True
-                            state["vad_endpoint"] = True
+                            if multi_utterance:
+                                # Mid-session: emit an utterance boundary; do
+                                # NOT terminate the session — keep accepting
+                                # audio for the next utterance.
+                                state["vad_endpoint_pending"] = True
+                            else:
+                                state["asr_eos"] = True
+                                state["vad_endpoint"] = True
                     async with coord.acquire("asr"):
                         await loop.run_in_executor(
                             _get_asr_executor(), asr_stream.accept_waveform, sample_rate, samples
@@ -981,11 +991,19 @@ async def v2v_stream(ws: WebSocket):
     async def asr_out_task():
         """Poll ASR stream for partials, emit endpoint + final.
 
-        asr_endpoint is emitted only when the backend or VAD detects
-        an end-of-speech naturally. Client-driven asr_eos jumps straight
-        to final (per docs/api/v2v-stream.md).
+        Single-utterance (default): asr_endpoint + asr_final emitted once,
+        then session ends. Client-driven asr_eos skips asr_endpoint.
+
+        Multi-utterance (config multi_utterance=True): on each VAD or
+        backend endpoint, emit asr_endpoint + asr_final with
+        session_complete=false, then keep listening. Session terminates
+        only on client asr_eos / disconnect, which sends a closing
+        asr_final with session_complete=true (and duplicate_of_streamed
+        if the text matches the last mid-session final).
         """
-        backend_endpoint = False
+        backend_endpoint = False        # single-utterance only
+        last_streamed_final = None      # multi-utterance: last text emitted as a
+                                        # mid-session final, for dedup on close
         while not state["asr_eos"] and not state["client_closed"]:
             try:
                 async with coord.acquire("asr"):
@@ -997,16 +1015,35 @@ async def v2v_stream(ws: WebSocket):
             if partial:
                 await send_json({"type": v2v_proto.SERVER_ASR_PARTIAL,
                                  "text": partial, "is_stable": bool(is_endpoint)})
+
+            # Endpoint sources: backend (is_endpoint from get_partial) or VAD
+            # (vad_endpoint_pending, multi only). Single-mode VAD also sets
+            # asr_eos so we never reach the "pending" path there.
+            endpoint_fired = is_endpoint or state["vad_endpoint_pending"]
+            if endpoint_fired and multi_utterance:
+                await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
+                text = partial or ""
+                await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
+                                 "text": text,
+                                 "session_complete": False})
+                last_streamed_final = text
+                state["vad_endpoint_pending"] = False
+                # Backend stream is_endpoint will auto-reset on the next audio
+                # chunk via _check_new_utterance_resume; loop continues.
+                await asyncio.sleep(0.05)
+                continue
+
             if is_endpoint:
                 state["asr_eos"] = True
                 backend_endpoint = True
                 break
             await asyncio.sleep(0.05)
+
         if state["client_closed"]:
             return
         # Only emit asr_endpoint for VAD- or backend-detected endpoints,
         # not when the client manually requested asr_eos.
-        if state["vad_endpoint"] or backend_endpoint:
+        if not multi_utterance and (state["vad_endpoint"] or backend_endpoint):
             await send_json({"type": v2v_proto.SERVER_ASR_ENDPOINT})
         try:
             async with coord.acquire("asr"):
@@ -1014,7 +1051,16 @@ async def v2v_stream(ws: WebSocket):
         except Exception as e:
             await send_error(f"asr finalize: {e}")
             return
-        await send_json({"type": v2v_proto.SERVER_ASR_FINAL, "text": final_text or ""})
+
+        if multi_utterance:
+            duplicate = (final_text or "") == (last_streamed_final or "")
+            await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
+                             "text": final_text or "",
+                             "session_complete": True,
+                             "duplicate_of_streamed": duplicate})
+        else:
+            await send_json({"type": v2v_proto.SERVER_ASR_FINAL,
+                             "text": final_text or ""})
 
     async def tts_out_task():
         """Drain sentence queue → synthesize → emit audio.

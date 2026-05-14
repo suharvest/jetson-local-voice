@@ -10,6 +10,7 @@ is a `config` that decides which features light up:
 | Both set | Full V2V duplex. Binary in both directions: client → ASR input, server → TTS output. |
 | `vad` | Server-side VAD backend (default `silero` if ASR enabled, `none` otherwise). |
 | `vad_silence_ms` | How long silence to trigger auto `asr_endpoint`. Default 500 ms. |
+| `multi_utterance` | If `true`, the session stays open across utterances; each VAD/backend endpoint emits a mid-session `asr_final` with `session_complete: false` and the loop keeps listening. Default `false` (single-utterance, current behaviour). |
 
 Existing `/asr/stream` and `/tts/stream` endpoints stay unchanged for
 backward compatibility. The new endpoint adds capability without
@@ -27,7 +28,8 @@ breaking anything.
  "tts_speed":1.0,              // optional; some backends only
  "sample_rate":16000,          // PCM sample rate
  "vad":"silero",               // "silero" | "webrtcvad" | "none"
- "vad_silence_ms":500}
+ "vad_silence_ms":500,
+ "multi_utterance":false}      // see "End-of-utterance semantics" below
 
 {"type":"text", "text":"<incremental text chunk>"}
 {"type":"asr_eos"}             // manually finalize ASR (overrides VAD)
@@ -42,7 +44,11 @@ Plus: **binary frames** = int16 PCM at `sample_rate` (mono), feeding ASR.
 ```
 {"type":"asr_partial",       "text":"...", "is_stable":false}
 {"type":"asr_endpoint"}                              // VAD detected end of speech
-{"type":"asr_final",         "text":"..."}           // exactly one per utterance
+{"type":"asr_final",         "text":"..."}           // single-utterance mode: one per session
+                                                     // multi_utterance mode adds:
+                                                     //   "session_complete": false   // mid-session boundary
+                                                     //   "session_complete": true,   // session-end final
+                                                     //   "duplicate_of_streamed": bool
 {"type":"tts_started",       "sentence":"..."}       // about to ship audio
 {"type":"tts_sentence_done", "sentence":"..."}       // one sentence finished
 {"type":"tts_done"}                                  // tts_flush honored, no more audio
@@ -87,6 +93,8 @@ barge-ins).
 
 ## End-of-utterance semantics
 
+**Single-utterance (default, `multi_utterance: false`)**
+
 - VAD-driven: server emits `asr_endpoint`, then `asr_final`. The audio
   buffer is closed; further binary frames are ignored until the
   client opens a new WebSocket.
@@ -95,6 +103,31 @@ barge-ins).
 
 If the client sends nothing (binary or eos) and VAD is disabled, the
 ASR stream stays open indefinitely (or until WS disconnect).
+
+**Multi-utterance (`multi_utterance: true`)**
+
+Same WS session carries an unbounded sequence of utterances. On each
+VAD or backend-detected end-of-speech the server emits:
+
+```
+{"type":"asr_endpoint"}
+{"type":"asr_final", "text":"<this utterance>", "session_complete": false}
+```
+
+The audio buffer stays open; the next utterance is recognized in the
+same stream (backends reset per-utterance state automatically on the
+next chunk of speech). The session terminates on:
+
+- **Client `asr_eos`** — server runs `finalize()`, emits a final
+  `asr_final` with `session_complete: true`. If the final text matches
+  the last mid-session final the client already received, the frame
+  also carries `duplicate_of_streamed: true` so the client can dedupe.
+- **WS disconnect** — same behaviour, but no closing frame is delivered.
+
+Clients should treat mid-session `asr_final` frames as the canonical
+transcript of each utterance; the closing frame only delivers any
+trailing audio that arrived after the last VAD endpoint and is usually
+a duplicate.
 
 ## Customer example (Python, asyncio)
 
