@@ -70,3 +70,5 @@ rk3576/engine/
 rk3576/*.so
 rk3576/scripts/*.wav
 rk3576/scripts/*.npz
+rk3576/
+tools/
