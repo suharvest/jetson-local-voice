@@ -7,7 +7,7 @@
     "mode": "concurrent",
     "shared_resource": "trt"
   },
-  "artifact_set": "orin-nx-highperf-2026-05-11",
+  "artifact_set": "orin-nx-highperf-2026-05-14",
   "env": {
     "LANGUAGE_MODE": "multilanguage",
     "ASR_BACKEND": "trt_edgellm",
@@ -25,9 +25,9 @@
     "QWEN3_TTS_ACTIVE_CP_GROUPS": "13",
     "EDGE_LLM_TTS_PERF_PROFILE": "balanced",
     "QWEN3_ARTIFACT_MANIFEST": "deploy/artifacts/qwen3_manifest.json",
-    "QWEN3_ARTIFACT_SET": "orin-nx-highperf-2026-05-11",
+    "QWEN3_ARTIFACT_SET": "orin-nx-highperf-2026-05-14",
     "QWEN3_ARTIFACT_ROOT": "/opt/models/qwen3-edgellm",
-    "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/asr_thinker_full_fp8embed",
+    "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf-v2/asr_thinker_full_fp8embed",
     "EDGE_LLM_ASR_AUDIO_ENC_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/asr_audio_encoder",
     "EDGE_LLM_TTS_TALKER_DIR": "${QWEN3_ARTIFACT_ROOT}/tts/talker",
     "EDGE_LLM_TTS_TALKER_BACKEND": "qwen3_tts_explicit_kv",
