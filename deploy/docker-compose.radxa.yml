@@ -46,6 +46,8 @@ services:
       # endpoint pre-fire → near-zero stop→final latency. Required for the
       # multi_utterance V2V path (see docs/api/v2v-stream.md).
       - QWEN3_ASR_STREAM_TRUE=1
+      - QWEN3_ASR_TRUE_ROLL_SEC=15
+      - VAD_ENDPOINT_SILENCE_MS=800
       # ── TTS ─────────────────────────────────────────────────────────
       - TTS_BACKEND=matcha_rknn
       - TTS_MODEL_DIR=/opt/tts/models

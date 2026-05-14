@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 _VAD_MAX_SEG_SEC = 4.5
 _VAD_MIN_SEG_SEC = 0.5
 _VAD_FRAME_MS = 20
-_LONG_AUDIO_THRESHOLD_S = 5.0       # below this, trust the inner streaming path
+_LONG_AUDIO_THRESHOLD_S = 15.0       # below this, trust the inner streaming path (raised from 5.0 — the true streaming path with ROLLING_BUFFER_SEC=15 can handle up to 15s cleanly)
 
 # Outputs that mean "model gave up and echoed its own instruction suffix" —
 # drop these from the joined transcript.

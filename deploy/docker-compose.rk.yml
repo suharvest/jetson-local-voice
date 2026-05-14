@@ -52,6 +52,8 @@ services:
       # per-utterance VAD endpoints. Set to 0 to fall back to legacy
       # StreamSession (window / reuse / kv_streaming modes).
       - QWEN3_ASR_STREAM_TRUE=1
+      - QWEN3_ASR_TRUE_ROLL_SEC=15
+      - VAD_ENDPOINT_SILENCE_MS=800
       # ── TTS ─────────────────────────────────────────────────────────
       - TTS_BACKEND=matcha_rknn
       - TTS_MODEL_DIR=/opt/tts/models
