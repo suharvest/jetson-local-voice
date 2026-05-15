@@ -11,6 +11,8 @@
     "LANGUAGE_MODE": "rk",
     "RK_PLATFORM": "rk3588",
     "ASR_BACKEND": "qwen3_asr_rk",
+    "SEEED_LOCAL_VOICE_VAD_BACKEND": "silero",
+    "SEEED_LOCAL_VOICE_VAD_SILENCE_MS": "400",
     "ASR_DECODER_TYPE": "rkllm",
     "ASR_MODEL_DIR": "/opt/asr/models",
     "RKLLM_LIB_PATH": "/opt/asr/lib/librkllmrt.so",

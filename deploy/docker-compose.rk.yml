@@ -37,6 +37,9 @@ services:
       - /home/cat/project/rknn-matmul-parallel:/opt/rknn-matmul-parallel:ro
     environment:
       - SEEED_LOCAL_VOICE_PROFILE=${SEEED_LOCAL_VOICE_PROFILE:-rk3576-default}
+      # Open-dialogue endpointing defaults. Override in .env for product tuning.
+      - SEEED_LOCAL_VOICE_VAD_BACKEND=${SEEED_LOCAL_VOICE_VAD_BACKEND:-silero}
+      - SEEED_LOCAL_VOICE_VAD_SILENCE_MS=${SEEED_LOCAL_VOICE_VAD_SILENCE_MS:-400}
       # ── ASR ─────────────────────────────────────────────────────────
       - ASR_BACKEND=qwen3_asr_rk
       - ASR_DECODER_TYPE=rkllm
@@ -46,7 +49,7 @@ services:
       - ASR_NPU_CORE_MASK=NPU_CORE_1
       - ASR_MODEL_DIR=/opt/asr/models
       - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
-      # True streaming: 400 ms chunks + left-context encoder + webrtcvad
+      # True streaming: 400 ms chunks + left-context encoder + silero VAD
       # endpoint pre-fire → near-zero stop→final latency. Required for the
       # multi_utterance V2V path (see docs/api/v2v-stream.md) to surface
       # per-utterance VAD endpoints. Set to 0 to fall back to legacy

@@ -18,8 +18,8 @@ webrtcvad fallback is stateless C extension (`pip install
 webrtcvad-wheels`), tiny but less accurate on noisy / non-English.
 
 Backends:
-- 'silero' (default) — multilingual, accurate, 2.3 MB ONNX
-- 'webrtcvad' — pure C, ~50 KB, single-language okay for command voice
+- 'silero' — multilingual, accurate, 2.3 MB ONNX
+- 'webrtcvad' — pure C, ~50 KB, low-overhead fallback
 - 'none' — disable VAD (caller must finalize ASR explicitly)
 """
 from __future__ import annotations
@@ -130,7 +130,7 @@ class SileroVADSession(VADSession):
         self,
         sample_rate: int = 16000,
         threshold: float = 0.5,
-        silence_ms: int = 500,
+        silence_ms: int = 400,
         speech_pad_ms: int = 100,   # accepted for API parity; not used here
     ):
         if sample_rate != 16000:
@@ -197,7 +197,7 @@ class WebRTCVADSession(VADSession):
         self,
         sample_rate: int = 16000,
         aggressiveness: int = 2,    # 0..3, higher = more aggressive
-        silence_ms: int = 500,
+        silence_ms: int = 400,
     ):
         import webrtcvad
         self._vad = webrtcvad.Vad(int(aggressiveness))
@@ -244,7 +244,7 @@ class WebRTCVADSession(VADSession):
 def create_vad(
     backend: str = "silero",
     sample_rate: int = 16000,
-    silence_ms: int = 500,
+    silence_ms: int = 400,
     **kwargs,
 ) -> Optional[VADSession]:
     """Factory. Returns None for backend='none'."""

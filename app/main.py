@@ -82,6 +82,20 @@ def _get_asr_executor() -> ThreadPoolExecutor:
         )
     return _asr_executor
 
+
+def _default_vad_backend() -> str:
+    return os.environ.get("SEEED_LOCAL_VOICE_VAD_BACKEND", "silero").strip() or "silero"
+
+
+def _default_vad_silence_ms() -> int:
+    raw = os.environ.get("SEEED_LOCAL_VOICE_VAD_SILENCE_MS", "400")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid SEEED_LOCAL_VOICE_VAD_SILENCE_MS=%r; using 400", raw)
+        return 400
+    return max(0, value)
+
 @app.on_event("startup")
 async def startup():
     global _asr_backend
@@ -103,6 +117,11 @@ async def startup():
     language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
     logger.info("=" * 60)
     logger.info("LANGUAGE_MODE: %s", language_mode)
+    logger.info(
+        "VAD default: backend=%s silence_ms=%d",
+        _default_vad_backend(),
+        _default_vad_silence_ms(),
+    )
     if language_mode == "multilanguage":
         logger.info("  → Using Qwen3 TTS + ASR (52 languages, voice cloning)")
     else:
@@ -561,8 +580,8 @@ async def asr_stream(
     ws: WebSocket,
     language: str = "auto",
     sample_rate: int = 16000,
-    vad: Optional[str] = None,           # opt-in: "silero" | "webrtcvad" | "none"
-    vad_silence_ms: int = 500,
+    vad: Optional[str] = None,           # default from SEEED_LOCAL_VOICE_VAD_BACKEND
+    vad_silence_ms: Optional[int] = None,
 ):
     """Streaming ASR via WebSocket.
 
@@ -570,11 +589,10 @@ async def asr_stream(
     Client sends: empty bytes b"" to signal end
     Server sends: JSON {"text": "...", "is_final": bool, "is_stable": bool}
 
-    Optional server-side VAD: pass ?vad=silero (or webrtcvad) to have the
-    server auto-finalize on silence — client no longer needs to send the
-    empty b"" frame. ``vad_silence_ms`` controls the silence threshold
-    (default 500 ms). Without the query param this endpoint behaves
-    exactly as before (forced EOS by client).
+    Server-side VAD auto-finalizes on silence — client no longer needs to
+    send the empty b"" frame in open-mic dialogue mode. ``vad_silence_ms``
+    controls the silence threshold (default 400 ms). Pass ?vad=none for
+    legacy forced-EOS-only behavior.
 
     Requires an ASR backend with STREAMING capability.
     """
@@ -583,6 +601,8 @@ async def asr_stream(
     from app.core.asr_backend import ASRCapability
 
     await ws.accept()
+    vad_backend = vad if vad is not None else _default_vad_backend()
+    vad_silence = _default_vad_silence_ms() if vad_silence_ms is None else max(0, int(vad_silence_ms))
 
     # Choose backend: prefer ASR backend with STREAMING, fall back to sherpa
     asr_be = _get_asr_backend()
@@ -596,14 +616,14 @@ async def asr_stream(
     # singleton model from app.core.vad — no extra model load per
     # connection.
     vad_session = None
-    if vad and vad not in ("none", "off", "disabled"):
+    if vad_backend and vad_backend not in ("none", "off", "disabled"):
         try:
             from app.core import vad as vad_mod
             vad_session = vad_mod.create_vad(
-                vad, sample_rate=sample_rate, silence_ms=vad_silence_ms
+                vad_backend, sample_rate=sample_rate, silence_ms=vad_silence
             )
         except Exception as e:
-            logger.warning("VAD '%s' init failed (%s); falling back to forced-EOS", vad, e)
+            logger.warning("VAD '%s' init failed (%s); falling back to forced-EOS", vad_backend, e)
             vad_session = None
 
     if use_backend_stream:
@@ -655,9 +675,14 @@ async def _asr_stream_backend(
                         "reset": True,
                     })
                     logger.debug("ASR stream reset by client command (backend=%s)", asr_be.name)
-                elif cmd.get("command") == "end_utterance":
+                elif cmd.get("command") == "end_utterance" or (cmd.get("type") or "").lower() == "eou":
                     _loop = asyncio.get_event_loop()
-                    final_text = await _loop.run_in_executor(_get_asr_executor(), stream.force_endpoint)
+                    force_endpoint = getattr(stream, "force_endpoint", None)
+                    if force_endpoint is not None:
+                        final_text = await _loop.run_in_executor(_get_asr_executor(), force_endpoint)
+                    else:
+                        await _loop.run_in_executor(_get_asr_executor(), stream.prepare_finalize)
+                        final_text = await _loop.run_in_executor(_get_asr_executor(), stream.finalize)
                     await ws.send_json({
                         "type": "final",
                         "text": final_text,
@@ -767,7 +792,7 @@ async def v2v_stream(ws: WebSocket):
         send {"type":"tts_flush"}; await binary chunks + tts_done
 
       ASR-only (mic → text, with auto VAD endpoint):
-        send {"type":"config", "asr_language":"zh", "vad":"silero"}
+        send {"type":"config", "asr_language":"zh"}
         send PCM binary chunks
         await asr_partial / asr_endpoint / asr_final
 
@@ -814,8 +839,8 @@ async def v2v_stream(ws: WebSocket):
     tts_voice       = cfg.get("tts_voice")
     tts_speed       = cfg.get("tts_speed")
     sample_rate     = int(cfg.get("sample_rate", 16000))
-    vad_backend     = cfg.get("vad", "silero" if asr_language else "none")
-    vad_silence_ms  = int(cfg.get("vad_silence_ms", 500))
+    vad_backend     = cfg.get("vad", _default_vad_backend() if asr_language else "none")
+    vad_silence_ms  = int(cfg.get("vad_silence_ms", _default_vad_silence_ms()))
     multi_utterance = bool(cfg.get("multi_utterance", False))
 
     if not asr_language and not tts_language:

@@ -4,7 +4,7 @@ Single source of truth for perf timing. Every runner uses these — keeps
 timestamp semantics consistent across asr/tts/v2v/concurrent.
 """
 from __future__ import annotations
-import io, json, time, wave
+import io, json, time, urllib.parse, wave
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -71,6 +71,7 @@ class ASRResult:
                                        # eos_to_final_ms / audio_dur. This is the
                                        # cross-device-comparable number — independent
                                        # of how the client paces chunks.
+    eos_mode: str = "vad"
 
     @property
     def as_dict(self) -> dict:
@@ -102,12 +103,15 @@ class TTSResult:
 class ASRClient:
     def __init__(self, base_url: str, ws_url: str | None = None,
                  chunk_ms: int = 250, realtime: bool = True,
-                 timeout: int = 120):
+                 timeout: int = 120, vad_backend: str | None = "silero",
+                 vad_silence_ms: int = 400):
         self.base_url = base_url.rstrip("/")
         self.ws_url = (ws_url or base_url).replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
         self.chunk_ms = chunk_ms
         self.realtime = realtime
         self.timeout = timeout
+        self.vad_backend = vad_backend
+        self.vad_silence_ms = vad_silence_ms
 
     # ----- offline POST /asr -----
     def transcribe_offline(self, wav_bytes: bytes, language: str = "Chinese") -> ASRResult:
@@ -129,19 +133,25 @@ class ASRClient:
 
     # ----- streaming WS /asr/stream -----
     def transcribe_streaming(self, wav_bytes: bytes, language: str = "Chinese",
-                             eos_mode: str = "forced") -> ASRResult:
+                             eos_mode: str = "vad") -> ASRResult:
         """
         eos_mode:
           - "forced": send b"" after last PCM chunk (immediate finalize)
-          - "vad":    don't send b""; let server VAD trigger finalize (more realistic)
+          - "vad":    don't send b""; let server/backend VAD trigger finalize
+          - "eou":    send {"type":"eou"} after last PCM chunk (dialogue-manager EOU)
         """
-        assert eos_mode in ("forced", "vad")
+        assert eos_mode in ("forced", "vad", "eou")
         chunks, sr = wav_to_pcm_chunks(wav_bytes, self.chunk_ms)
         dur = wav_duration_s(wav_bytes)
         chunk_dur = self.chunk_ms / 1000.0
+        query = {"language": language, "sample_rate": str(sr)}
+        if eos_mode == "vad" and self.vad_backend:
+            query["vad"] = self.vad_backend
+            query["vad_silence_ms"] = str(self.vad_silence_ms)
+        qs = urllib.parse.urlencode(query)
 
         ws = websocket.create_connection(
-            f"{self.ws_url}/asr/stream?language={language}&sample_rate={sr}",
+            f"{self.ws_url}/asr/stream?{qs}",
             timeout=self.timeout,
         )
         t_first_send = time.monotonic()
@@ -169,12 +179,41 @@ class ASRClient:
                 time.sleep(chunk_dur)
         ws.settimeout(self.timeout)
 
+        final_text = ""
+        final_received = False
         t_eos = time.monotonic()
         if eos_mode == "forced":
             ws.send_binary(b"")
+        elif eos_mode == "eou":
+            ws.send(json.dumps({"type": "eou"}))
+        elif eos_mode == "vad":
+            # File replay has no microphone tail. Send enough trailing silence
+            # for server-side VAD to observe the configured hangover while
+            # keeping t_eos anchored at the end of the speech file.
+            silence_ms = max(self.vad_silence_ms + self.chunk_ms, self.chunk_ms)
+            silence_chunks = int(np.ceil(silence_ms / self.chunk_ms))
+            frames_per_chunk = int(sr * self.chunk_ms / 1000)
+            silence = np.zeros(frames_per_chunk, dtype=np.int16).tobytes()
+            ws.settimeout(0.001)
+            for _ in range(silence_chunks):
+                ws.send_binary(silence)
+                try:
+                    msg = ws.recv()
+                    data = json.loads(msg)
+                    text_str = _coerce_text(data.get("text", ""))
+                    if t_first_partial is None and text_str:
+                        t_first_partial = time.monotonic()
+                    if data.get("type") == "final" or data.get("is_final") is True:
+                        final_text = text_str.strip()
+                        final_received = True
+                        break
+                except websocket.WebSocketTimeoutException:
+                    pass
+                if self.realtime:
+                    time.sleep(chunk_dur)
+            ws.settimeout(self.timeout)
 
-        final_text = ""
-        while True:
+        while not final_received:
             raw = ws.recv()
             if not raw:
                 # Server closed without a frame. Older servers do this on
@@ -187,8 +226,9 @@ class ASRClient:
             text_str = _coerce_text(text_field)
             if t_first_partial is None and text_str:
                 t_first_partial = time.monotonic()
-            if data.get("type") == "final":
+            if data.get("type") == "final" or data.get("is_final") is True:
                 final_text = text_str.strip()
+                final_received = True
                 break
             final_text = text_str.strip()
         t_final = time.monotonic()
@@ -203,6 +243,7 @@ class ASRClient:
             eos_to_final_ms=eos_to_final_ms,
             rtf=((t_final - t_first_send) * 1000) / (dur * 1000) if dur else 0.0,
             finalize_rtf=eos_to_final_ms / (dur * 1000) if dur else None,
+            eos_mode=eos_mode,
         )
 
 
@@ -282,7 +323,7 @@ class V2VResult:
 
 def run_v2v(asr: ASRClient, tts: TTSClient, wav_bytes: bytes,
             language_asr: str = "Chinese", language_tts: str = "zh",
-            eos_mode: str = "forced", llm_delay_ms: float = 0.0) -> V2VResult:
+            eos_mode: str = "vad", llm_delay_ms: float = 0.0) -> V2VResult:
     """End-to-end voice-to-voice. LLM stage is a sleep placeholder."""
     asr_res = asr.transcribe_streaming(wav_bytes, language_asr, eos_mode)
     t_after_asr = time.monotonic()

@@ -27,10 +27,12 @@ services:
       - LANGUAGE_MODE=${LANGUAGE_MODE:-zh_en}
       - SEEED_LOCAL_VOICE_PROFILE=${SEEED_LOCAL_VOICE_PROFILE:-}
       - SEEED_LOCAL_VOICE_PROFILE_JSON=${SEEED_LOCAL_VOICE_PROFILE_JSON:-}
+      # Open-dialogue endpointing defaults. Override in .env for product tuning.
+      - SEEED_LOCAL_VOICE_VAD_BACKEND=${SEEED_LOCAL_VOICE_VAD_BACKEND:-silero}
+      - SEEED_LOCAL_VOICE_VAD_SILENCE_MS=${SEEED_LOCAL_VOICE_VAD_SILENCE_MS:-400}
       # Manifest + deploy script live in the sibling qwen3-edgellm-jetson repo.
-      # Mount that repo into the container (e.g. -v ~/project/qwen3-edgellm-jetson:/opt/qej:ro)
-      # and set QWEN3_EDGELLM_JETSON_ROOT=/opt/qej; QWEN3_ARTIFACT_MANIFEST then resolves
-      # via QWEN3_EDGELLM_JETSON_ROOT + /deploy/artifacts/qwen3_manifest.json.
+      # The high-performance Qwen3 ASR streaming worker also needs the
+      # deploy/audio_preprocessing assets from that repo.
       - QWEN3_EDGELLM_JETSON_ROOT=${QWEN3_EDGELLM_JETSON_ROOT:-/opt/qwen3-edgellm-jetson}
       - QWEN3_ARTIFACT_MANIFEST=${QWEN3_ARTIFACT_MANIFEST:-}
       - QWEN3_ARTIFACT_SET=${QWEN3_ARTIFACT_SET:-}
@@ -47,6 +49,18 @@ services:
       - ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
     volumes:
       - speech-models:/opt/models
+      - type: bind
+        source: ${QWEN3_EDGELLM_JETSON_HOST_ROOT:-../../qwen3-edgellm-jetson}
+        target: ${QWEN3_EDGELLM_JETSON_ROOT:-/opt/qwen3-edgellm-jetson}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${QWEN3_VOICE_WORKER_HOST_DIR:-../../qwen3-edgellm-jetson/native/edgellm_voice_worker/build}
+        target: /opt/jv-workers
+        read_only: true
+        bind:
+          create_host_path: false
     restart: unless-stopped
     deploy:
       resources:

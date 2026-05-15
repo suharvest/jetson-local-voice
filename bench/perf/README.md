@@ -81,6 +81,11 @@ python bench/perf/perf.py noise --snr 20 10 5 0 --noise-type babble
 python bench/perf/perf.py stability --duration-min 30 --container seeed-nano-v111
 ```
 
+Default benchmark endpointing matches open-dialogue deployment:
+`--eos vad --vad-backend silero --vad-silence-ms 400`. Tune the silence
+threshold per run with `--vad-silence-ms`, or in service deployment with
+`SEEED_LOCAL_VOICE_VAD_SILENCE_MS`.
+
 ## Two test modes (important!)
 
 The same metrics carry **very different meaning** depending on where the

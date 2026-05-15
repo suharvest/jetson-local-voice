@@ -9,12 +9,21 @@ is a `config` that decides which features light up:
 | `tts_language` set | TTS is enabled. Client may send `text` JSON frames; server emits PCM binary chunks + `tts_started` / `tts_sentence_done` / `tts_done` JSON. |
 | Both set | Full V2V duplex. Binary in both directions: client → ASR input, server → TTS output. |
 | `vad` | Server-side VAD backend (default `silero` if ASR enabled, `none` otherwise). |
-| `vad_silence_ms` | How long silence to trigger auto `asr_endpoint`. Default 500 ms. |
+| `vad_silence_ms` | How long silence to trigger auto `asr_endpoint`. Default is `SEEED_LOCAL_VOICE_VAD_SILENCE_MS` or 400 ms. |
 | `multi_utterance` | If `true`, the session stays open across utterances; each VAD/backend endpoint emits a mid-session `asr_final` with `session_complete: false` and the loop keeps listening. Default `false` (single-utterance, current behaviour). |
 
 Existing `/asr/stream` and `/tts/stream` endpoints stay unchanged for
 backward compatibility. The new endpoint adds capability without
 breaking anything.
+
+Deployment defaults:
+
+```bash
+SEEED_LOCAL_VOICE_VAD_BACKEND=silero
+SEEED_LOCAL_VOICE_VAD_SILENCE_MS=400
+```
+
+Clients can still override per connection with `vad` and `vad_silence_ms`.
 
 ## Protocol
 
@@ -28,7 +37,7 @@ breaking anything.
  "tts_speed":1.0,              // optional; some backends only
  "sample_rate":16000,          // PCM sample rate
  "vad":"silero",               // "silero" | "webrtcvad" | "none"
- "vad_silence_ms":500,
+ "vad_silence_ms":400,
  "multi_utterance":false}      // see "End-of-utterance semantics" below
 
 {"type":"text", "text":"<incremental text chunk>"}
@@ -146,7 +155,7 @@ async def v2v_session(transcribe_partial_cb, llm_token_stream):
             "asr_language": "Chinese",
             "tts_language": "zh",
             "vad": "silero",
-            "vad_silence_ms": 500,
+            "vad_silence_ms": 400,
         }))
 
         sample_rate = None        # parsed from first binary frame

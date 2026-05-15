@@ -10,7 +10,7 @@
   - Added 1.0s left-context ring buffer for encoder
   - Added rolling encoder output buffer (5s) for decoder prefill
   - Partial decode: 12 tokens per chunk (was 4)
-  - VAD endpoint detection: webrtcvad, 500ms silence + 1.0s utterance
+  - VAD endpoint detection: silero, 400ms silence + 1.0s utterance
   - Token-level boundary dedup (max 12 overlap)
   - return token IDs from decode, not text strings
 - `app/main.py`: Added `end_utterance` WS command

@@ -157,7 +157,7 @@ def _iter_loop(items: list, warmup: int, runs: int):
 
 def run_asr(asr: ASRClient, corpus: list[dict],
             warmup: int = 3, runs: int = 10,
-            mode: str = "streaming", eos_mode: str = "forced") -> list[dict]:
+            mode: str = "streaming", eos_mode: str = "vad") -> list[dict]:
     """mode: 'offline' (POST /asr) or 'streaming' (WS /asr/stream)."""
     assert mode in ("offline", "streaming")
     records: list[dict] = []
@@ -213,7 +213,7 @@ def run_tts(tts: TTSClient, prompts: list[dict],
 
 def run_v2v_bench(asr: ASRClient, tts: TTSClient, corpus: list[dict],
                   warmup: int = 3, runs: int = 10,
-                  eos_mode: str = "forced", llm_delay_ms: float = 0.0) -> list[dict]:
+                  eos_mode: str = "vad", llm_delay_ms: float = 0.0) -> list[dict]:
     records: list[dict] = []
     for label, entry, k in _iter_loop(corpus, warmup, runs):
         lang_map = {"zh": "Chinese", "en": "English"}

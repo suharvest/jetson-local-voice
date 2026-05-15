@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import base64
 import subprocess
 import tempfile
 import threading
@@ -109,6 +110,36 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                     str(manifest.get("max_mel_frames", 6000)),
                 )
             ),
+            "stream_mode": os.environ.get(
+                "EDGE_LLM_ASR_STREAM_MODE",
+                manifest.get("stream_mode", "accumulate"),
+            ).strip().lower(),
+            "stream_chunk_sec": float(
+                os.environ.get(
+                    "EDGE_LLM_ASR_STREAM_CHUNK_SEC",
+                    str(manifest.get("stream_chunk_sec", 0.5)),
+                )
+            ),
+            "stream_unfixed_chunks": int(
+                os.environ.get(
+                    "EDGE_LLM_ASR_STREAM_UNFIXED_CHUNKS",
+                    str(manifest.get("stream_unfixed_chunks", 2)),
+                )
+            ),
+            "stream_unfixed_tokens": int(
+                os.environ.get(
+                    "EDGE_LLM_ASR_STREAM_UNFIXED_TOKENS",
+                    str(manifest.get("stream_unfixed_tokens", 5)),
+                )
+            ),
+            "mel_settings_path": os.environ.get(
+                "EDGE_LLM_ASR_MEL_SETTINGS",
+                manifest.get("mel_settings_path", ""),
+            ),
+            "mel_filters_path": os.environ.get(
+                "EDGE_LLM_ASR_MEL_FILTERS",
+                manifest.get("mel_filters_path", ""),
+            ),
             "manifest_path": manifest_path,
         }
 
@@ -156,6 +187,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             raise FileNotFoundError(
                 "ASR preload failed — missing:\n  " + "\n  ".join(missing)
             )
+        self._require_streaming_worker_assets()
 
         logger.info(
             "ASR backend preload OK (config=%s)",
@@ -228,6 +260,30 @@ class TRTEdgeLLMASRBackend(ASRBackend):
     def _use_worker(self) -> bool:
         return bool(self._config["use_worker"])
 
+    def _use_streaming_worker(self) -> bool:
+        return self._config.get("stream_mode") in (
+            "worker", "stream", "streaming", "chunk_confirm", "prefix"
+        )
+
+    def _require_streaming_worker_assets(self) -> None:
+        if not self._use_streaming_worker():
+            return
+        missing = []
+        if not self._use_worker():
+            missing.append("EDGE_LLM_ASR_WORKER=1 is required for streaming worker mode")
+        for key, label in (
+            ("mel_settings_path", "EDGE_LLM_ASR_MEL_SETTINGS"),
+            ("mel_filters_path", "EDGE_LLM_ASR_MEL_FILTERS"),
+        ):
+            path = self._config.get(key) or ""
+            if not path or not os.path.exists(path):
+                missing.append(f"{label}: {path or '(unset)'}")
+        if missing:
+            raise FileNotFoundError(
+                "EDGE_LLM_ASR_STREAM_MODE=worker requires PCM mel assets:\n  "
+                + "\n  ".join(missing)
+            )
+
     def _worker_env(self) -> dict:
         env = os.environ.copy()
         env["EDGELLM_PLUGIN_PATH"] = self._config["plugin_path"]
@@ -258,6 +314,10 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             "--multimodalEngineDir",
             self._config["audio_encoder_dir"],
         ]
+        mel_settings = self._config.get("mel_settings_path") or ""
+        mel_filters = self._config.get("mel_filters_path") or ""
+        if mel_settings and mel_filters:
+            cmd += ["--melSettings", mel_settings, "--melFilters", mel_filters]
         self._worker = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -283,6 +343,22 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         if ready.get("event") != "ready":
             raise RuntimeError(f"ASR worker did not become ready: {ready}")
         self._worker_ready_meta = ready
+
+    def _worker_request(self, input_data: dict) -> dict:
+        with self._worker_lock:
+            self._ensure_worker()
+            assert self._worker is not None and self._worker.stdin is not None and self._worker.stdout is not None
+            self._worker.stdin.write(json.dumps(input_data, ensure_ascii=False) + "\n")
+            self._worker.stdin.flush()
+            line = self._worker.stdout.readline()
+        if not line:
+            stderr = self._stderr_tail_text()
+            self._worker = None
+            raise RuntimeError(f"ASR worker exited before response: {stderr}")
+        output_data = json.loads(line)
+        if output_data.get("event") == "error" or output_data.get("ok") is False:
+            raise RuntimeError(f"ASR worker error: {output_data}")
+        return output_data
 
     @staticmethod
     def _strip_language_prefix(text: str) -> tuple[str, Optional[str]]:
@@ -509,6 +585,8 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         """
         if not self._ready:
             raise RuntimeError("ASR backend not preloaded")
+        if self._use_streaming_worker():
+            return _TRTEdgeLLMStreamingASRStream(self, language=language)
         return _TRTEdgeLLMAccumulatingASRStream(self, language=language)
 
 
@@ -625,3 +703,120 @@ class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
 
     def get_partial(self) -> tuple[str, bool]:
         return "", False
+
+
+class _TRTEdgeLLMStreamingASRStream(ASRStream):
+    """TRT-EdgeLLM qwen3_asr_worker streaming protocol adapter.
+
+    Enabled only with EDGE_LLM_ASR_STREAM_MODE=worker. The worker receives
+    cumulative float32 PCM via `pcm_b64` and emits partial/final JSON events.
+    """
+
+    def __init__(self, backend: TRTEdgeLLMASRBackend, language: str = "auto"):
+        self._backend = backend
+        self._language = language
+        self._session_id = uuid.uuid4().hex
+        self._sample_rate = 16000
+        self._hop_samples = max(
+            1, int(float(backend._config["stream_chunk_sec"]) * self._sample_rate)
+        )
+        self._audio_accum = np.zeros(0, dtype=np.float32)
+        self._samples_since_hop = 0
+        self._partial_text = ""
+        self._final_text = ""
+        self._cancelled = False
+        self._closed = False
+        self._begin()
+
+    def _begin(self) -> None:
+        ev = {
+            "event": "begin",
+            "id": self._session_id,
+            "sample_rate": self._sample_rate,
+            "chunk_size_sec": float(self._backend._config["stream_chunk_sec"]),
+            "unfixed_chunk_num": int(self._backend._config["stream_unfixed_chunks"]),
+            "unfixed_token_num": int(self._backend._config["stream_unfixed_tokens"]),
+            "context": "",
+        }
+        if self._language and self._language != "auto":
+            ev["force_language"] = self._language
+        resp = self._backend._worker_request(ev)
+        if resp.get("event") != "begin_ack":
+            raise RuntimeError(f"ASR streaming worker begin failed: {resp}")
+
+    def _send_chunk(self, *, last: bool) -> dict:
+        pcm = np.asarray(self._audio_accum, dtype="<f4")
+        pcm_b64 = base64.b64encode(pcm.tobytes()).decode("ascii")
+        resp = self._backend._worker_request({
+            "event": "chunk",
+            "id": self._session_id,
+            "pcm_b64": pcm_b64,
+            "audio_sec": len(self._audio_accum) / self._sample_rate,
+            "last": last,
+        })
+        event = resp.get("event")
+        if event == "segment_rotation":
+            carry_samples = int(float(resp.get("carryover_sec", 1.0)) * self._sample_rate)
+            if carry_samples > 0 and len(self._audio_accum) > carry_samples:
+                self._audio_accum = self._audio_accum[-carry_samples:].copy()
+            return resp
+        if event == "partial":
+            self._partial_text = self._backend._strip_language_prefix(
+                resp.get("text", "") or ""
+            )[0].strip()
+            return resp
+        if event == "final":
+            self._final_text = self._backend._strip_language_prefix(
+                resp.get("text", "") or ""
+            )[0].strip()
+            self._closed = True
+            return resp
+        raise RuntimeError(f"unexpected ASR streaming worker event: {resp}")
+
+    def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
+        if self._cancelled or self._closed:
+            return
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
+        if sample_rate != self._sample_rate:
+            ratio = self._sample_rate / sample_rate
+            new_len = int(len(samples) * ratio)
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, new_len),
+                np.arange(len(samples)),
+                samples,
+            ).astype(np.float32)
+        self._audio_accum = np.concatenate([self._audio_accum, samples])
+        self._samples_since_hop += len(samples)
+        while self._samples_since_hop >= self._hop_samples:
+            self._send_chunk(last=False)
+            self._samples_since_hop -= self._hop_samples
+
+    def prepare_finalize(self) -> None:
+        # The worker closes the session on the final chunk, so finalize() owns
+        # the last=true event and returns the final text.
+        pass
+
+    def finalize(self) -> str:
+        if self._cancelled or self._closed:
+            return self._final_text
+        if len(self._audio_accum) == 0:
+            self._backend._worker_request({"event": "end", "id": self._session_id})
+            self._closed = True
+            return ""
+        self._send_chunk(last=True)
+        return self._final_text
+
+    def cancel_and_finalize(self) -> None:
+        self._final_text = self._partial_text
+        self._cancelled = True
+        try:
+            self._backend._worker_request({"event": "end", "id": self._session_id})
+        except Exception:
+            pass
+        self._closed = True
+
+    def get_partial(self) -> tuple[str, bool]:
+        if self._closed:
+            return self._final_text, True
+        return self._partial_text, False
