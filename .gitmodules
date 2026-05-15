@@ -1,3 +1,6 @@
 [submodule "third_party/rkvoice-stream"]
 	path = third_party/rkvoice-stream
 	url = https://github.com/suharvest/rkvoice-stream.git
+[submodule "third_party/qwen3-edgellm-jetson"]
+	path = third_party/qwen3-edgellm-jetson
+	url = https://github.com/suharvest/qwen3-edgellm-jetson.git
