@@ -79,6 +79,7 @@ class BaseApp:
         self._shutdown_evt: asyncio.Event | None = None
         self._mic_task: asyncio.Task | None = None
         self._dispatch_task: asyncio.Task | None = None
+        self._llm_turn_task: asyncio.Task | None = None
         self._first_tts_seen = False
 
     # ── public API ──────────────────────────────────────────────────
@@ -120,6 +121,13 @@ class BaseApp:
             await self.shutdown()
 
     async def shutdown(self) -> None:
+        # 0. cancel any in-flight LLM turn
+        if self._llm_turn_task is not None and not self._llm_turn_task.done():
+            self._llm_turn_task.cancel()
+            try:
+                await self._llm_turn_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # 1. stop mic capture
         if self._mic_task is not None:
             self._mic_task.cancel()
@@ -202,12 +210,18 @@ class BaseApp:
             if evt.duplicate_of_streamed:
                 return
             await self._broadcast("on_user_utterance", evt.text)
-            try:
-                await self.on_user_utterance(evt.text)
-            except NotImplementedError:
-                logger.error("BaseApp.on_user_utterance not overridden -- text dropped")
-            except Exception:
-                logger.exception("on_user_utterance failed")
+            # Spawn the LLM turn as a tracked task so the dispatch loop
+            # stays free to handle queued TTSAudio (playback) and
+            # ASRPartial (barge-in) while the model streams.
+            if self._llm_turn_task is not None and not self._llm_turn_task.done():
+                self._llm_turn_task.cancel()
+                try:
+                    await self._llm_turn_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._llm_turn_task = asyncio.create_task(
+                self._run_user_utterance(evt.text), name="llm-turn"
+            )
             return
 
         if isinstance(evt, TTSStarted):
@@ -232,6 +246,17 @@ class BaseApp:
         if isinstance(evt, SLVError):
             await self._broadcast("on_error", RuntimeError(evt.message))
             return
+
+    async def _run_user_utterance(self, text: str) -> None:
+        """Wrap on_user_utterance so a crashing LLM turn doesn't kill the task silently."""
+        try:
+            await self.on_user_utterance(text)
+        except NotImplementedError:
+            logger.error("BaseApp.on_user_utterance not overridden -- text dropped")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("on_user_utterance failed")
 
     async def _broadcast(self, hook_name: str, *args) -> None:
         if not self.plugins:
