@@ -16,3 +16,7 @@ class LLMBackend(ABC):
         if False:  # pragma: no cover
             yield ""
         raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Release any held network/transport resources. Default: no-op."""
+        return None

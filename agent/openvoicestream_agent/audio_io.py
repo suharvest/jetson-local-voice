@@ -68,9 +68,11 @@ class AudioIO:
             buf = bytes(indata)
             try:
                 assert self._loop is not None and self._in_queue is not None
-                self._loop.call_soon_threadsafe(self._in_queue.put_nowait, buf)
-            except asyncio.QueueFull:
-                logger.warning("mic queue full -- dropping chunk")
+                # IMPORTANT: schedule _safe_put on the loop thread, not
+                # put_nowait directly -- QueueFull would otherwise be
+                # raised on the loop thread where this try/except cannot
+                # catch it.
+                self._loop.call_soon_threadsafe(self._safe_put, buf)
             except Exception as e:  # pragma: no cover
                 logger.warning("mic cb error: %s", e)
 
@@ -90,6 +92,15 @@ class AudioIO:
                 yield chunk
         finally:
             self._stop_input_stream()
+
+    def _safe_put(self, data: bytes) -> None:
+        """Runs on the asyncio loop thread; drops the chunk if the queue is full."""
+        if self._in_queue is None:
+            return
+        try:
+            self._in_queue.put_nowait(data)
+        except asyncio.QueueFull:
+            logger.warning("mic queue full -- dropping chunk")
 
     def _stop_input_stream(self) -> None:
         if self._input_stream is not None:

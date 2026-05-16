@@ -13,15 +13,25 @@ class DialogueApp(BaseApp):
             return
         self.session.add_user(text)
         chunks: list[str] = []
-        async for token in self.llm.stream(
-            self.session.messages(self.config.system_prompt),
-            session=self.session,
-        ):
-            chunks.append(token)
-            self.events.emit("assistant_token", token)
-            await self.slv.send_text(token)
-        await self.slv.flush_tts()
-        self.session.add_assistant("".join(chunks))
+        try:
+            async for token in self.llm.stream(
+                self.session.messages(self.config.system_prompt),
+                session=self.session,
+            ):
+                chunks.append(token)
+                self.events.emit("assistant_token", token)
+                await self.broadcast("on_assistant_token", token)
+                await self.slv.send_text(token)
+        finally:
+            # Always flush so SLV stops the TTS pipeline cleanly even if
+            # the LLM stream raised mid-turn, and persist whatever tokens
+            # we did receive so the conversation stays consistent.
+            try:
+                await self.slv.flush_tts()
+            except Exception:  # pragma: no cover - best effort
+                pass
+            if chunks:
+                self.session.add_assistant("".join(chunks))
 
 
 __all__ = ["DialogueApp"]

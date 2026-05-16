@@ -105,6 +105,9 @@ class SLVClient:
         self._queue: asyncio.Queue[V2VEvent] = asyncio.Queue()
         self._tts_sample_rate: int | None = None
         self._closed = False
+        # Set when reader exits for any reason; events() uses this to
+        # break out of `await queue.get()` instead of hanging forever.
+        self._reader_done: asyncio.Event = asyncio.Event()
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -159,12 +162,33 @@ class SLVClient:
     # ── reader ──────────────────────────────────────────────────────
 
     async def events(self) -> AsyncIterator[V2VEvent]:
-        while not self._closed:
-            try:
-                evt = await self._queue.get()
-            except asyncio.CancelledError:
+        while True:
+            # Drain anything already queued first so SLVError emitted on
+            # reader exit is still surfaced to the consumer.
+            if not self._queue.empty():
+                yield self._queue.get_nowait()
+                continue
+            if self._reader_done.is_set() or self._closed:
                 return
-            yield evt
+            get_task = asyncio.create_task(self._queue.get())
+            done_task = asyncio.create_task(self._reader_done.wait())
+            try:
+                done, pending = await asyncio.wait(
+                    {get_task, done_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                get_task.cancel()
+                done_task.cancel()
+                raise
+            for t in pending:
+                t.cancel()
+            if get_task in done:
+                yield get_task.result()
+            else:
+                # Reader finished; flush any final items it pushed.
+                while not self._queue.empty():
+                    yield self._queue.get_nowait()
+                return
 
     async def _reader_loop(self) -> None:
         assert self._ws is not None
@@ -182,6 +206,9 @@ class SLVClient:
         except Exception as e:  # pragma: no cover - defensive
             logger.exception("SLV reader crashed")
             await self._queue.put(SLVError(str(e)))
+        finally:
+            # Wake any consumer blocked on events().
+            self._reader_done.set()
 
     async def _handle_binary(self, data: bytes) -> None:
         if self._tts_sample_rate is None:

@@ -164,6 +164,11 @@ class BaseApp:
             await self.audio.close()
         except Exception:  # pragma: no cover
             pass
+        # 7. release LLM client resources (HTTP connection pool, etc.)
+        try:
+            await self.llm.aclose()
+        except Exception:  # pragma: no cover
+            pass
 
     def request_shutdown(self) -> None:
         if self._shutdown_evt is not None:
@@ -258,17 +263,27 @@ class BaseApp:
         except Exception:
             logger.exception("on_user_utterance failed")
 
-    async def _broadcast(self, hook_name: str, *args) -> None:
-        if not self.plugins:
+    async def broadcast(self, hook_name: str, *args) -> None:
+        """Public hook broadcaster -- call from subclasses to fan out events.
+
+        Used by DialogueApp.on_user_utterance to fan out per-token deltas
+        (`on_assistant_token`) since the dispatch loop has no access to
+        the LLM's token stream.
+        """
+        plugins = getattr(self, "plugins", None)
+        if not plugins:
             return
         coros = []
-        for p in self.plugins:
+        for p in plugins:
             fn = getattr(p, hook_name, None)
             if fn is None:
                 continue
             coros.append(_safe_call(p.name, hook_name, fn, *args))
         if coros:
             await asyncio.gather(*coros, return_exceptions=True)
+
+    # Backwards-compatible alias used internally by the dispatch loop.
+    _broadcast = broadcast
 
 
 async def _safe_call(plugin_name: str, hook: str, fn, *args) -> None:  # noqa: ANN001

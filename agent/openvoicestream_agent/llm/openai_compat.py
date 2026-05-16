@@ -45,3 +45,9 @@ class OpenAICompatBackend(LLMBackend):
                 delta = None
             if delta:
                 yield delta
+
+    async def aclose(self) -> None:
+        try:
+            await self.client.close()
+        except Exception:  # pragma: no cover - best effort
+            pass
