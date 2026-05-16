@@ -50,13 +50,13 @@ services:
     volumes:
       - speech-models:/opt/models
       - type: bind
-        source: ${QWEN3_EDGELLM_JETSON_HOST_ROOT:-../../qwen3-edgellm-jetson}
+        source: ${QWEN3_EDGELLM_JETSON_HOST_ROOT:-../third_party/qwen3-edgellm-jetson}
         target: ${QWEN3_EDGELLM_JETSON_ROOT:-/opt/qwen3-edgellm-jetson}
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${QWEN3_VOICE_WORKER_HOST_DIR:-../../qwen3-edgellm-jetson/native/edgellm_voice_worker/build}
+        source: ${QWEN3_VOICE_WORKER_HOST_DIR:-../third_party/qwen3-edgellm-jetson/native/edgellm_voice_worker/build}
         target: /opt/jv-workers
         read_only: true
         bind:
