@@ -446,6 +446,14 @@ class BaseApp:
             preroll_max = max(1, 400 // max(chunk_ms, 1))  # ~400ms
             preroll: deque[bytes] = deque(maxlen=preroll_max)
             import numpy as _np
+            # Rate-limit on_mic_rms broadcast: 10Hz is overkill for a
+            # dashboard sparkline, and awaiting every plugin every 100ms
+            # was starving the mic queue during TTS playback — VAD never
+            # saw the burst of audio when the user spoke, so barge-in
+            # never fired. Broadcast at most every ~200ms (every 2nd
+            # chunk at chunk_ms=100, every 4th at chunk_ms=50).
+            rms_broadcast_every = max(1, 200 // max(chunk_ms, 1))
+            rms_chunk_counter = 0
             async for chunk in self.audio.start_capture():
                 # pipeline_mode gating: drop audio entirely while SLEEPING.
                 # WS stays connected so wake-time reconnect cost is zero.
@@ -454,21 +462,24 @@ class BaseApp:
                     # into the next wake's first utterance.
                     preroll.clear()
                     continue
-                # Per-chunk mic RMS for the dashboard. Cheap; only broadcast
-                # when there are plugins listening. Errors swallowed.
-                try:
-                    arr = _np.frombuffer(chunk, dtype=_np.int16)
-                    if arr.size:
-                        rms = float(_np.sqrt(_np.mean((arr.astype(_np.float32) / 32768.0) ** 2)))
-                    else:
-                        rms = 0.0
-                    thr = float(getattr(self.config, "client_vad_threshold", None) or 0.012)
-                    await self._broadcast(
-                        "on_mic_rms",
-                        {"rms": rms, "threshold": thr, "state": self._vad_state},
-                    )
-                except Exception:  # pragma: no cover - defensive
-                    pass
+                # Per-chunk mic RMS for the dashboard. Rate-limited so a
+                # slow WS client doesn't backpressure the mic queue and
+                # starve VAD (which kills barge-in detection during TTS).
+                rms_chunk_counter = (rms_chunk_counter + 1) % rms_broadcast_every
+                if rms_chunk_counter == 0:
+                    try:
+                        arr = _np.frombuffer(chunk, dtype=_np.int16)
+                        if arr.size:
+                            rms = float(_np.sqrt(_np.mean((arr.astype(_np.float32) / 32768.0) ** 2)))
+                        else:
+                            rms = 0.0
+                        thr = float(getattr(self.config, "client_vad_threshold", None) or 0.012)
+                        await self._broadcast(
+                            "on_mic_rms",
+                            {"rms": rms, "threshold": thr, "state": self._vad_state},
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
 
                 if self._client_vad is None:
                     # No VAD configured: stream everything (legacy behaviour).
