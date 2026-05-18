@@ -130,6 +130,14 @@ class LLMAvailabilityPlugin(Plugin):
         return bool(getattr(self.app.config, "llm_availability_enabled", True))
 
     async def start(self) -> None:
+        # Idempotent: double-start would otherwise leak a second probe
+        # task that races the first (and double-fires breaker reports).
+        if self._task is not None and not self._task.done():
+            logger.warning(
+                "LLMAvailabilityPlugin.start() called while probe task "
+                "still running; ignoring duplicate start"
+            )
+            return
         await super().start()
         self._stopped = False
         self._wake_evt = asyncio.Event()
@@ -185,6 +193,26 @@ class LLMAvailabilityPlugin(Plugin):
                         logger.warning("LLM probe: 200 but non-JSON body")
                         return False
                     return bool(data.get("choices"))
+                # 400 with a structured guard error means the request was
+                # rejected by an input-validation middleware (e.g. SLV's
+                # input_too_long guard with a low threshold). The LLM
+                # itself may be perfectly healthy — classify as unknown
+                # (None) rather than counting it as a failure, otherwise
+                # a strict guard would silently push the state machine
+                # toward DOWN.
+                if r.status_code == 400:
+                    try:
+                        body = r.json()
+                        code = (body.get("error") or {}).get("code") if isinstance(body, dict) else None
+                    except Exception:
+                        code = None
+                    if code in {"input_too_long", "invalid_request"}:
+                        logger.warning(
+                            "LLM probe rejected by guard (code=%s); "
+                            "treating as unknown (not LLM down)",
+                            code,
+                        )
+                        return None
                 logger.warning("LLM probe: HTTP %s", r.status_code)
                 return False
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
