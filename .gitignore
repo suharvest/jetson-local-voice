@@ -25,61 +25,20 @@ Thumbs.db
 # Git worktrees
 .worktrees/
 
-# Wheels (binary, managed separately)
-wheels/
-
 # Runtime bundles copied from device builds or release artifacts.
 deploy/jetson-workers/
 deploy/rk-runtime/
 
-# MTE binary weights and reference data (too large for git)
-rk3576/mte/weights/
-rk3576/mte/reference/
-
-# Synced models (large files)
-models/qwen3-tts/
-models/qwen3-asr-v2/
-
-# Benchmark build artifacts (deployed separately to Jetson)
-benchmark/cpp/*.so
-benchmark/cpp/build*/
-benchmark/cpp/prebuilt/
-archive/**/*.so
-archive/**/prebuilt/
-
-# Local archive outputs; tracked archive sources/docs remain tracked.
-archive/**/*.wav
-archive/**/*.json
-archive/2026-05/qwen3tts*/
-
-# Local experiment scratch (calibration, v2v, results) — ignore everything
-# under bench/ EXCEPT the perf harness, which is tracked.
-bench/*
-!bench/perf/
-logs/
-
-# Inside bench/perf/: track code + manifest, ignore generated artifacts.
+# Generated performance artifacts
 bench/perf/__pycache__/
 bench/perf/results/
 bench/perf/corpus/short/*.wav
 bench/perf/corpus/long/*.wav
 bench/perf/corpus/multilingual/**/*.wav
 
-# Internal handover / planning notes (not for repo)
-docs/plans/
-docs/superpowers/
-
 # Large ASR eval datasets (download on demand)
 tests/asr_real_wav_eval/dev-clean.tar.gz
 tests/asr_real_wav_eval/librispeech/
-
-# RK3576 large binaries / dumps (to be removed in seeed-voice refactor Step 4)
-rk3576/engine/
-rk3576/*.so
-rk3576/scripts/*.wav
-rk3576/scripts/*.npz
-rk3576/
-tools/
 
 # TRT engine files (binary, built per-device)
 artifacts/engines/

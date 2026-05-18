@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="media/hero.png" alt="OpenVoiceStream - streaming ASR and TTS for edge dialogue" width="760" />
+  <img src="docs/media/hero.png" alt="OpenVoiceStream - streaming ASR and TTS for edge dialogue" width="760" />
 </p>
 
 OpenVoiceStream is a local voice stack for products that need real-time ASR and TTS on edge hardware. It runs fully on-device, avoids heavyweight ML frameworks in the hot path, and keeps the client API stable while you switch between sherpa-onnx, TensorRT-EdgeLLM, RKNN, and CPU ONNX backends.
@@ -25,7 +25,7 @@ with low-cost real-time voice I/O, then move up to human-like speech or a fully
 local voice + LLM loop without changing the client API.
 
 <p align="center">
-  <img src="media/solution-lineup.png" alt="OpenVoiceStream solution lineup: recommended hardware paths for real-time voice I/O, production edge voice, human-like local speech, and voice plus local LLM" width="900" />
+  <img src="docs/media/solution-lineup.png" alt="OpenVoiceStream solution lineup: recommended hardware paths for real-time voice I/O, production edge voice, human-like local speech, and voice plus local LLM" width="900" />
 </p>
 
 Board prices vary by region and kit contents. The point is the order of
@@ -323,16 +323,14 @@ available; the unused research models are kept as historical context.
 | CosyVoice3 | Research only | Not shipped | Historical ~800 ms TTFT | Higher quality, too heavy for this release. |
 | F5-TTS | Research only | Not shipped | Historical ~2.5 s TTFT | Not suitable for low-latency edge dialogue. |
 
-Current streaming benchmark scripts live in `bench/perf/`. Historical Qwen3
-engine experiments and one-off TTS model comparisons are archived under
-`archive/2026-05/`.
+Current streaming benchmark scripts live in `bench/perf/`.
 
 ### Performance Tuning
 
 Run once after boot on Jetson to lock clocks to max:
 
 ```bash
-sudo ./setup-performance.sh
+sudo ./scripts/setup-performance.sh
 ```
 
 This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency scaling. Critical for consistent inference latency.
@@ -411,21 +409,25 @@ openvoicestream/
 │   ├── backends/            # Per-engine backends (sherpa / jetson / rk)
 │   ├── core/                # VAD, ASR/TTS contracts, streaming primitives
 │   └── model_downloader.py  # On-demand model download + voice patching
+├── agent/                   # LLM voice agent (session, plugin system, audio I/O)
 ├── voices/                  # Custom voice embeddings (auto-patched into model)
 ├── bench/                   # Streaming + V2V latency benchmarks (perf harness)
-├── archive/                 # Historical experiments and migration snapshots
 ├── patches/                 # Paraformer EOF truncation fix
-├── scripts/                 # Model download, ORT patching, engine build glue
+├── scripts/                 # Engine build, model download, diagnostics
+├── examples/                # API usage examples (TTS streaming, V2V client)
+├── tests/                   # Integration and E2E tests
 ├── deploy/
 │   ├── docker-compose.yml   # Production deploy (pre-built image)
+│   ├── artifacts/           # Deployment manifests
 │   └── docker/
 │       ├── Dockerfile.jetson  # Jetson Orin Nano/NX/AGX (zh_en or multilingual)
 │       ├── Dockerfile.rk      # Rockchip RK3576/RK3588 NPU
 │       └── Dockerfile.rpi     # Raspberry Pi 4/5 (CPU)
+├── configs/                 # Device profiles (Jetson, RK, RPi)
 ├── third_party/             # Submodules (independently maintained)
 │   ├── qwen3-edgellm-jetson # Qwen3 export + engine build for Jetson
 │   └── rkvoice-stream       # Rockchip NPU streaming voice runtime
-└── setup-performance.sh     # Jetson clock/power tuning
+└── docs/                    # Guides, runbooks, comparison reports
 ```
 
 Clone with `--recurse-submodules` to pull `third_party/*`, or run `git submodule update --init --recursive` after cloning.

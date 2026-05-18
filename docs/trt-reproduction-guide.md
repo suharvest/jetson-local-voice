@@ -22,9 +22,9 @@ TRT engine to the model directory:
 ```bash
 # On Jetson device
 mkdir -p /opt/models/paraformer-streaming/engines
-cp artifacts/engines/orin-nano/paraformer_encoder_dp4_400.plan \
+cp deploy/artifacts/engines/orin-nano/paraformer_encoder_dp4_400.plan \
    /opt/models/paraformer-streaming/engines/paraformer_encoder_dp4_400.plan
-cp artifacts/engines/orin-nano/paraformer_decoder_fp16.plan \
+cp deploy/artifacts/engines/orin-nano/paraformer_decoder_fp16.plan \
    /opt/models/paraformer-streaming/engines/paraformer_decoder_fp16.plan
 ```
 
@@ -181,5 +181,5 @@ Kept (lightweight):
 | `app/backends/jetson/matcha_trt.py` | Matcha TRT + ORT-CPU backend |
 | `deploy/docker/Dockerfile.jetson` | Slim Docker build |
 | `configs/profiles/jetson-zh-en.json` | zh_en deployment profile |
-| `artifacts/engines/orin-nano/` | Pre-built TRT engines |
-| `artifacts/onnx/` | Surgically-modified ONNX files |
+| `deploy/artifacts/engines/orin-nano/` | Pre-built TRT engines |
+| `deploy/artifacts/onnx/` | Surgically-modified ONNX files |

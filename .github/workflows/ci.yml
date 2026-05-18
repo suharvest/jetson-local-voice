@@ -44,7 +44,6 @@ jobs:
             app/backends/cpu/sherpa_asr.py \
             app/backends/jetson/matcha_trt.py \
             app/backends/rk/tts.py \
-            bench/product_eval.py \
             deploy/roundtrip_verify.py
 
       - name: Service unit tests

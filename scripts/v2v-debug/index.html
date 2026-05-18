@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>V2V Debug — OpenVoiceStream</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a22; --line:#252a36; --muted:#8b93a7;
+    --fg:#e6e9f2; --accent:#5dd6a3; --warn:#f7c948; --err:#f06a6a;
+    --partial:#9aa3b7;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  header{padding:14px 18px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:14px}
+  h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .pill{font-size:11px;padding:2px 8px;border:1px solid var(--line);
+    border-radius:99px;color:var(--muted)}
+  main{display:grid;grid-template-columns:340px 1fr;gap:0;height:calc(100% - 50px)}
+  aside{border-right:1px solid var(--line);padding:14px 16px;overflow:auto;background:var(--panel)}
+  section.work{padding:16px 22px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+  fieldset{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0 0 12px}
+  legend{padding:0 6px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  label{display:block;margin:6px 0 2px;color:var(--muted);font-size:12px}
+  input,select,textarea{width:100%;background:#0c0f15;color:var(--fg);
+    border:1px solid var(--line);border-radius:6px;padding:7px 9px;font:inherit;outline:none}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+  textarea{min-height:60px;resize:vertical}
+  .row{display:flex;gap:8px}
+  .row>*{flex:1}
+  .modes{display:flex;gap:6px;margin-bottom:6px}
+  .modes button{flex:1;background:#0c0f15;color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:7px;cursor:pointer;font:inherit}
+  .modes button.active{border-color:var(--accent);color:var(--accent)}
+  .bigbtn{font-size:15px;padding:14px;width:100%;border:none;border-radius:10px;
+    cursor:pointer;font-weight:600;background:var(--accent);color:#0a0f0c;letter-spacing:.4px}
+  .bigbtn.recording{background:var(--err);color:#fff;
+    box-shadow:0 0 0 6px rgba(240,106,106,.18)}
+  .bigbtn:disabled{opacity:.4;cursor:not-allowed}
+  .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  .stat{background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:8px 10px}
+  .stat .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .stat .v{font-size:18px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+  .transcript{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;flex:1;overflow:auto;display:flex;flex-direction:column;gap:10px;min-height:240px}
+  .secbtn{width:100%;background:#0c0f15;color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:8px;cursor:pointer;font:inherit;margin-top:8px}
+  .secbtn:hover{border-color:var(--accent);color:var(--accent)}
+  .llmSummary{background:#0c0f15;border:1px solid var(--line);border-radius:6px;
+    padding:8px 10px}
+  .llmSummary strong{color:var(--fg);font-weight:600}
+
+  .modalBackdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
+    align-items:center;justify-content:center;z-index:50}
+  .modalBackdrop.open{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    width:min(520px,92vw);max-height:88vh;overflow:auto;padding:18px 20px;
+    box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  .modal h2{margin:0 0 12px;font-size:15px;font-weight:600}
+  .modal .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+  .modal .actions button{background:var(--accent);color:#0a0f0c;border:none;
+    border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer;font:inherit}
+  .modal .actions button.ghost{background:transparent;color:var(--muted);
+    border:1px solid var(--line)}
+
+  .empty{color:var(--muted);font-size:13px;line-height:1.7;margin:auto;max-width:520px}
+  .empty ul{padding-left:18px;margin:8px 0}
+  .empty code{background:#0c0f15;padding:1px 6px;border-radius:4px;
+    border:1px solid var(--line);color:var(--fg)}
+  .block{padding:8px 10px;border-radius:6px;border-left:3px solid var(--line)}
+  .block.user{border-left-color:#7aa7ff}
+  .block.bot{border-left-color:var(--accent)}
+  .block.partial{color:var(--partial);font-style:italic}
+  .block .role{font-size:11px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.5px;margin-bottom:3px}
+  .log{font:11px/1.4 ui-monospace,monospace;color:var(--muted);background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;padding:8px 10px;max-height:160px;overflow:auto}
+  .log .e{color:var(--err)}
+  .log .w{color:var(--warn)}
+  .hint{color:var(--muted);font-size:11px;margin-top:4px}
+  details{margin-top:8px}
+  summary{cursor:pointer;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>V2V Debug Console</h1>
+  <span class="pill" id="connPill">disconnected</span>
+  <span class="pill" id="serverPill">/v2v/stream</span>
+  <span style="flex:1"></span>
+  <span class="pill"><a href="/health" style="color:inherit;text-decoration:none">/health</a></span>
+</header>
+
+<main>
+<aside>
+  <div class="modes" id="modes">
+    <button data-mode="conversation" class="active">对话</button>
+    <button data-mode="interpret">同传</button>
+    <button data-mode="asr">纯 ASR</button>
+  </div>
+  <p class="hint" id="modeHint">说话 → LLM 回复 → TTS 朗读。</p>
+
+  <fieldset>
+    <legend>语言</legend>
+    <label>ASR 输入语言（auto = 让模型自己识别）</label>
+    <select id="asrLang">
+      <option value="auto" selected>auto（自动识别）</option>
+      <option value="Chinese">Chinese</option>
+      <option value="English">English</option>
+      <option value="Japanese">Japanese</option>
+      <option value="Korean">Korean</option>
+    </select>
+    <label>TTS / 显示输出语言</label>
+    <select id="ttsLang">
+      <option value="auto" selected>auto（让 TTS 后端识别）</option>
+      <option value="zh">中文 (zh)</option>
+      <option value="en">English (en)</option>
+      <option value="ja">日本語 (ja)</option>
+      <option value="ko">한국어 (ko)</option>
+    </select>
+    <p class="hint">同传 / 纯 ASR + 翻译：建议选具体目标语言，否则 LLM 翻译方向不明确。</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>LLM</legend>
+    <div class="llmSummary" id="llmSummary">
+      <div><strong id="llmSumMode">外部 OpenAI 兼容接口</strong></div>
+      <div class="hint" id="llmSumDetail">gpt-4o-mini · api.openai.com</div>
+    </div>
+    <button type="button" class="secbtn" id="openLlm">配置 LLM…</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>服务端</legend>
+    <label>WebSocket URL</label>
+    <input id="wsUrl" />
+    <label>VAD 静音阈值 (ms)</label>
+    <input id="vadMs" type="number" value="500" min="100" step="50" />
+  </fieldset>
+
+  <button id="micBtn" class="bigbtn">按住或点击开始说话</button>
+  <p class="hint">点击切换录音；服务端 VAD 自动判定句末。</p>
+</aside>
+
+<section class="work">
+  <div class="stats">
+    <div class="stat"><div class="k">First ASR partial</div><div class="v" id="m_partial">–</div></div>
+    <div class="stat"><div class="k">ASR final</div><div class="v" id="m_final">–</div></div>
+    <div class="stat"><div class="k">LLM first token</div><div class="v" id="m_llm">–</div></div>
+    <div class="stat"><div class="k">First audio</div><div class="v" id="m_audio">–</div></div>
+  </div>
+
+  <div class="transcript" id="transcript">
+    <div class="empty" id="emptyState">
+      <p><strong>结果会出现在这里 👇</strong></p>
+      <ul>
+        <li>识别到你说的话 → 蓝色 <code>YOU</code> 气泡（先灰色斜体的 partial，再实色 final）</li>
+        <li>LLM 回复 / 翻译 → 绿色 <code>ASSISTANT</code> / <code>TRANSLATION</code> / <code>DISPLAY</code> 气泡，token 流式刷新</li>
+        <li>TTS 语音 → 浏览器自动播放（纯 ASR 模式不发声）</li>
+      </ul>
+      <p>右上 4 个 tile 是延迟（ms），不是文本。</p>
+    </div>
+  </div>
+
+  <details>
+    <summary>调试日志</summary>
+    <div class="log" id="log"></div>
+  </details>
+</section>
+</main>
+
+<div class="modalBackdrop" id="llmModal" role="dialog" aria-modal="true">
+  <div class="modal">
+    <h2>LLM 配置</h2>
+    <label>LLM 来源</label>
+    <select id="llmMode">
+      <option value="external">外部 OpenAI 兼容接口</option>
+      <option value="builtin">本服务内置兼容接口（与后端 WS 同主机）</option>
+      <option value="echo">无 LLM（回声 / 直接 TTS）</option>
+    </select>
+    <div id="llmCfg">
+      <label>Base URL</label>
+      <input id="llmBase" value="https://api.openai.com/v1" />
+      <label>API Key（仅存浏览器 localStorage）</label>
+      <input id="llmKey" type="password" placeholder="sk-..." autocomplete="off" />
+      <label>Model</label>
+      <input id="llmModel" value="gpt-4o-mini" />
+      <label>System Prompt</label>
+      <textarea id="llmSys">You are a concise, helpful voice assistant. Reply in the user's language unless asked otherwise. Keep responses to 1-3 short sentences.</textarea>
+    </div>
+    <div class="actions">
+      <button type="button" class="ghost" id="cancelLlm">取消</button>
+      <button type="button" id="saveLlm">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── DOM ─────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const log = (m, cls='') => {
+  const el = document.createElement('div');
+  if (cls) el.className = cls;
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${m}`;
+  $('log').appendChild(el);
+  $('log').scrollTop = $('log').scrollHeight;
+};
+const setConn = (s, ok=false) => {
+  const p = $('connPill');
+  p.textContent = s;
+  p.style.color = ok ? 'var(--accent)' : 'var(--muted)';
+};
+
+// Debug page is served from a separate static server, so location.host points
+// at the static server (e.g. localhost:8080), NOT the backend. Default to
+// localhost:9360 and let the user point it at any device on the LAN.
+const defaultWs = 'ws://localhost:9360/v2v/stream';
+$('wsUrl').value = defaultWs;
+$('serverPill').textContent = '→ localhost:9360';
+
+// ── Mode selection ─────────────────────────────────────────────────
+let mode = 'conversation';
+const modeHints = {
+  conversation: '说话 → LLM 回复 → TTS 朗读。',
+  interpret: '同声传译：说话 → LLM 翻译到 TTS 输出语言 → TTS 朗读。',
+  asr: '纯 ASR：只显示识别文字；若 LLM 启用，会将文字翻译到选定语言显示，但不会播放语音。',
+};
+for (const b of document.querySelectorAll('#modes button')) {
+  b.onclick = () => {
+    document.querySelectorAll('#modes button').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    mode = b.dataset.mode;
+    $('modeHint').textContent = modeHints[mode];
+  };
+}
+
+// ── LLM config: modal + localStorage persistence ────────────────────
+const LLM_KEYS = ['llmMode', 'llmBase', 'llmKey', 'llmModel', 'llmSys'];
+const LS_KEY = 'v2v-debug.llm';
+
+function loadLlm() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+    for (const k of LLM_KEYS) if (saved[k] != null) $(k).value = saved[k];
+  } catch {}
+  refreshLlmSummary();
+  $('llmCfg').style.display = $('llmMode').value === 'echo' ? 'none' : '';
+}
+
+function saveLlmToLS() {
+  const obj = {};
+  for (const k of LLM_KEYS) obj[k] = $(k).value;
+  try { localStorage.setItem(LS_KEY, JSON.stringify(obj)); } catch {}
+}
+
+function refreshLlmSummary() {
+  const mode = $('llmMode').value;
+  const modeLabel = { external: '外部 OpenAI 兼容', builtin: '内置兼容接口', echo: '无 LLM（回声）' }[mode];
+  $('llmSumMode').textContent = modeLabel;
+  if (mode === 'echo') {
+    $('llmSumDetail').textContent = 'ASR final → 直接进 TTS';
+  } else {
+    let host = '';
+    try {
+      host = mode === 'builtin'
+        ? new URL($('wsUrl').value.replace(/^ws/, 'http')).host
+        : new URL($('llmBase').value).host;
+    } catch { host = '(invalid URL)'; }
+    $('llmSumDetail').textContent = `${$('llmModel').value || '?'} · ${host}`;
+  }
+}
+
+$('llmMode').onchange = () => {
+  $('llmCfg').style.display = $('llmMode').value === 'echo' ? 'none' : '';
+};
+$('openLlm').onclick = () => $('llmModal').classList.add('open');
+$('cancelLlm').onclick = () => { loadLlm(); $('llmModal').classList.remove('open'); };
+$('saveLlm').onclick = () => {
+  saveLlmToLS();
+  refreshLlmSummary();
+  $('llmModal').classList.remove('open');
+};
+$('llmModal').onclick = (e) => { if (e.target === $('llmModal')) $('cancelLlm').click(); };
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('llmModal').classList.contains('open')) $('cancelLlm').click();
+});
+
+loadLlm();
+$('wsUrl').addEventListener('input', refreshLlmSummary);
+
+// ── Transcript ──────────────────────────────────────────────────────
+function addBlock(role, cls) {
+  const es = $('emptyState'); if (es) es.remove();
+  const wrap = document.createElement('div');
+  wrap.className = 'block ' + cls;
+  const r = document.createElement('div'); r.className = 'role'; r.textContent = role;
+  const t = document.createElement('div'); t.className = 'text';
+  wrap.appendChild(r); wrap.appendChild(t);
+  $('transcript').appendChild(wrap);
+  $('transcript').scrollTop = $('transcript').scrollHeight;
+  return t;
+}
+
+// ── Audio capture: mic → 16k mono int16 frames ──────────────────────
+let audioCtx, micStream, micNode, captureNode;
+const TARGET_SR = 16000;
+
+async function startCapture(onPcm) {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+  });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  micNode = audioCtx.createMediaStreamSource(micStream);
+  // ScriptProcessor is deprecated but universally supported; good for debug.
+  captureNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  const inSr = audioCtx.sampleRate;
+  const ratio = inSr / TARGET_SR;
+  let carry = 0;
+  captureNode.onaudioprocess = (ev) => {
+    const inBuf = ev.inputBuffer.getChannelData(0);
+    // Linear-interp downsample to TARGET_SR.
+    const outLen = Math.floor((inBuf.length - carry) / ratio);
+    const out = new Int16Array(outLen);
+    let idx = carry;
+    for (let i = 0; i < outLen; i++) {
+      const i0 = Math.floor(idx), i1 = Math.min(i0 + 1, inBuf.length - 1);
+      const frac = idx - i0;
+      const s = inBuf[i0] * (1 - frac) + inBuf[i1] * frac;
+      out[i] = Math.max(-32768, Math.min(32767, s * 32767));
+      idx += ratio;
+    }
+    carry = idx - inBuf.length;
+    if (carry < 0) carry = 0;
+    onPcm(out.buffer);
+  };
+  micNode.connect(captureNode);
+  captureNode.connect(audioCtx.destination); // required for onaudioprocess in some browsers
+}
+
+function stopCapture() {
+  try { captureNode && captureNode.disconnect(); } catch{}
+  try { micNode && micNode.disconnect(); } catch{}
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch{}
+  try { audioCtx && audioCtx.close(); } catch{}
+  captureNode = micNode = micStream = audioCtx = null;
+}
+
+// ── PCM playback: streaming int16 chunks ────────────────────────────
+let playCtx, playSr = 0, playTime = 0;
+function playerReset() {
+  try { playCtx && playCtx.close(); } catch{}
+  playCtx = null; playSr = 0; playTime = 0;
+}
+function playerStart(sr) {
+  playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+  playSr = sr;
+  playTime = playCtx.currentTime + 0.05;
+}
+function playerWrite(int16) {
+  if (!playCtx) return;
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+  const buf = playCtx.createBuffer(1, f32.length, playSr);
+  buf.copyToChannel(f32, 0);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playCtx.destination);
+  const startAt = Math.max(playTime, playCtx.currentTime + 0.01);
+  src.start(startAt);
+  playTime = startAt + buf.duration;
+}
+
+// ── LLM (OpenAI compatible, streaming) ──────────────────────────────
+async function* llmStream(prompt) {
+  const llmMode = $('llmMode').value;
+  if (llmMode === 'echo') { yield prompt; return; }
+  let base = $('llmBase').value.replace(/\/+$/, '');
+  if (llmMode === 'builtin') {
+    // Built-in compatible interface on the same host as the backend WS.
+    // Derived from the user-configured WS URL, not from the static page host.
+    try {
+      const u = new URL($('wsUrl').value);
+      const httpProto = u.protocol === 'wss:' ? 'https:' : 'http:';
+      base = `${httpProto}//${u.host}/v1`;
+    } catch {
+      base = 'http://localhost:9360/v1';
+    }
+  }
+  const url = base + '/chat/completions';
+  const sys = $('llmSys').value.trim();
+  let userPrompt = prompt;
+  const targetLang = $('ttsLang').value;
+  const langLabel = { zh: 'Chinese', en: 'English', ja: 'Japanese', ko: 'Korean' }[targetLang];
+  if (mode === 'interpret') {
+    userPrompt = langLabel
+      ? `Translate the following into ${langLabel}. Reply ONLY with the translation, no commentary.\n\n${prompt}`
+      // "auto" — let the LLM pick a sensible target (typically opposite of source)
+      : `Translate the following into the most appropriate target language (e.g. if the input is Chinese, translate to English, and vice versa). Reply ONLY with the translation, no commentary.\n\n${prompt}`;
+  } else if (mode === 'asr' && llmMode !== 'echo') {
+    userPrompt = langLabel
+      ? `Render the following in ${langLabel} (translate if needed). Reply ONLY with the result text.\n\n${prompt}`
+      : `Rewrite or translate the following into a sensible target language and reply ONLY with the result text.\n\n${prompt}`;
+  }
+  const body = {
+    model: $('llmModel').value,
+    stream: true,
+    messages: [
+      ...(sys ? [{ role: 'system', content: sys }] : []),
+      { role: 'user', content: userPrompt },
+    ],
+  };
+  const headers = { 'Content-Type': 'application/json' };
+  const key = $('llmKey').value.trim();
+  if (key) headers['Authorization'] = 'Bearer ' + key;
+
+  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`LLM ${resp.status}: ${txt.slice(0, 200)}`);
+  }
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n'); buf = lines.pop();
+    for (const ln of lines) {
+      const s = ln.trim();
+      if (!s.startsWith('data:')) continue;
+      const data = s.slice(5).trim();
+      if (data === '[DONE]') return;
+      try {
+        const j = JSON.parse(data);
+        const tok = j.choices?.[0]?.delta?.content;
+        if (tok) yield tok;
+      } catch {}
+    }
+  }
+}
+
+// ── Session: orchestrate WS + capture + LLM + playback ──────────────
+let ws, sessionActive = false, t0 = 0;
+const metric = (id, v) => { $(id).textContent = v == null ? '–' : `${v} ms`; };
+
+async function startSession() {
+  $('m_partial').textContent = $('m_final').textContent =
+    $('m_llm').textContent = $('m_audio').textContent = '–';
+
+  const wsUrl = $('wsUrl').value.trim();
+  const asrLang = $('asrLang').value;
+  const ttsLang = $('ttsLang').value;
+  const vadMs = parseInt($('vadMs').value, 10) || 500;
+  const wantTts = (mode !== 'asr');  // ASR-only mode disables TTS path
+  const llmMode = $('llmMode').value;
+
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+  setConn('connecting…');
+
+  let userBlock = null, botBlock = null;
+  let firstPartialAt = 0, finalAt = 0, llmFirstAt = 0, firstAudioAt = 0;
+  let asrFinalText = '';
+  let llmTask = null;
+
+  ws.onopen = async () => {
+    setConn('connected', true);
+    t0 = performance.now();
+    const cfg = {
+      type: 'config',
+      asr_language: asrLang,
+      sample_rate: TARGET_SR,
+      vad: 'silero',
+      vad_silence_ms: vadMs,
+    };
+    if (wantTts) {
+      cfg.tts_language = ttsLang;
+    }
+    ws.send(JSON.stringify(cfg));
+    log('config sent: ' + JSON.stringify(cfg));
+
+    try {
+      await startCapture((pcmBuf) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(pcmBuf);
+      });
+      log('mic capture started @ ' + TARGET_SR + 'Hz');
+    } catch (e) {
+      log('mic error: ' + e.message, 'e');
+      stopSession();
+    }
+  };
+
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data !== 'string') {
+      // Binary: first 4 bytes = sample rate (uint32 LE), rest = int16 PCM
+      const buf = ev.data;
+      if (!playCtx) {
+        const dv = new DataView(buf);
+        const sr = dv.getUint32(0, true);
+        playerStart(sr);
+        if (!firstAudioAt) {
+          firstAudioAt = performance.now() - t0;
+          metric('m_audio', firstAudioAt.toFixed(0));
+        }
+        if (buf.byteLength > 4) {
+          playerWrite(new Int16Array(buf, 4));
+        }
+      } else {
+        if (!firstAudioAt) {
+          firstAudioAt = performance.now() - t0;
+          metric('m_audio', firstAudioAt.toFixed(0));
+        }
+        playerWrite(new Int16Array(buf));
+      }
+      return;
+    }
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    switch (msg.type) {
+      case 'asr_partial':
+        if (!firstPartialAt) {
+          firstPartialAt = performance.now() - t0;
+          metric('m_partial', firstPartialAt.toFixed(0));
+        }
+        if (!userBlock) userBlock = addBlock('YOU', 'user partial');
+        userBlock.textContent = msg.text;
+        break;
+      case 'asr_endpoint':
+        log('asr_endpoint (VAD detected end-of-speech)');
+        break;
+      case 'asr_final':
+        finalAt = performance.now() - t0;
+        metric('m_final', finalAt.toFixed(0));
+        asrFinalText = msg.text || '';
+        if (!userBlock) userBlock = addBlock('YOU', 'user');
+        userBlock.parentElement.classList.remove('partial');
+        userBlock.textContent = asrFinalText;
+        log('asr_final: ' + asrFinalText);
+        // Stop mic — server closes ASR side anyway.
+        stopCapture();
+        // Kick off LLM (unless mode = asr + echo, then nothing to do).
+        if (mode === 'asr' && llmMode === 'echo') {
+          // Just display; server won't produce audio since tts_language omitted.
+          gracefulClose();
+          break;
+        }
+        llmTask = runLLM(asrFinalText);
+        break;
+      case 'tts_started':
+        log('tts_started: ' + msg.sentence);
+        break;
+      case 'tts_sentence_done':
+        // ok
+        break;
+      case 'tts_done':
+        log('tts_done');
+        gracefulClose();
+        break;
+      case 'error':
+        log('server error: ' + msg.error, 'e');
+        break;
+    }
+  };
+
+  ws.onerror = (e) => { log('ws error', 'e'); };
+  ws.onclose = (e) => {
+    setConn('disconnected');
+    sessionActive = false;
+    $('micBtn').classList.remove('recording');
+    $('micBtn').textContent = '按住或点击开始说话';
+    stopCapture();
+  };
+
+  async function runLLM(prompt) {
+    botBlock = addBlock(mode === 'interpret' ? 'TRANSLATION'
+                       : (mode === 'asr' ? 'DISPLAY' : 'ASSISTANT'), 'bot');
+    try {
+      let acc = '';
+      for await (const tok of llmStream(prompt)) {
+        if (!llmFirstAt) {
+          llmFirstAt = performance.now() - t0;
+          metric('m_llm', llmFirstAt.toFixed(0));
+        }
+        acc += tok;
+        botBlock.textContent = acc;
+        if (wantTts && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'text', text: tok }));
+        }
+      }
+      if (wantTts && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'tts_flush' }));
+      } else {
+        gracefulClose();
+      }
+    } catch (e) {
+      log('LLM stream error: ' + e.message, 'e');
+      if (wantTts && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'tts_flush' }));
+      } else {
+        gracefulClose();
+      }
+    }
+  }
+
+  function gracefulClose() {
+    try { ws.close(); } catch {}
+  }
+}
+
+function stopSession() {
+  if (ws && ws.readyState <= 1) {
+    try { ws.send(JSON.stringify({ type: 'asr_eos' })); } catch {}
+    try { ws.close(); } catch {}
+  }
+  stopCapture();
+  sessionActive = false;
+  $('micBtn').classList.remove('recording');
+  $('micBtn').textContent = '按住或点击开始说话';
+}
+
+$('micBtn').onclick = async () => {
+  if (sessionActive) { stopSession(); return; }
+  playerReset();
+  sessionActive = true;
+  $('micBtn').classList.add('recording');
+  $('micBtn').textContent = '录音中… 点击结束';
+  try {
+    await startSession();
+  } catch (e) {
+    log('start error: ' + e.message, 'e');
+    stopSession();
+  }
+};
+</script>
+</body>
+</html>

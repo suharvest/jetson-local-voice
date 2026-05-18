@@ -25,7 +25,7 @@ Matcha assets at first boot and does not require Qwen3 artifacts.
 | Item | Location | Notes |
 |---|---|---|
 | RKNN/RKLLM generated artifacts | [`harvestsu/seeed-local-voice-rk-artifacts`](https://huggingface.co/harvestsu/seeed-local-voice-rk-artifacts) | Contains only generated files that are not already hosted by official sources. |
-| Deploy manifest | [`deploy/artifacts/rk_manifest.json`](../deploy/artifacts/rk_manifest.json) | Source paths, sizes, SHA-256 hashes, runtime version hints, and artifact set names. |
+| Deploy manifest | `rk_manifest.json` | Source paths, sizes, SHA-256 hashes, runtime version hints, and artifact set names. |
 | RK runtime sidecars | [`deploy/rk-runtime`](../deploy/rk-runtime) | Bundled into the RK image to reduce runtime drift across devices. |
 
 Validated image:
@@ -43,7 +43,7 @@ Validated image:
 
 ## Legacy Local Files
 
-The older files under `artifacts/engines/` and `artifacts/onnx/` describe the
+The older files under `deploy/artifacts/engines/` and `deploy/artifacts/onnx/` describe the
 first Matcha/Paraformer TensorRT split experiments:
 
 - Paraformer encoder/decoder TensorRT plans for Orin Nano.
