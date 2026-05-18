@@ -31,7 +31,7 @@ class AudioIO:
         output_device: str | int | None = None,
         input_sr: int = 16000,
         output_sr: int = 24000,
-        chunk_ms: int = 32,
+        chunk_ms: int = 100,
     ) -> None:
         self.input_device = input_device
         self.output_device = output_device
@@ -138,18 +138,28 @@ class AudioIO:
             while True:
                 pcm = await self._out_queue.get()
                 if pcm is None:
-                    self._is_playing = False
                     continue
-                self._is_playing = True
+                # NB: do NOT toggle _is_playing here. SLV streams TTS chunks
+                # with variable inter-frame timing, so the queue can be
+                # transiently empty between two chunks of the same utterance.
+                # If we flipped to False during those gaps, barge-in checks
+                # (`if audio.is_playing`) would race and miss real interrupts.
+                # is_playing is owned by BaseApp dispatch:
+                #   first TTSAudio frame → play() sets True
+                #   TTSDone               → mark_playback_done() sets False
+                #   barge-in / shutdown   → stop_playback() sets False
                 try:
                     if self._output_stream is not None:
                         self._output_stream.write(pcm)
                 except Exception as e:  # pragma: no cover
                     logger.warning("playback write error: %s", e)
-                if self._out_queue.empty():
-                    self._is_playing = False
         except asyncio.CancelledError:
             raise
+
+    def mark_playback_done(self) -> None:
+        """Called by BaseApp when SLV emits TTSDone; flips is_playing False
+        without dropping anything still queued."""
+        self._is_playing = False
 
     async def play(self, pcm: bytes) -> None:
         self._ensure_output()

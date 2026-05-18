@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "description": "Rockchip RK3576/RK3588 generated artifacts and deploy sidecars for OpenVoiceStream. Official Matcha text resources are downloaded from the existing Seeed CDN instead of duplicated here.",
+  "hf_repo_id": "harvestsu/seeed-local-voice-rk-artifacts",
+  "repo_type": "model",
+  "revision": "main",
+  "default_set": "rk3588-multilang-2026-05-17",
+  "artifact_sets": {
+    "rk3576-multilang-2026-05-17": {
+      "soc": "rk3576",
+      "profile": "multilang",
+      "root": "/",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2"
+      },
+      "runtime_contract": {
+        "tts_path": "matcha_ort_acoustic_rknn_vocos",
+        "closed_loop_validated": false,
+        "env": {
+          "TTS_BACKEND": "matcha_rknn",
+          "MATCHA_USE_ORT": "1",
+          "MATCHA_MODEL": "matcha-s64.rknn",
+          "MATCHA_MODEL_SEQ_LEN": "80",
+          "VOCOS_MODEL": "vocos-16khz-600.rknn",
+          "VOCOS_FRAMES": "600"
+        }
+      },
+      "files": [
+        {
+          "path": "opt/asr/models/tokenizer/tokenizer.json",
+          "source_path": "rk3576/opt/asr/models/tokenizer/tokenizer.json",
+          "size_bytes": 11429377,
+          "sha256": "bd2a97b55c8f7f9c328c73ee9b9178771037e9f566dfca8e238a063d41cbac92"
+        },
+        {
+          "path": "opt/asr/models/mel_filters.npy",
+          "source_path": "rk3576/opt/asr/models/mel_filters.npy",
+          "size_bytes": 205952,
+          "sha256": "85ca4058090e9318bab39b79683ba214744304dc9d6f3868ee55fbae6e16c80a"
+        },
+        {
+          "path": "opt/asr/models/embd/decoder_hf.embed_tokens.npy",
+          "source_path": "shared/opt/asr/models/embd/decoder_hf.embed_tokens.npy",
+          "size_bytes": 622329984,
+          "sha256": "dc7fa8078c75467dbb400b214289a69cc7d3624fc944980282a098b5de15ca97"
+        },
+        {
+          "path": "opt/asr/models/vad/silero_vad.onnx",
+          "source_path": "rk3576/opt/asr/models/vad/silero_vad.onnx",
+          "size_bytes": 2313101,
+          "sha256": "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396"
+        },
+        {
+          "path": "opt/asr/models/encoder/rk3576/qwen3_asr_encoder_merged.fp16.4s.rk3576.rknn",
+          "source_path": "rk3576/opt/asr/models/encoder/rk3576/qwen3_asr_encoder_merged.fp16.4s.rk3576.rknn",
+          "size_bytes": 387855918,
+          "sha256": "316e37b28b545318f72c6f6e87e169735723de310234942511e744f91e98bf55"
+        },
+        {
+          "path": "opt/asr/models/encoder/rk3576/qwen3_asr_encoder_merged.fp16.2s.rk3576.rknn",
+          "source_path": "rk3576/opt/asr/models/encoder/rk3576/qwen3_asr_encoder_merged.fp16.2s.rk3576.rknn",
+          "size_bytes": 386182062,
+          "sha256": "0a2cc99ebc42e856a8e21a9f3d8e3c488ba212303fa6961a877c5ca90475a38a"
+        },
+        {
+          "path": "opt/asr/models/rkllm/decoder_qwen3.w4a16_g128.rk3576.rkllm",
+          "source_path": "rk3576/opt/asr/models/rkllm/decoder_qwen3.w4a16_g128.rk3576.rkllm",
+          "size_bytes": 795088292,
+          "sha256": "de7ec58ebf15811e70e4262e87aabbd66509bb1db2740d1a329b38616e8dbaf5"
+        },
+        {
+          "path": "opt/tts/models/matcha-s64.rknn",
+          "source_path": "rk3576/opt/tts/models/matcha-s64.rknn",
+          "size_bytes": 55545545,
+          "sha256": "57aa86c059bf7f81713145c2a215fc1a30b3fe2e530811612263cc06ca138862"
+        },
+        {
+          "path": "opt/tts/models/vocos-16khz-600.rknn",
+          "source_path": "rk3576/opt/tts/models/vocos-16khz-600.rknn",
+          "size_bytes": 28248241,
+          "sha256": "8c17606288ad84e47a154f28ba87233b330b2bd4ac20788ebd82363af4276d7e"
+        },
+        {
+          "path": "opt/tts/models/matcha-split/matcha-encoder-fp16.rknn",
+          "source_path": "rk3576/opt/tts/models/matcha-split/matcha-encoder-fp16.rknn",
+          "size_bytes": 18165375,
+          "sha256": "f7f542b9d16972a7542963ac2e97aaf939c8da89164d06feed28bb424d03a64a"
+        },
+        {
+          "path": "opt/tts/models/matcha-split/matcha-estimator-fp16.rknn",
+          "source_path": "rk3576/opt/tts/models/matcha-split/matcha-estimator-fp16.rknn",
+          "size_bytes": 23699290,
+          "sha256": "ead989cdd43ba8ae392c6765c6d5fe42a276cb270a25f7f904d6756776275bc5"
+        },
+        {
+          "path": "opt/tts/models/matcha-split/time_emb_step0.npy",
+          "source_path": "rk3576/opt/tts/models/matcha-split/time_emb_step0.npy",
+          "size_bytes": 6272,
+          "sha256": "09e090234f7b9efc20cd7ce987a0863c47aa5cd8cbbd5be5a617445d7078c220"
+        },
+        {
+          "path": "opt/tts/models/matcha-split/time_emb_step1.npy",
+          "source_path": "rk3576/opt/tts/models/matcha-split/time_emb_step1.npy",
+          "size_bytes": 6272,
+          "sha256": "40d38b241518db23a5ed4c919a76c59dd30747dc288d6813957a5c94f326b105"
+        },
+        {
+          "path": "opt/tts/models/matcha-split/time_emb_step2.npy",
+          "source_path": "rk3576/opt/tts/models/matcha-split/time_emb_step2.npy",
+          "size_bytes": 6272,
+          "sha256": "55d5fe2d023dfdaa444315adc6e3c06bdeaade165e6a2a5b2661d673d66038e4"
+        },
+        {
+          "path": "opt/tts/models/model-steps-3.onnx",
+          "source_path": "rk3576/opt/tts/models/model-steps-3.onnx",
+          "size_bytes": 75717082,
+          "sha256": "524286bf6cf11be74329ae1c682ac69e34d6860c2ea9fd1290319d561540b16a"
+        }
+      ],
+      "external_sources": [
+        {
+          "path": "opt/tts/models/matcha-icefall-zh-en/",
+          "source": "Seeed CDN models-matcha.tar.gz via model_downloader"
+        }
+      ]
+    },
+    "rk3588-multilang-2026-05-17": {
+      "soc": "rk3588",
+      "profile": "multilang",
+      "root": "/",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2"
+      },
+      "runtime_contract": {
+        "tts_path": "matcha_ort_acoustic_rknn_vocos",
+        "closed_loop_validated": true,
+        "closed_loop_phrase": "你好，今天天气真不错。",
+        "env": {
+          "TTS_BACKEND": "matcha_rknn",
+          "MATCHA_USE_ORT": "1",
+          "MATCHA_MODEL": "matcha-s64.rknn",
+          "MATCHA_MODEL_SEQ_LEN": "80",
+          "VOCOS_MODEL": "vocos-16khz-600.rknn",
+          "VOCOS_FRAMES": "256"
+        }
+      },
+      "files": [
+        {
+          "path": "opt/asr/models/tokenizer/tokenizer.json",
+          "source_path": "rk3588/opt/asr/models/tokenizer/tokenizer.json",
+          "size_bytes": 11429377,
+          "sha256": "bd2a97b55c8f7f9c328c73ee9b9178771037e9f566dfca8e238a063d41cbac92"
+        },
+        {
+          "path": "opt/asr/models/mel_filters.npy",
+          "source_path": "rk3588/opt/asr/models/mel_filters.npy",
+          "size_bytes": 205952,
+          "sha256": "85ca4058090e9318bab39b79683ba214744304dc9d6f3868ee55fbae6e16c80a"
+        },
+        {
+          "path": "opt/asr/models/embd/decoder_hf.embed_tokens.npy",
+          "source_path": "shared/opt/asr/models/embd/decoder_hf.embed_tokens.npy",
+          "size_bytes": 622329984,
+          "sha256": "dc7fa8078c75467dbb400b214289a69cc7d3624fc944980282a098b5de15ca97"
+        },
+        {
+          "path": "opt/asr/models/vad/silero_vad.onnx",
+          "source_path": "rk3588/opt/asr/models/vad/silero_vad.onnx",
+          "size_bytes": 2313101,
+          "sha256": "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396"
+        },
+        {
+          "path": "opt/asr/models/encoder/rk3588/qwen3_asr_encoder_merged.fp16.15s.rk3588.rknn",
+          "source_path": "rk3588/opt/asr/models/encoder/rk3588/qwen3_asr_encoder_merged.fp16.15s.rk3588.rknn",
+          "size_bytes": 382138290,
+          "sha256": "509af53e61dc7e98a2799381af8a366f84ddedbc14da64a50969f82b9e784d32"
+        },
+        {
+          "path": "opt/asr/models/encoder/rk3588/qwen3_asr_encoder_merged.fp16.4s.rk3588.rknn",
+          "source_path": "rk3588/opt/asr/models/encoder/rk3588/qwen3_asr_encoder_merged.fp16.4s.rk3588.rknn",
+          "size_bytes": 379147310,
+          "sha256": "a39b7f803513cffe944c3006c4018c5aae775ac2c67a7941627e07972147cae8"
+        },
+        {
+          "path": "opt/asr/models/encoder/rk3588/qwen3_asr_encoder_merged.fp16.2s.rk3588.rknn",
+          "source_path": "rk3588/opt/asr/models/encoder/rk3588/qwen3_asr_encoder_merged.fp16.2s.rk3588.rknn",
+          "size_bytes": 378632174,
+          "sha256": "25e0d95ebe8642b06f8657516bc114f9b01aca7d05a440389c2e7d22a1de258e"
+        },
+        {
+          "path": "opt/asr/models/decoder/decoder_qwen3.fp16.rk3588.rkllm",
+          "source_path": "rk3588/opt/asr/models/decoder/decoder_qwen3.fp16.rk3588.rkllm",
+          "size_bytes": 1529742060,
+          "sha256": "8dfcb19073de04d5838f78b3135049af06b863e7a46dbb28c0130db5d2a3bb49"
+        },
+        {
+          "path": "opt/tts/models/matcha-s64.rknn",
+          "source_path": "rk3588/opt/tts/models/matcha-s64.rknn",
+          "size_bytes": 47700621,
+          "sha256": "8df58a43dd02db23e4896b055af3fd2a270f8a745bfeb689b6d436e4ef157729"
+        },
+        {
+          "path": "opt/tts/models/vocos-16khz-600.rknn",
+          "source_path": "rk3588/opt/tts/models/vocos-16khz-600.rknn",
+          "size_bytes": 27907697,
+          "sha256": "963e73f78bfee9f021850f5d2a6a712db691efbaa4b6c46ef460af1200f98ed4"
+        },
+        {
+          "path": "opt/tts/models/model-steps-3.onnx",
+          "source_path": "rk3588/opt/tts/models/model-steps-3.onnx",
+          "size_bytes": 75717082,
+          "sha256": "524286bf6cf11be74329ae1c682ac69e34d6860c2ea9fd1290319d561540b16a"
+        }
+      ],
+      "external_sources": [
+        {
+          "path": "opt/tts/models/matcha-icefall-zh-en/",
+          "source": "Seeed CDN models-matcha.tar.gz via model_downloader"
+        }
+      ]
+    }
+  }
+}

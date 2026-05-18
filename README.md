@@ -1,89 +1,122 @@
 # OpenVoiceStream
 
-**Streaming voice for edge dialogue.** Few dependencies (just engines + NPU), one container deploy, ~110ms TTFT on Jetson / RK3588 / RPi.
-
-[![GitHub stars](https://img.shields.io/github/stars/suharvest/seeed-local-voice?style=social)](https://github.com/suharvest/seeed-local-voice)
-[![sherpa-onnx](https://img.shields.io/badge/engine-sherpa--onnx-green.svg)](https://github.com/k2-fsa/sherpa-onnx)
-[![Qwen3](https://img.shields.io/badge/multilingual-Qwen3-blueviolet.svg)](https://huggingface.co/Qwen)
-[![Kokoro TTS](https://img.shields.io/badge/TTS-Kokoro%20v1.0-orange.svg)](https://huggingface.co/hexgrad/Kokoro-82M)
-[![Docker](https://img.shields.io/badge/deploy-Docker-blue.svg)](https://www.docker.com/)
-[![Devices](https://img.shields.io/badge/devices-Jetson%20%7C%20RK3576%20%7C%20RK3588%20%7C%20RPi4%2F5-76b900.svg)](#supported-devices)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+**Native-engine streaming ASR + TTS for edge dialogue.** One container, stable HTTP/WebSocket APIs, and validated paths across Jetson, Rockchip, and Raspberry Pi ecosystems.
 
 <p align="center">
-  <img src="media/hero.png" alt="OpenVoiceStream — sub-200ms streaming ASR + TTS on edge" width="640" />
+  <a href="https://github.com/suharvest/openvoicestream"><img src="https://img.shields.io/github/stars/suharvest/openvoicestream?style=social" alt="GitHub stars" /></a>
+  <a href="#architecture"><img src="https://img.shields.io/badge/ASR-Paraformer%20%7C%20Qwen3--ASR%20%7C%20SenseVoice-2f80ed.svg" alt="ASR: Paraformer, Qwen3-ASR, SenseVoice" /></a>
+  <a href="#tts-model-comparison"><img src="https://img.shields.io/badge/TTS-Matcha--TTS%20%7C%20Qwen3--TTS%20%7C%20Kokoro-f97316.svg" alt="TTS: Matcha-TTS, Qwen3-TTS, Kokoro" /></a>
+  <a href="#architecture"><img src="https://img.shields.io/badge/engines-TensorRT--EdgeLLM%20%7C%20RKNN%20%7C%20sherpa--onnx-16a34a.svg" alt="Engines: TensorRT-EdgeLLM, RKNN, sherpa-onnx" /></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/deploy-Docker-2563eb.svg" alt="Deploy with Docker" /></a>
+  <a href="#supported-devices"><img src="https://img.shields.io/badge/ecosystems-Jetson%20%7C%20Rockchip%20%7C%20Raspberry%20Pi-65a30d.svg" alt="Supported ecosystems: Jetson, Rockchip, Raspberry Pi" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-facc15.svg" alt="MIT license" /></a>
 </p>
 
-<!-- TODO: Add demo GIF showing voice-in → text → voice-out round-trip -->
+<p align="center">
+  <img src="media/hero.png" alt="OpenVoiceStream - streaming ASR and TTS for edge dialogue" width="760" />
+</p>
 
-OpenVoiceStream is a streaming voice stack — ASR and TTS — built for real-time conversational pipelines on edge devices. It deploys as a single container, runs entirely on-device, and exposes a clean WebSocket / HTTP API that doesn't change when you swap engines or hardware.
+OpenVoiceStream is a local voice stack for products that need real-time ASR and TTS on edge hardware. It runs fully on-device, avoids heavyweight ML frameworks in the hot path, and keeps the client API stable while you switch between sherpa-onnx, TensorRT-EdgeLLM, RKNN, and CPU ONNX backends.
 
-## Why OpenVoiceStream
+## Why This Matters
 
-| 🪶 **Few dependencies** | 📦 **Easy to deploy** | ⚡ **Low latency** |
-| --- | --- | --- |
-| Runs on lean inference engines — sherpa-onnx, TensorRT-EdgeLLM, RKNN — with no heavy ML framework at runtime. No PyTorch, no transformers in the hot path. | One Docker image (~900 MB on Jetson, ~600 MB on Rockchip). Models auto-download on first start. `docker run` and you're talking. | **~110ms** ASR + TTS time-to-first-audio on Jetson Orin NX. ~3–5x faster than cloud APIs, and the latency floor is yours to tune, not someone else's API queue. |
+| Tier | What you can build | Hardware cost signal |
+|---|---|---|
+| **Real-time voice I/O** | A Raspberry Pi-class board can handle local streaming ASR + TTS for simple voice input/output. | Starts around **tens of dollars** for the board class. |
+| **Human-like local speech** | A Jetson Orin Nano-class board can run the more expressive Qwen3 / voice-clone path locally. | Around **a few hundred dollars** for a dev-kit class board. |
+| **Voice + local LLM** | An Orin NX-class edge box can host the voice stack plus a compact OpenAI-compatible local LLM service for fully local dialogue. | Still edge-device scale, not a GPU server. |
+| **No per-call cloud bill** | ASR, TTS, and the optional LLM path can run on the device after artifacts are cached. | No speech API key, no token meter, no runtime internet dependency. |
+
+Board prices vary by region and kit contents. The useful point is the order of
+magnitude: low-cost boards can do real-time voice I/O, and small edge AI boards
+can do the full spoken assistant loop locally.
 
 ## Quick Start
 
-Pull and run. Models auto-download on first start (~1 min) and cache in a Docker volume:
+Clone once on the target device. The installer validates the host, selects the
+right compose file, pulls the image, starts the service, and can run health,
+capability, TTS smoke, and TTS-to-ASR round-trip checks.
 
 ```bash
-# Chinese + English (default)
-docker run -d --name openvoicestream \
-  --runtime nvidia --ipc host \
-  -p 8621:8000 \
-  -v openvoicestream-models:/opt/models \
-  -v /usr/local/cuda/lib64:/host-cuda:ro \
-  -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
-  -v /lib/aarch64-linux-gnu:/host-libs:ro \
-  -e LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-nvidia-libs:/host-libs:/host-cuda \
-  --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v3.0-slim
+git clone --recurse-submodules https://github.com/suharvest/openvoicestream.git
+cd openvoicestream
 
-# Verify (wait ~40s for warmup)
-curl http://localhost:8621/health
-# {"asr":false,"tts":true,"streaming_asr":true}
+# Auto-detect Jetson, Rockchip, or Raspberry Pi.
+deploy/install.sh --pull --verify
 ```
 
-**English-only mode** (Kokoro TTS + Zipformer ASR):
+Choose explicitly when auto-detect is not enough:
 
 ```bash
-docker run -d --name openvoicestream \
-  --runtime nvidia --ipc host \
-  -p 8621:8000 \
-  -e LANGUAGE_MODE=en \
-  -v openvoicestream-models:/opt/models \
-  -v /usr/local/cuda/lib64:/host-cuda:ro \
-  -v /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs:ro \
-  -v /lib/aarch64-linux-gnu:/host-libs:ro \
-  -e LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-nvidia-libs:/host-libs:/host-cuda \
-  --restart unless-stopped \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v3.0-slim
+deploy/install.sh --target jetson --pull --verify
+deploy/install.sh --target rk3588 --pull --verify
+deploy/install.sh --target rk3576 --pull --verify
+deploy/install.sh --target rpi --pull --verify
 ```
 
-**Deploy with compose** (recommended for production):
+After startup, the service listens on `http://device:8621`:
+
+| Target | URL | Compose file | Image |
+|---|---|---|---|
+| Jetson | `http://device:8621` | `deploy/docker-compose.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf` |
+| RK3576 | `http://device:8621` | `deploy/docker-compose.rk.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` |
+| RK3588 | `http://device:8621` | `deploy/docker-compose.radxa.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` |
+| Raspberry Pi | `http://device:8621` | `deploy/docker-compose.rpi.yml` | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx` |
+
+The published Docker images currently keep the previous registry namespace so
+existing deployments can pull the same artifacts during the rename.
+
+Manual verification:
 
 ```bash
-git clone --recurse-submodules https://github.com/suharvest/seeed-local-voice.git
-cd seeed-local-voice
+# Same default URL on Jetson, RK3576, RK3588, and Raspberry Pi.
+deploy/verify.sh --url http://device:8621 --tts-smoke --roundtrip
+curl http://device:8621/health
+```
 
-# Chinese + English (default)
+Client examples live in [`examples/`](examples/):
+
+```bash
+python3 examples/stream_tts_to_wav.py \
+  --url http://device:8621 \
+  --text "你好，欢迎使用 OpenVoiceStream。" \
+  --out /tmp/ovs-tts.wav
+```
+
+**Deploy with compose** when you want to manage profiles yourself:
+
+```bash
+# Chinese + English on Jetson, using the lightweight Paraformer + Matcha path.
 docker compose -f deploy/docker-compose.yml up -d
 
-# English only
+# English only on Jetson.
 LANGUAGE_MODE=en docker compose -f deploy/docker-compose.yml up -d
 
-# Qwen3 multilingual ASR/TTS (52 langs + voice clone)
-SEEED_LOCAL_VOICE_PROFILE=jetson-multilang-highperf \
-QWEN3_HF_REPO_ID=<your-org/qwen3-edgellm-jetson-artifacts> \
+# Qwen3 multilingual ASR/TTS on Jetson Orin NX.
+OVS_PROFILE=jetson-multilang-highperf-nx \
 docker compose -f deploy/docker-compose.yml up -d
 ```
+
+`deploy/install.sh --pull --verify` auto-detects Jetson/RK/RPi when run on the
+target device. The Jetson default stays on the lightweight `zh_en` path because
+it is the fastest path to reproduce. Set a `jetson-multilang-*` profile when
+you want the Qwen3 TensorRT-EdgeLLM route.
+
+## Choose A Path
+
+| Need | Recommended path | Why |
+|---|---|---|
+| Lowest-latency bilingual dialogue | Jetson Orin NX, `jetson-zh-en` | Paraformer + Matcha with native TRT engines reaches 58 ms EOS-to-audio p50. |
+| 52-language ASR/TTS with voice clone | Jetson Orin NX/Nano, `jetson-multilang-highperf*` | Qwen3-ASR + Qwen3-TTS via TensorRT-EdgeLLM under the same API. |
+| Multilingual ASR with faster TTS | Jetson Qwen3 ASR + Matcha profile | Keeps Qwen3 ASR while using the lighter Matcha TTS path. |
+| Rockchip NPU deployment | RK3588 before RK3576 | Both run the validated hybrid Matcha path; RK3588 has much lower ASR finalize latency. |
+| Lowest-cost CPU deployment | Raspberry Pi 5 / CM5 class | CPU-only ONNX path with small image and no accelerator runtime dependency. |
 
 ## Table of Contents
 
-- [Why OpenVoiceStream](#why-openvoicestream)
+- [Why This Matters](#why-this-matters)
 - [Quick Start](#quick-start)
+- [Choose A Path](#choose-a-path)
 - [Key Features](#key-features)
 - [Architecture](#architecture)
 - [API Reference](#api-reference)
@@ -99,14 +132,14 @@ docker compose -f deploy/docker-compose.yml up -d
 
 ## Key Features
 
-- **Streaming-first** — WebSocket ASR with partial results, sentence-level streaming TTS. Built around how dialogue actually flows, not request/response.
-- **Sub-200ms latency** — ~110ms ASR + TTS time-to-first-audio (Chinese+English), ~180ms (English-only). 3–5x faster than cloud APIs.
-- **Engine-light** — sherpa-onnx for the bilingual path, TensorRT-EdgeLLM for Jetson multilingual, RKNN for Rockchip NPU. No PyTorch at runtime.
-- **One-command deploy** — `docker run` and the service comes up. Models auto-download. No build chain on the target device.
-- **Stable API across backends** — same WebSocket / HTTP contract for sherpa, Qwen3, and the Rockchip path. Swap models without changing client code.
-- **Multilingual options** — Chinese+English (Paraformer + Matcha-TTS), English-only (Zipformer + Kokoro v1.0, 53 voices), or 52-language Qwen3-ASR + Qwen3-TTS with voice cloning.
-- **Lean footprint** — ~650 MB RAM, ~32% CPU idle on Jetson Orin NX. Leaves room for an LLM and other workloads on the same device.
-- **Fully on-device** — no cloud, no API keys, no internet required at runtime.
+- **Streaming-first API** — WebSocket ASR with partial/final results and HTTP streaming TTS with sentence-level audio chunks.
+- **Native engine runtime** — TensorRT-EdgeLLM on Jetson, RKNN/RKLLM on Rockchip, sherpa-onnx and ONNX Runtime on CPU/CUDA paths.
+- **Stable backend contract** — clients keep the same `/asr/stream`, `/tts`, `/tts/stream`, and `/health` calls when profiles change.
+- **Measured low latency** — 58 ms EOS-to-first-audio on Jetson Orin NX with Paraformer + Matcha; 157 ms with Qwen3 ASR/TTS voice clone.
+- **Multilingual options** — Chinese+English, English-only, and 52-language Qwen3 paths are exposed through the same service.
+- **Container-first deploy** — prebuilt images, target-specific compose files, host checks, model downloads, and verification scripts are included.
+- **LLM-ready agent layer** — `agent/` streams ASR results into an OpenAI-compatible or EdgeLLM backend, then streams LLM tokens directly back to TTS.
+- **Fully local economics** — no speech API key, no per-call ASR/TTS bill, no runtime internet dependency after artifacts are cached, and no PyTorch/Transformers in the voice hot path.
 
 ## Architecture
 
@@ -114,7 +147,7 @@ docker compose -f deploy/docker-compose.yml up -d
 ┌───────────────────────────────────────────────────────────┐
 │  Edge device (Jetson Orin / RK3576 / RK3588 / RPi 4–5)    │
 │                                                           │
-│  FastAPI service (:8000)                                  │
+│  FastAPI service (container :8000; host default :8621)     │
 │  ├── WS /asr/stream    Streaming ASR                      │
 │  │     └─ zh_en: Paraformer  │  en: Zipformer  │  multi: Qwen3-ASR │
 │  ├── POST /asr          SenseVoice offline ASR (zh+en)    │
@@ -164,7 +197,7 @@ WS /asr/stream?sample_rate=16000&language=auto
 import asyncio, websockets
 
 async def transcribe():
-    async with websockets.connect("ws://device:8000/asr/stream?sample_rate=16000") as ws:
+    async with websockets.connect("ws://device:8621/asr/stream?sample_rate=16000") as ws:
         for chunk in audio_chunks:  # np.int16 arrays
             await ws.send(chunk.tobytes())
             result = await ws.recv()  # partial results
@@ -175,7 +208,7 @@ async def transcribe():
 ### Offline ASR (HTTP)
 
 ```bash
-curl -X POST http://device:8000/asr \
+curl -X POST http://device:8621/asr \
   -F "file=@recording.wav" -F "language=auto"
 # {"text": "transcribed text"}
 ```
@@ -183,7 +216,7 @@ curl -X POST http://device:8000/asr \
 ### TTS (HTTP)
 
 ```bash
-curl -X POST http://device:8000/tts \
+curl -X POST http://device:8621/tts \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world", "sid": 52, "speed": 1.0}' \
   --output output.wav
@@ -191,7 +224,10 @@ curl -X POST http://device:8000/tts \
 
 Parameters: `text` (required), `sid` (speaker ID, default 52), `speed` (rate, default 1.0)
 
-**Note:** `speed` and `pitch` parameters only work in the Sherpa backend (`zh_en`/`en` mode). Qwen3-TTS (`multilingual` mode) does not support speed/pitch adjustment — these are Sherpa-specific capabilities.
+**Note:** `speed` works only on backends that advertise speed control
+(Sherpa/Matcha/RKNN). Qwen3-TTS (`multilanguage` profiles) does not currently
+support reliable speed or pitch adjustment, so clients should treat those
+parameters as unsupported on Qwen3.
 
 ### TTS Streaming (HTTP)
 
@@ -211,7 +247,7 @@ GET /health  →  {"asr": bool, "tts": bool, "streaming_asr": bool}
 
 ## Qwen3 Multilingual Path
 
-`LANGUAGE_MODE=multilingual` enables Qwen3-ASR + Qwen3-TTS — 52 languages plus voice cloning. The integration code lives in this repo; Qwen-specific export, engine builds, and worker glue are maintained in the standalone companion repo [`suharvest/qwen3-edgellm-jetson`](https://github.com/suharvest/qwen3-edgellm-jetson) (pinned here as a submodule at `third_party/qwen3-edgellm-jetson/`). Large model artifacts live in [`harvestsu/qwen3-edgellm-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-edgellm-jetson-artifacts) on Hugging Face.
+`OVS_PROFILE=jetson-multilang-highperf*` enables Qwen3-ASR + Qwen3-TTS — 52 languages plus voice cloning. The integration code lives in this repo; Qwen-specific export, engine builds, and worker glue are maintained in the standalone companion repo [`suharvest/qwen3-edgellm-jetson`](https://github.com/suharvest/qwen3-edgellm-jetson) (pinned here as a submodule at `third_party/qwen3-edgellm-jetson/`). Large model artifacts live in [`harvestsu/qwen3-edgellm-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-edgellm-jetson-artifacts) on Hugging Face.
 
 **Quickest path on a fresh Orin NX:**
 
@@ -234,74 +270,71 @@ Use `jetson-multilang-highperf-nx` on Orin NX when consuming the NX-native engin
 
 For detailed branch ownership, engine env vars, frozen-baseline numbers, and artifact handling, see [`docs/plans/qwen3-current-frozen-baseline-2026-05-10.md`](docs/plans/qwen3-current-frozen-baseline-2026-05-10.md).
 
+Current release status, image digests, artifact repositories, and known gaps are
+tracked in [`docs/productization-status.md`](docs/productization-status.md).
+
 ## Performance
 
-### Cross-device comparison (measured 2026-05-13)
+### Cross-Device Benchmarks (measured 2026-05-18)
 
-Full measured numbers across Jetson Orin Nano / Radxa ROCK 5T (RK3588) / RK3576 / Raspberry Pi 5, plus a use-case-driven device picker, live in **[`docs/performance-comparison.md`](docs/performance-comparison.md)**.
+Jetson/RPi rows are from the original local forced-EOS gate against
+`http://127.0.0.1:8621`. RK rows were rerun after the true-streaming fix with
+`QWEN3_ASR_CHUNK_CONFIRM=0`, `--eos vad`, and `--vad-silence-ms 800`; their V2V
+column is split `/asr/stream` plus `/tts/stream`.
 
-Headline summary:
+| Target / profile | Image | TTS backend | ASR backend | TTS RTF p50 | ASR fRTF p50 | ASR CER p50 | V2V EOS→audio p50 |
+|---|---|---|---|---:|---:|---:|---:|
+| Orin Nano `jetson-multilang-highperf` | `jetson-v1.12-highperf` | `trt_edgellm` | `trt_edgellm` | 0.470 | 0.076 | 5.3% | 251 ms |
+| Orin NX `jetson-multilang-highperf-nx` | `jetson-v1.12-highperf` | `trt_edgellm` | `trt_edgellm` | 0.417 | 0.042 | 5.3% | 157 ms |
+| Orin Nano `jetson-qwen3asr-matcha` | `jetson-v1.12-highperf` | `matcha_trt` | `trt_edgellm` | 0.024 | 0.075 | 5.3% | 286 ms |
+| Orin NX `jetson-qwen3asr-matcha-nx` | `jetson-v1.12-highperf` | `matcha_trt` | `trt_edgellm` | 0.018 | 0.042 | 5.3% | 162 ms |
+| Orin Nano `jetson-zh-en` | `jetson-v1.12-highperf` | `matcha_trt` | `paraformer_trt` | 0.023 | 0.077 | 13.3% | 327 ms |
+| Orin NX `jetson-zh-en` | `jetson-v1.12-highperf` | `matcha_trt` | `paraformer_trt` | 0.018 | 0.015 | 10.5% | 58 ms |
+| RK3588 `rk3588-default` | `rk-v1.4-closedloop` | `rk:matcha_rknn` | `rk:qwen3_asr_rk` | 0.124 | 0.318 | 60.7% | 394 ms |
+| RK3576 `rk3576-default` | `rk-v1.4-closedloop` | `rk:matcha_rknn` | `rk:qwen3_asr_rk` | 0.290 | 0.265 | 63.2% | 1099 ms |
+| Raspberry Pi 5 `rpi5-default` | `rpi-v1.0-onnx` | `sherpa` | `sherpa_asr` | 0.078 | 0.000 | 20.0% | 3 ms |
 
-| Use case | Best fit | Why |
-|---|---|---|
-| Best English accuracy + voice clone | **Jetson Orin Nano** | 0 % WER short English, only platform with voice cloning |
-| Best Chinese accuracy | **Radxa RK3588** | 2.6 % CER short, 5 % Long-EN WER |
-| Lowest cost (zh+en commands) | **RPi5** | Real-time streaming, $80 BOM |
-| Multilingual ASR (ja/ko/es/de/fr) | **RK3576** | Qwen3 ASR works; TTS still WIP |
+The previous RK rows were stale forced-EOS/chunk-confirm results. In the fixed
+rerun, standalone Matcha TTS first audio is 51 ms p50 on RK3588 and 65 ms p50
+on RK3576; split V2V is now ASR-finalize-bound at 394 ms / 1099 ms p50. The
+real `/v2v/stream` path remains about 1.27 s p50 with the current 800 ms VAD
+hangover.
 
-Cross-device Finalize-RTF and CER/WER tables, full TTS results, V2V latency, and concurrency numbers are in the comparison doc above.
+Deployment footprint from the same run:
 
-### Latency on Jetson Orin NX 16GB (representative baseline)
+| Target | Image size | Model / engine volume | Resident memory | Startup to ready |
+|---|---:|---:|---:|---:|
+| Orin Nano | 2.02 GB | 5.14 GB | 2.14 GiB | 14 s |
+| Orin NX | 2.02 GB | 5.45 GB | 1.02 GiB | 13 s |
+| RK3588 | 767 MB | 3.31 GB ASR + 301 MB TTS | 4.09 GiB | 9 s |
+| RK3576 | 767 MB | 2.21 GB ASR + 351 MB TTS | 2.71 GiB | 15 s |
+| Raspberry Pi 5 | 568 MB | 2.19 GB | n/a from Docker stats | 9 s |
 
-| | ASR TTFT | TTS TTFT | ASR + TTS | vs Cloud |
-|---|---------|---------|-----------|----------|
-| **zh_en** (Chinese+English) | ~50ms | ~60ms | **~110ms** | 3–5x faster |
-| **en** (English only) | ~50ms | ~130ms | **~180ms** | 2–4x faster |
-
-Full voice-to-voice latency depends on LLM inference time (not included above).
-
-### Resource Usage (Jetson Orin NX 16GB)
-
-| State | CPU (8-core) | RAM | GPU |
-|-------|-------------|-----|-----|
-| Idle (models loaded) | ~32% | ~650 MB | 0% |
-| During TTS inference | ~63% | ~658 MB | burst |
-| During ASR streaming | ~32% | ~650 MB | minimal |
-
-The service uses only ~650 MB RAM, leaving plenty of headroom for LLM inference (Ollama), computer vision, or robot control on the same device.
-
-### Benchmarks
-
-**zh_en mode:**
-
-| Metric | Value |
-|--------|-------|
-| Paraformer TTFT | ~50ms |
-| Paraformer finalize | ~45ms |
-| Paraformer accuracy | 80.8% (26 synthetic sentences) |
-| Matcha TTS TTFT | ~60ms (short text) |
-| Matcha TTS latency | ~150ms (typical Chinese sentence) |
-
-**en mode:**
-
-| Metric | Value |
-|--------|-------|
-| Zipformer TTFT | ~50ms |
-| Kokoro TTS TTFT | ~130ms (short text) |
-| Kokoro TTS latency | ~300ms (typical sentence) |
+Concurrency smoke (`parallel=2`, `asr_tts_simul`) passed on Jetson Nano/NX
+Paraformer+Matcha, RK3588, RK3576, and Raspberry Pi 5. Jetson p=2 is
+functional but TTS becomes throughput-bound (RTF ~1.3-1.4), so use Orin NX or a
+Qwen3 ASR + Matcha split when low-latency concurrent dialogue matters. Full raw
+JSON paths and methodology are in
+[`docs/benchmarks/streaming-release-gate-2026-05-18.md`](docs/benchmarks/streaming-release-gate-2026-05-18.md).
 
 ### TTS Model Comparison
 
-We evaluated 4 TTS models for TTFT (time-to-first-audio-chunk). Matcha-TTS was selected for zh_en mode (best Chinese quality), Kokoro for en mode (best English quality):
+The current release uses Matcha/Vocos for the bilingual path, Kokoro for
+English-only deployments, and Qwen3-TTS when voice cloning or 52-language TTS is
+required. The RTF numbers below are from the 2026-05-18 benchmark run where
+available; the unused research models are kept as historical context.
 
-| Model | TTFT (short) | TTFT (long) | Chinese Quality | English Quality | Used in |
-|-------|-------------|-------------|-----------------|-----------------|---------|
-| **Matcha-TTS + Vocos** | ~60ms | ~150ms | Good | Fair | **zh_en** |
-| **Kokoro v1.0** | ~130ms | ~300ms | — | Excellent | **en** |
-| CosyVoice3 | ~800ms | ~2s | Excellent | — | — |
-| F5-TTS | ~2.5s | ~5s | Excellent | — | — |
+| Model | Current role | Streaming RTF p50 | First audio p50 | Notes |
+|-------|--------------|------------------:|----------------:|-------|
+| **Matcha-TTS + Vocos** | Default bilingual TTS | 0.018 on Orin NX, 0.075 on RK3588, 0.078 on RPi5 | 2.6-7.5 ms | Fastest practical TTS path; no voice clone. |
+| **Qwen3-TTS** | Multilingual voice clone | 0.417 on Orin NX, 0.470 on Orin Nano | 4.4-7.3 ms | Higher quality/features, much heavier than Matcha. |
+| **Kokoro v1.0** | English-only TTS | Not in this benchmark run | Historical ~130 ms TTFT | Kept for English-only deployments. |
+| CosyVoice3 | Research only | Not shipped | Historical ~800 ms TTFT | Higher quality, too heavy for this release. |
+| F5-TTS | Research only | Not shipped | Historical ~2.5 s TTFT | Not suitable for low-latency edge dialogue. |
 
-Benchmark scripts live in `benchmarks/`. See `benchmarks/archive/` for detailed F5-TTS optimization experiments (CUDA, TensorRT, NFE sweep).
+Current streaming benchmark scripts live in `bench/perf/`. Historical Qwen3
+engine experiments and one-off TTS model comparisons are archived under
+`archive/2026-05/`.
 
 ### Performance Tuning
 
@@ -319,10 +352,11 @@ This sets MAXN power mode, locks CPU/GPU clocks, and disables dynamic frequency 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English), `en` (English only), or `multilingual` (Qwen3, 52 langs) |
+| `OVS_PROFILE` | unset | Preferred OpenVoiceStream profile selector, e.g. `jetson-zh-en`, `jetson-multilang-highperf-nx`, `rk3588-default`, `rpi5-default` |
+| `LANGUAGE_MODE` | `zh_en` | `zh_en` (Chinese+English), `en` (English only), or `multilanguage` (Qwen3, 52 langs; profiles usually set this for you) |
 | `TTS_PROVIDER` | `cuda` | ONNX execution provider |
 | `TTS_DEFAULT_SID` | `52` | Default TTS speaker ID (52=af_cute, 3=af_heart) — Sherpa only |
-| `TTS_DEFAULT_SPEED` | `1.0` | TTS playback speed — **Sherpa only** |
+| `TTS_DEFAULT_SPEED` | `1.0` | TTS playback speed for backends that support it; Qwen3-TTS does not |
 | `TTS_NUM_THREADS` | `4` | TTS inference threads |
 | `TTS_PITCH_SHIFT` | `0` | Pitch shift in semitones — **Sherpa only** |
 | `SENSEVOICE_LANGUAGE` | `auto` | SenseVoice language hint |
@@ -342,8 +376,13 @@ Auto-downloaded on first start and cached in a Docker volume:
 | Zipformer streaming en | ~65 MB | `en` | Streaming ASR (English only) |
 | Kokoro TTS v1.0 | ~719 MB | `en` | TTS synthesis (English, 53 speakers) |
 | SenseVoice zh-en-ja-ko-yue | ~500 MB | both | Offline ASR (5 languages) |
-| Qwen3-TTS 0.6B + TRT engines | ~2.5 GB | `multilingual` | TTS + voice clone (52 languages) |
-| Qwen3-ASR encoder + decoder | ~1.5 GB | `multilingual` | ASR (52 languages, streaming) |
+| Qwen3-TTS 0.6B + TRT engines | ~2.5 GB | `multilanguage` | TTS + voice clone (52 languages) |
+| Qwen3-ASR encoder + decoder | ~1.5 GB | `multilanguage` | ASR (52 languages, streaming) |
+
+Measured Docker volume sizes in the current release are larger than individual
+model tarballs because they include compiled engines and profile-specific
+artifacts: 5.14-5.45 GB on Jetson, 2.56-3.61 GB on RK, and 2.19 GB on
+Raspberry Pi 5.
 
 ## Supported Devices
 
@@ -352,10 +391,15 @@ OpenVoiceStream is validated on the following hardware. Any device in the same c
 | Device class | Validated on | Notes |
 |---|---|---|
 | **NVIDIA Jetson Orin** | Jetson Orin Nano 8GB, Orin NX 16GB, AGX Orin | CUDA 12.6 / JetPack 6.2. Full feature set including Qwen3 multilingual + voice clone. |
-| **Rockchip NPU** | Radxa ROCK 5T (RK3588), Banana Pi BPI-M5 Pro (RK3576) | RKNN runtime. zh+en path mature; multilingual Qwen3-ASR works, Qwen3-TTS WIP. |
+| **Rockchip NPU** | Radxa ROCK 5T (RK3588), Banana Pi BPI-M5 Pro (RK3576) | RKNN runtime. Qwen3-ASR works; release TTS uses the validated hybrid Matcha path. |
 | **Raspberry Pi (CPU)** | Raspberry Pi 5 8GB, Raspberry Pi 4 4GB | CPU inference. Lowest BOM (~$80). Real-time zh+en commands. |
 
-Requirements: Docker + ~5 GB disk for models + ~650 MB free RAM. On Jetson, NVIDIA Container Runtime is required; on Rockchip, the host NPU driver (`rknpu`) must be loaded.
+Requirements: Docker plus enough disk for the image and model volume. Current
+measured footprints are about 7.5 GB total for Jetson, 3.2-4.4 GB for RK, and
+2.8 GB for Raspberry Pi 5. Runtime memory depends on the profile: about 1.0-2.1
+GiB on Jetson, 2.7-4.1 GiB on RK, and CPU-only on Raspberry Pi. On Jetson,
+NVIDIA Container Runtime is required; on Rockchip, the host NPU driver
+(`rknpu`) must be loaded.
 
 ## Patched sherpa-onnx
 
@@ -370,15 +414,15 @@ Pre-built `.so` files live in `patches/sherpa-onnx-lib/` (aarch64, Python 3.10, 
 ## Project Structure
 
 ```text
-seeed-local-voice/
+openvoicestream/
 ├── app/                     # FastAPI service
 │   ├── main.py              # Endpoints and startup
 │   ├── backends/            # Per-engine backends (sherpa / jetson / rk)
 │   ├── core/                # VAD, ASR/TTS contracts, streaming primitives
 │   └── model_downloader.py  # On-demand model download + voice patching
 ├── voices/                  # Custom voice embeddings (auto-patched into model)
-├── benchmarks/              # TTS model TTFT comparisons
 ├── bench/                   # Streaming + V2V latency benchmarks (perf harness)
+├── archive/                 # Historical experiments and migration snapshots
 ├── patches/                 # Paraformer EOF truncation fix
 ├── scripts/                 # Model download, ORT patching, engine build glue
 ├── deploy/
@@ -397,13 +441,14 @@ Clone with `--recurse-submodules` to pull `third_party/*`, or run `git submodule
 
 ## Changelog
 
-### v3.0-slim
+### Current Container Release
 
-- **95% smaller image** — 898 MB vs 17.7 GB. Multi-stage build extracts only the runtime Python packages (onnxruntime + sherpa-onnx) into an `ubuntu:22.04` base
-- **Host GPU library mounts** — CUDA/TensorRT/cuDNN libraries are bind-mounted from the host JetPack installation instead of baked into the image, improving cross-JetPack compatibility
-- **Same performance** — identical TTS/ASR latency and CUDA provider support (TRT + CUDA + CPU)
+- **Jetson highperf image** — `jetson-v1.12-highperf`, 2.02 GB, with host CUDA/TensorRT libraries mounted from JetPack and models/engines cached in `speech-models`.
+- **RK release image** — `rk-v1.4-closedloop`, 767 MB, with runtime-pinned RKNN dependencies and validated hybrid Matcha TTS.
+- **Raspberry Pi image** — `rpi-v1.0-onnx`, 568 MB, CPU-only ONNX path.
 
-> **Note:** v3.0-slim is derived from v2.2 (the full image). There is no standalone v3.0 fat image — `v3.0-slim` is the current production release. This version requires host GPU lib mounts at runtime (see Quick Start). This is standard practice for Jetson containers and matches the pattern used by vision-trt and other optimized images.
+See the 2026-05-18 benchmark report for image size, model volume,
+resident memory, startup time, and concurrency results.
 
 ### v2.2
 

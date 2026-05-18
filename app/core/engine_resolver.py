@@ -1,4 +1,4 @@
-"""Runtime TRT engine resolver for seeed-local-voice.
+"""Runtime TRT engine resolver for OpenVoiceStream.
 
 For each engine declared in the active profile's ``required_engines`` list,
 the resolver guarantees a valid engine file exists at the target path
@@ -6,7 +6,11 @@ before backends are imported. Resolution order:
 
   1. Local cache hit  -- engine_path exists + sidecar .meta.json matches host
   2. HuggingFace prebuilt bundle for <host_sig>.tar.gz
-  3. Local compile fallback -- run scripts/build_<model>.sh (unless ``hf_only``)
+  3. Local compile fallback -- only now fetch ONNX if missing, then run
+     scripts/build_<model>.sh (unless ``hf_only``)
+
+ONNX artifacts are rebuild inputs, not TensorRT runtime dependencies. A
+compatible prebuilt engine must not trigger ONNX downloads.
 
 Backends read engine paths from env vars at import time, so the resolver
 also injects every entry's ``env_var`` → ``engine_path`` into ``os.environ``
@@ -53,10 +57,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # --- env keys controlling resolver behaviour ------------------------------
-ENV_MODELS_DIR = "SEEED_LOCAL_VOICE_MODELS_DIR"  # default /opt/models
-ENV_PROJECT_ROOT = "SEEED_LOCAL_VOICE_PROJECT_ROOT"  # for resolving build scripts
-ENV_PREFETCH_ONNX = "SEEED_LOCAL_VOICE_PREFETCH_ONNX"  # 0/1, default 0
-ENV_FORCE_REBUILD = "SEEED_LOCAL_VOICE_FORCE_REBUILD"  # 0/1, default 0
+ENV_MODELS_DIR = ("OVS_MODELS_DIR", "SEEED_LOCAL_VOICE_MODELS_DIR")  # default /opt/models
+ENV_PROJECT_ROOT = ("OVS_PROJECT_ROOT", "SEEED_LOCAL_VOICE_PROJECT_ROOT")  # for resolving build scripts
+ENV_PREFETCH_ONNX = ("OVS_PREFETCH_ONNX", "SEEED_LOCAL_VOICE_PREFETCH_ONNX")  # 0/1, default 0
+ENV_FORCE_REBUILD = ("OVS_FORCE_REBUILD", "SEEED_LOCAL_VOICE_FORCE_REBUILD")  # 0/1, default 0
 
 # Conservative WS by device tier (MiB). Auto-detected from total RAM.
 _DEVICE_TIER_WS = {
@@ -64,6 +68,16 @@ _DEVICE_TIER_WS = {
     "nx": 2048,
     "agx": 4096,
 }
+
+
+def _env(names: str | tuple[str, ...], default: str | None = None) -> str | None:
+    if isinstance(names, str):
+        names = (names,)
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +122,7 @@ def _detect_sm() -> str:
     if m:
         return m.group(1) + m.group(2)
     # Fallback: read /proc/device-tree for Tegra
-    return os.environ.get("SEEED_LOCAL_VOICE_SM", "87")
+    return _env(("OVS_SM", "SEEED_LOCAL_VOICE_SM"), "87") or "87"
 
 
 def _detect_trt_version() -> str:
@@ -118,7 +132,7 @@ def _detect_trt_version() -> str:
     m = re.search(r"(\d+\.\d+)\.\d+\.\d+", out)
     if m:
         return m.group(1)
-    return os.environ.get("SEEED_LOCAL_VOICE_TRT", "10.3")
+    return _env(("OVS_TRT", "SEEED_LOCAL_VOICE_TRT"), "10.3") or "10.3"
 
 
 def _detect_cuda_version() -> str:
@@ -127,7 +141,7 @@ def _detect_cuda_version() -> str:
     m = re.search(r"\+cuda(\d+\.\d+)", out)
     if m:
         return m.group(1)
-    return os.environ.get("SEEED_LOCAL_VOICE_CUDA", "12.6")
+    return _env(("OVS_CUDA", "SEEED_LOCAL_VOICE_CUDA"), "12.6") or "12.6"
 
 
 def _detect_jp_version() -> str:
@@ -136,10 +150,10 @@ def _detect_jp_version() -> str:
         with open("/etc/nv_tegra_release") as f:
             line = f.readline()
     except OSError:
-        return os.environ.get("SEEED_LOCAL_VOICE_JP", "6.2")
+        return _env(("OVS_JP", "SEEED_LOCAL_VOICE_JP"), "6.2") or "6.2"
     m = re.search(r"R(\d+)\s*\(release\)\s*,\s*REVISION:\s*(\d+)\.(\d+)", line)
     if not m:
-        return os.environ.get("SEEED_LOCAL_VOICE_JP", "6.2")
+        return _env(("OVS_JP", "SEEED_LOCAL_VOICE_JP"), "6.2") or "6.2"
     rmajor = int(m.group(1))
     # R36 → JetPack 6.x, R35 → JetPack 5.x
     jp_major = {36: 6, 35: 5}.get(rmajor, 6)
@@ -175,7 +189,7 @@ def _detect_device_tier() -> str:
                     return "agx"
     except OSError:
         pass
-    return os.environ.get("SEEED_LOCAL_VOICE_DEVICE_TIER", "nano")
+    return _env(("OVS_DEVICE_TIER", "SEEED_LOCAL_VOICE_DEVICE_TIER"), "nano") or "nano"
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +237,21 @@ def _write_meta(engine_path: Path, host: HostSignature, source: str, onnx_sha: O
     tmp = mp.with_suffix(mp.suffix + ".tmp")
     tmp.write_text(json.dumps(meta, indent=2))
     os.replace(tmp, mp)
+
+
+def _iter_extracted_engine_files(engine_dir: Path) -> list[Path]:
+    """Return TensorRT engine files extracted into an engine directory."""
+    if not engine_dir.exists():
+        return []
+    out: list[Path] = []
+    for path in engine_dir.iterdir():
+        if not path.is_file():
+            continue
+        if path.name.startswith("._"):
+            continue
+        if path.suffix in {".engine", ".plan"}:
+            out.append(path)
+    return out
 
 
 def _meta_matches(engine_path: Path, host: HostSignature) -> bool:
@@ -288,11 +317,56 @@ _BUILD_ENV_ALLOWLIST = frozenset({
 
 
 def _project_root() -> Path:
-    env = os.environ.get(ENV_PROJECT_ROOT)
+    env = _env(ENV_PROJECT_ROOT)
     if env:
         return Path(env)
     # app/core/engine_resolver.py → project root = parents[2]
     return Path(__file__).resolve().parents[2]
+
+
+def _model_root(spec: EngineSpec) -> Path:
+    return spec.engine_path.parent.parent
+
+
+def _path_under(path: Path, root: Path) -> Optional[Path]:
+    """Return ``path`` relative to ``root`` if it stays inside the model dir."""
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+
+
+def _onnx_path_candidates(spec: EngineSpec) -> list[Path]:
+    """Candidate local paths for a profile's ONNX input.
+
+    Older profile entries used ``onnx_input`` as a filename under
+    ``<model>/onnx``. Some build scripts, however, consume files from the
+    model root (Paraformer) or intentionally use ``../model-steps-3.onnx`` to
+    point from ``onnx/`` back to the Matcha source model. Keep both layouts
+    working and reject paths that escape the model directory.
+    """
+    if not spec.onnx_input:
+        return []
+    raw = Path(spec.onnx_input)
+    if raw.is_absolute():
+        return [raw]
+
+    root = _model_root(spec)
+    candidates: list[Path] = []
+    for candidate in (root / "onnx" / raw, root / raw):
+        if _path_under(candidate, root) is not None and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _onnx_manifest_candidates(spec: EngineSpec) -> list[tuple[str, Path]]:
+    root = _model_root(spec)
+    rels: list[tuple[str, Path]] = []
+    for path in _onnx_path_candidates(spec):
+        rel = _path_under(path, root)
+        if rel is not None:
+            rels.append((rel.as_posix(), path))
+    return rels
 
 
 def _try_hf_resolve(spec: EngineSpec, host: HostSignature) -> bool:
@@ -335,11 +409,15 @@ def _try_hf_resolve(spec: EngineSpec, host: HostSignature) -> bool:
         return False
 
     onnx_sha = None
-    if spec.onnx_input:
-        onnx_p = spec.engine_path.parent.parent / "onnx" / spec.onnx_input
+    for onnx_p in _onnx_path_candidates(spec):
         if onnx_p.exists():
             onnx_sha = _sha256_file(onnx_p)
-    _write_meta(spec.engine_path, host, source="hf_bundle", onnx_sha=onnx_sha)
+            break
+    for engine_file in _iter_extracted_engine_files(spec.engine_path.parent):
+        try:
+            _write_meta(engine_file, host, source="hf_bundle", onnx_sha=onnx_sha)
+        except OSError as exc:
+            logger.warning("failed to write HF bundle metadata for %s: %s", engine_file, exc)
     return True
 
 
@@ -349,16 +427,23 @@ def _ensure_onnx_for_compile(spec: EngineSpec) -> Path:
         raise RuntimeError(
             f"{spec.model_id}/{spec.engine_file}: build_script declared but onnx_input missing"
         )
-    onnx_path = spec.engine_path.parent.parent / "onnx" / spec.onnx_input
-    if onnx_path.exists():
-        return onnx_path
+    for onnx_path in _onnx_path_candidates(spec):
+        if onnx_path.exists():
+            return onnx_path
+
     from app.core import hf_artifacts
-    manifest_key = f"onnx/{spec.onnx_input}"
-    rel = f"models/{spec.model_id}/{manifest_key}"
     manifest = hf_artifacts.fetch_manifest(spec.model_id)  # raises if no manifest
-    info = (manifest.get("files") or {}).get(manifest_key) or {}
-    hf_artifacts.download_file(rel, onnx_path, expected_sha256=info.get("sha256"))
-    return onnx_path
+    files = manifest.get("files") or {}
+    for manifest_key, onnx_path in _onnx_manifest_candidates(spec):
+        info = files.get(manifest_key)
+        if not info:
+            continue
+        rel = f"models/{spec.model_id}/{manifest_key}"
+        hf_artifacts.download_file(rel, onnx_path, expected_sha256=info.get("sha256"))
+        return onnx_path
+    raise hf_artifacts.ArtifactError(
+        f"HF manifest for {spec.model_id} has no ONNX input for {spec.engine_file}"
+    )
 
 
 def _compile_locally(spec: EngineSpec, host: HostSignature) -> None:
@@ -423,7 +508,7 @@ def _compile_locally(spec: EngineSpec, host: HostSignature) -> None:
 # ---------------------------------------------------------------------------
 
 def _models_dir() -> Path:
-    return Path(os.environ.get(ENV_MODELS_DIR, "/opt/models"))
+    return Path(_env(ENV_MODELS_DIR, "/opt/models") or "/opt/models")
 
 
 def _acquire_lock():
@@ -472,7 +557,7 @@ def resolve_all(profile: dict) -> dict[str, Path]:
         return {}
 
     host = detect_host_signature()
-    force_rebuild = os.environ.get(ENV_FORCE_REBUILD, "0") in ("1", "true", "yes")
+    force_rebuild = (_env(ENV_FORCE_REBUILD, "0") or "0") in ("1", "true", "yes")
 
     fd = _acquire_lock()
     try:

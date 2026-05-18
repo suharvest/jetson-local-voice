@@ -1,12 +1,14 @@
-"""Paraformer streaming ASR — encoder via TensorRT, decoder via ONNX Runtime CUDA.
+"""Paraformer streaming ASR — encoder + decoder via TensorRT.
 
 Supports: OFFLINE, STREAMING
-Uses numpy-only fbank extraction + TRT encoder (CUDA) + ORT decoder (CUDA EP).
+Uses numpy-only fbank extraction + TRT encoder (CUDA) + TRT decoder (CUDA).
 CIF (Continuous Integrate-and-Fire) handles token timing and endpoint detection.
 
-Provider architecture: encoder=trt, decoder=ort_cuda
+Provider architecture: encoder=trt, decoder=trt
 
-Based on M1 manifest (docs/plans/matcha-paraformer-trt-m1-manifest-2026-04-28.md):
+build_paraformer_trt.sh builds the decoder engine from the surgically-modified
+decoder-trt.onnx (make_pad_mask subgraphs externalized as pad_mask/enc_pad_mask inputs).
+
 - Encoder input:  speech [1, feats_length, 560] float32
 - Encoder input:  speech_lengths [1] int32
 - Encoder output: enc [1, feats_length, 512] float32
@@ -14,6 +16,7 @@ Based on M1 manifest (docs/plans/matcha-paraformer-trt-m1-manifest-2026-04-28.md
 - Encoder output: alphas [1, feats_length] float32
 - Decoder input:  enc, enc_len, acoustic_embeds [1, token_length, 512], acoustic_embeds_len [1]
 - Decoder input:  in_cache_0..15 [1, 512, 10] float32 (fixed-depth causal window)
+- Decoder input:  pad_mask [1, token_length], enc_pad_mask [1, enc_length] float32
 - Decoder output: logits [1, token_length, 8404], sample_ids [1, token_length] int64
 - Decoder output: out_cache_0..15 [1, 512, 10]
 - Vocab: 8404 tokens (0=blank, 1=<s>, 2=</s>, 8403=<unk>)
@@ -53,10 +56,25 @@ DEC_ONNX_PATH = os.environ.get(
     "PARAFORMER_DEC_ONNX",
     os.path.join(PARAFORMER_MODEL_DIR, "decoder.onnx"),
 )
+DEC_ENGINE_PATH = os.environ.get(
+    "PARAFORMER_DEC_ENGINE",
+    os.path.join(PARAFORMER_MODEL_DIR, "engines", "paraformer_decoder_fp16.plan"),
+)
 TOKENS_PATH = os.environ.get(
     "PARAFORMER_TOKENS",
     os.path.join(PARAFORMER_MODEL_DIR, "tokens.txt"),
 )
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %d", name, os.environ.get(name), default)
+        return default
+
+
+PREROLL_MS = max(0, _env_int("PARAFORMER_PREROLL_MS", 100))
 
 # Streaming parameters — match sherpa-onnx training distribution
 # (https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en)
@@ -281,17 +299,13 @@ def load_tokens(path: str) -> list[str]:
 def decode_ids(token_ids: list[int], tokens: list[str]) -> str:
     """Decode token IDs to text, filtering special tokens.
 
-    Skips BLANK/SOS/EOS and suppresses immediate adjacent-id repeats
-    (e.g. [6049, 6049] → one "好"). EOS is skipped, NOT used as a stop:
-    Paraformer streaming may emit EOS mid-stream as cache-flush artifact.
+    Skips BLANK/SOS/EOS. EOS is skipped, NOT used as a stop: Paraformer
+    streaming may emit EOS mid-stream as cache-flush artifact.
     BPE continuation suffix "@@" is stripped and merged with next token.
     """
     pieces = []
-    prev_tid: Optional[int] = None
     for tid in token_ids:
         if tid in (BLANK_ID, SOS_ID, EOS_ID):
-            continue
-        if tid == prev_tid:
             continue
         if 0 <= tid < len(tokens):
             token = tokens[tid]
@@ -300,8 +314,21 @@ def decode_ids(token_ids: list[int], tokens: list[str]) -> str:
             if token.endswith("@@"):
                 token = token[:-2]
             pieces.append(token)
-            prev_tid = tid
     return "".join(pieces)
+
+
+def add_preroll_silence(audio: np.ndarray) -> np.ndarray:
+    """Add a short leading context pad for zero-start utterances."""
+    if PREROLL_MS <= 0 or len(audio) == 0:
+        return audio
+    pad = np.zeros(int(SAMPLE_RATE * PREROLL_MS / 1000), dtype=np.float32)
+    return np.concatenate([pad, audio.astype(np.float32, copy=False)])
+
+
+def initial_preroll_audio() -> np.ndarray:
+    if PREROLL_MS <= 0:
+        return np.array([], dtype=np.float32)
+    return np.zeros(int(SAMPLE_RATE * PREROLL_MS / 1000), dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +365,7 @@ class ParaformerTRTStream(ASRStream):
         self._tokens = backend._tokens
 
         # Audio accumulation
-        self._audio_buf = np.array([], dtype=np.float32)
+        self._audio_buf = initial_preroll_audio()
         self._processed_chunks = 0
 
         # History audio for feature normalization continuity (Bug G fix)
@@ -373,7 +400,7 @@ class ParaformerTRTStream(ASRStream):
         self._final_text_cache = ""
 
     def _reset_utterance_state(self) -> None:
-        self._audio_buf = np.array([], dtype=np.float32)
+        self._audio_buf = initial_preroll_audio()
         self._processed_chunks = 0
         self._all_token_ids = []
         self._partial_text = ""
@@ -628,12 +655,12 @@ class ParaformerTRTBackend(ASRBackend):
         self._engines: dict[str, trt.IEngine] = {}
         self._contexts: dict[str, trt.IExecutionContext] = {}
         self._bindings: dict[str, dict] = {}
-        self._dec_session = None  # ORT InferenceSession
         self._enc_ort_session = None  # ORT fallback for encoder
         self._enc_provider = "trt"  # "trt" or "ort_cuda"
         self._tokens: list[str] = []
         self._ready = False
         self._enc_active_profile: Optional[int] = None
+        self._enc_profile_ranges: list[tuple[int, int, int]] = []
 
     # -- Properties ----------------------------------------------------------
 
@@ -644,7 +671,7 @@ class ParaformerTRTBackend(ASRBackend):
     @property
     def providers(self) -> dict[str, str]:
         """Return provider labels for each component."""
-        return {"encoder": self._enc_provider, "decoder": "ort_cuda"}
+        return {"encoder": self._enc_provider, "decoder": "trt"}
 
     @property
     def capabilities(self) -> set[ASRCapability]:
@@ -665,7 +692,7 @@ class ParaformerTRTBackend(ASRBackend):
 
         # Validate files
         for label, path in [("encoder engine", ENC_ENGINE_PATH),
-                            ("decoder ONNX", DEC_ONNX_PATH)]:
+                            ("decoder engine", DEC_ENGINE_PATH)]:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"Paraformer {label} not found: {path}")
         if not os.path.isfile(TOKENS_PATH):
@@ -680,11 +707,13 @@ class ParaformerTRTBackend(ASRBackend):
         eng = self._engines["enc"]
         tensor_names = [eng.get_tensor_name(i) for i in range(eng.num_io_tensors)]
         logger.info("Encoder engine (%d I/O): %s", len(tensor_names), tensor_names)
+        self._enc_profile_ranges = self._load_encoder_profile_ranges(eng)
         self._contexts["enc"] = eng.create_execution_context()
 
-        # Validate encoder TRT engine with a warmup run. If it produces NaN,
-        # fall back to ORT CUDA EP (FP16 engines can overflow on Jetson).
-        warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        # Validate encoder TRT engine with a warmup run. Use a low-level sine
+        # signal instead of zeros — zero audio causes LayerNorm division-by-zero
+        # in TRT's FP16/BF16 kernels (ORT adds epsilon, TRT may not).
+        warmup_audio = (np.sin(2 * np.pi * 440 * np.arange(SAMPLE_RATE) / SAMPLE_RATE) * 0.3).astype(np.float32)
         warmup_feats = compute_fbank(warmup_audio)
         warmup_feats = stack_frames(warmup_feats)
         n_warmup = min(warmup_feats.shape[0], 40)
@@ -697,7 +726,7 @@ class ParaformerTRTBackend(ASRBackend):
         else:
             logger.warning(
                 "Encoder TRT engine produces NaN, falling back to ORT CUDA EP. "
-                "Rebuild with --bf16 or --best precision to restore TRT."
+                "Rebuild the encoder in FP32 to restore TRT."
             )
             self._enc_provider = "ort_cuda"
             import onnxruntime
@@ -713,32 +742,20 @@ class ParaformerTRTBackend(ASRBackend):
             # Warmup ORT encoder
             self._run_encoder_ort(warmup_feats)
 
-        # -- Load decoder ONNX via ORT CUDA EP --
-        import onnxruntime
-        dec_opts = onnxruntime.SessionOptions()
-        dec_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        dec_opts.log_severity_level = 3  # only errors
-        self._dec_session = onnxruntime.InferenceSession(
-            DEC_ONNX_PATH,
-            sess_options=dec_opts,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        )
-        dec_inputs = [(n.name, n.shape, n.type) for n in self._dec_session.get_inputs()]
-        dec_outputs = [(n.name, n.shape, n.type) for n in self._dec_session.get_outputs()]
-        logger.info("Decoder ORT session (%d in / %d out):",
-                    len(dec_inputs), len(dec_outputs))
-        for n, s, t in dec_inputs:
-            logger.info("  IN  %s %s %s", n, s, t)
-        for n, s, t in dec_outputs:
-            logger.info("  OUT %s %s %s", n, s, t)
+        # -- Load decoder TRT engine --
+        self._engines["dec"] = _load_trt_engine(DEC_ENGINE_PATH)
+        dec_eng = self._engines["dec"]
+        dec_tensor_names = [dec_eng.get_tensor_name(i) for i in range(dec_eng.num_io_tensors)]
+        logger.info("Decoder engine (%d I/O): %s", len(dec_tensor_names), dec_tensor_names)
+        self._contexts["dec"] = dec_eng.create_execution_context()
 
-        # Warmup decoder with minimal shapes
+        # Warmup decoder
         dummy_enc = np.zeros((1, 1, 512), dtype=np.float32)
         dummy_ae = np.zeros((1, 512), dtype=np.float32)
         dummy_cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
         self._run_decoder(dummy_enc, 1, dummy_ae, 1, dummy_cache)
 
-        logger.info("Paraformer TRT backend ready (encoder=%s, decoder=ort_cuda)", self._enc_provider)
+        logger.info("Paraformer TRT backend ready (encoder=%s, decoder=trt)", self._enc_provider)
         self._ready = True
 
     # -- Public API ---------------------------------------------------------
@@ -769,12 +786,14 @@ class ParaformerTRTBackend(ASRBackend):
                 np.linspace(0, len(data) - 1, new_len),
                 np.arange(len(data)), data,
             ).astype(np.float32)
+        data = add_preroll_silence(data)
 
         # FBank -> stack -> encoder (full audio)
         feats = compute_fbank(data)
         feats = stack_frames(feats)
 
-        # Use largest chunk that fits engine profile (max=400 in BF16 dual-profile build)
+        # Use largest chunk that fits the encoder TRT profile (max=400 in the
+        # default FP32 build).
         # to give FSMN encoder full left context. Falls back to 40-frame chunking
         # only when audio exceeds engine max.
         ENGINE_MAX_FRAMES = 400
@@ -830,6 +849,7 @@ class ParaformerTRTBackend(ASRBackend):
         if not self._ready:
             raise RuntimeError("Paraformer TRT backend not loaded; call preload() first")
 
+        audio = add_preroll_silence(audio)
         feats = compute_fbank(audio)
         feats = stack_frames(feats)
 
@@ -956,12 +976,13 @@ class ParaformerTRTBackend(ASRBackend):
         """
         ctx = self._contexts["enc"]
         n_frames = feats.shape[0]
-        n_profiles = getattr(self._engines["enc"], "num_optimization_profiles", 1)
-        # Profile 1 covers 40..400 frames and matches streaming-with-history
-        # (~140) plus offline chunks. Skip profile 0 to avoid TRT single-context
-        # profile-switch races; pad short inputs up to profile 1 min instead.
-        profile_idx = 1 if n_profiles > 1 else 0
-        enc_min_frames = 40
+        profile_idx, enc_min_frames, enc_max_frames = self._select_encoder_profile(n_frames)
+        if n_frames > enc_max_frames:
+            logger.error(
+                "Encoder TRT input has %d frames, exceeding selected profile %d max=%d",
+                n_frames, profile_idx, enc_max_frames,
+            )
+            return None, None
 
         # Pad to engine min shape if needed
         orig_n_frames = n_frames
@@ -1062,6 +1083,46 @@ class ParaformerTRTBackend(ASRBackend):
 
         return enc_out, alphas_out
 
+    def _load_encoder_profile_ranges(self, eng) -> list[tuple[int, int, int]]:
+        """Return (profile_idx, min_frames, max_frames) for encoder speech input."""
+        ranges: list[tuple[int, int, int]] = []
+        n_profiles = getattr(eng, "num_optimization_profiles", 1)
+        for profile_idx in range(n_profiles):
+            try:
+                shapes = eng.get_tensor_profile_shape("speech", profile_idx)
+                min_frames = int(shapes[0][1])
+                max_frames = int(shapes[2][1])
+            except Exception as exc:
+                logger.warning(
+                    "Unable to inspect encoder profile %d shape range: %s",
+                    profile_idx,
+                    exc,
+                )
+                continue
+            ranges.append((profile_idx, min_frames, max_frames))
+        if not ranges:
+            ranges = [(0, 40, 400)]
+        ranges.sort(key=lambda item: (item[1], item[2]))
+        logger.info("Encoder profile ranges: %s", ranges)
+        return ranges
+
+    def _select_encoder_profile(self, n_frames: int) -> tuple[int, int, int]:
+        """Pick the narrowest TensorRT profile that can run n_frames."""
+        ranges = self._enc_profile_ranges or [(0, 40, 400)]
+
+        compatible = [
+            item for item in ranges
+            if item[1] <= n_frames <= item[2]
+        ]
+        if compatible:
+            return min(compatible, key=lambda item: item[2] - item[1])
+
+        pad_candidates = [item for item in ranges if n_frames < item[1]]
+        if pad_candidates:
+            return min(pad_candidates, key=lambda item: item[1])
+
+        return max(ranges, key=lambda item: item[2])
+
     def _alloc_enc_buffers(self, n_frames: int) -> dict:
         bufs = {}
         bufs["speech"] = self._cuda_malloc(1 * n_frames * 560 * 4)
@@ -1087,56 +1148,115 @@ class ParaformerTRTBackend(ASRBackend):
         acoustic_embeds_len: int,
         cache: list[np.ndarray],
     ) -> Optional[np.ndarray]:
-        """Run decoder via ONNX Runtime CUDA EP.
+        """Run decoder via TensorRT engine.
 
         Args:
             enc: [1, enc_len, 512] encoder output
             enc_len: int
-            acoustic_embeds: [num_tokens, 512]
+            acoustic_embeds: [num_tokens, 512] — expanded to [1, num_tokens, 512]
             acoustic_embeds_len: int
-            cache: list of 16 [1, 512, 10] cache tensors
+            cache: list of 16 [1, 512, 10] cache tensors (updated in-place)
 
         Returns:
             sample_ids: [n_tokens] int64 token IDs, or None on failure
         """
-        if self._dec_session is None:
-            logger.error("Decoder ORT session not loaded")
+        ctx = self._contexts.get("dec")
+        if ctx is None:
+            logger.error("Decoder TRT context not available")
             return None
 
         n_tokens = acoustic_embeds.shape[0]
-
-        # Pad acoustic_embeds to 1 token if empty (shouldn't happen at call site)
         if n_tokens == 0:
             return np.array([], dtype=np.int64)
 
-        try:
-            # Build ORT input dict
-            ort_inputs = {
-                "enc": np.ascontiguousarray(enc),
-                "enc_len": np.array([enc_len], dtype=np.int32),
-                "acoustic_embeds": np.ascontiguousarray(acoustic_embeds[np.newaxis, :]),
-                "acoustic_embeds_len": np.array([acoustic_embeds_len], dtype=np.int32),
-            }
-            for i in range(16):
-                ort_inputs[f"in_cache_{i}"] = np.ascontiguousarray(cache[i])
+        enc_nframes = enc.shape[1]
+        key = f"dec_{enc_nframes}_{n_tokens}"
 
-            # Single run: fetch sample_ids + all updated caches
-            output_names = ["sample_ids"] + [f"out_cache_{i}" for i in range(16)]
-            outputs = self._dec_session.run(
-                output_names=output_names,
-                input_feed=ort_inputs,
-            )
+        if key not in self._bindings:
+            self._bindings[key] = self._alloc_dec_buffers(enc_nframes, n_tokens)
+        bufs = self._bindings[key]
 
-            sample_ids = outputs[0][0]  # [n_tokens] int64
-            for i in range(16):
-                oc = outputs[1 + i]
-                if oc.shape != cache[i].shape:
-                    cache[i] = oc
-                else:
-                    cache[i][:] = oc
+        # Register tensor addresses (TRT 10.x requirement)
+        ctx.set_tensor_address("enc", bufs["enc"])
+        ctx.set_tensor_address("enc_len", bufs["enc_len"])
+        ctx.set_tensor_address("acoustic_embeds", bufs["acoustic_embeds"])
+        ctx.set_tensor_address("acoustic_embeds_len", bufs["acoustic_embeds_len"])
+        ctx.set_tensor_address("pad_mask", bufs["pad_mask"])
+        ctx.set_tensor_address("enc_pad_mask", bufs["enc_pad_mask"])
+        for i in range(16):
+            ctx.set_tensor_address(f"in_cache_{i}", bufs[f"in_cache_{i}"])
+            ctx.set_tensor_address(f"out_cache_{i}", bufs[f"out_cache_{i}"])
+        ctx.set_tensor_address("logits", bufs["logits"])
+        ctx.set_tensor_address("sample_ids", bufs["sample_ids"])
 
-            return sample_ids
+        # Set dynamic shapes
+        ctx.set_input_shape("enc", (1, enc_nframes, 512))
+        ctx.set_input_shape("acoustic_embeds", (1, n_tokens, 512))
+        ctx.set_input_shape("pad_mask", (1, n_tokens))
+        ctx.set_input_shape("enc_pad_mask", (1, enc_nframes))
 
-        except Exception as e:
-            logger.error("Decoder ORT inference failed: %s", e)
+        # Create CUDA stream
+        err, stream = cudart.cudaStreamCreate()
+        if self._cuda_err(err) != 0:
+            logger.error("cudaStreamCreate failed for decoder")
             return None
+
+        # Copy inputs to device
+        try:
+            cudart.cudaMemcpy(bufs["enc"], enc.ctypes.data, enc.nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            cudart.cudaMemcpy(bufs["enc_len"], np.array([enc_nframes], dtype=np.int32).ctypes.data, 4,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            ae_batch = np.ascontiguousarray(acoustic_embeds[np.newaxis, :])
+            cudart.cudaMemcpy(bufs["acoustic_embeds"], ae_batch.ctypes.data, ae_batch.nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            cudart.cudaMemcpy(bufs["acoustic_embeds_len"], np.array([n_tokens], dtype=np.int32).ctypes.data, 4,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            # Masks: [1, L] all-ones (matching decoder-trt.onnx inputs).
+            # CIF produces exact token counts without padding, so all positions are valid.
+            pad_mask = np.ones((1, n_tokens), dtype=np.float32)
+            enc_pad_mask = np.ones((1, enc_nframes), dtype=np.float32)
+            cudart.cudaMemcpy(bufs["pad_mask"], pad_mask.ctypes.data, pad_mask.nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            cudart.cudaMemcpy(bufs["enc_pad_mask"], enc_pad_mask.ctypes.data, enc_pad_mask.nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            for i in range(16):
+                cudart.cudaMemcpy(bufs[f"in_cache_{i}"], cache[i].ctypes.data, cache[i].nbytes,
+                                  cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+            # Execute
+            success = ctx.execute_async_v3(stream)
+            cudart.cudaStreamSynchronize(stream)
+
+            if not success:
+                logger.error("Decoder TRT execute_async_v3 failed (enc=%d, tokens=%d)", enc_nframes, n_tokens)
+                return None
+
+            # Copy outputs back
+            sample_ids = np.empty((1, n_tokens), dtype=np.int64)
+            cudart.cudaMemcpy(sample_ids.ctypes.data, bufs["sample_ids"], sample_ids.nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+            for i in range(16):
+                cudart.cudaMemcpy(cache[i].ctypes.data, bufs[f"out_cache_{i}"], cache[i].nbytes,
+                                  cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+        finally:
+            cudart.cudaStreamDestroy(stream)
+
+        return sample_ids[0]
+
+    def _alloc_dec_buffers(self, enc_nframes: int, n_tokens: int) -> dict:
+        """Allocate device buffers for decoder TRT inference."""
+        bufs = {}
+        bufs["enc"] = self._cuda_malloc(1 * enc_nframes * 512 * 4)
+        bufs["enc_len"] = self._cuda_malloc(4)
+        bufs["acoustic_embeds"] = self._cuda_malloc(1 * n_tokens * 512 * 4)
+        bufs["acoustic_embeds_len"] = self._cuda_malloc(4)
+        bufs["pad_mask"] = self._cuda_malloc(n_tokens * 4)
+        bufs["enc_pad_mask"] = self._cuda_malloc(enc_nframes * 4)
+        for i in range(16):
+            bufs[f"in_cache_{i}"] = self._cuda_malloc(1 * 512 * 10 * 4)
+            bufs[f"out_cache_{i}"] = self._cuda_malloc(1 * 512 * 10 * 4)
+        bufs["logits"] = self._cuda_malloc(1 * n_tokens * 8404 * 4)  # float32
+        bufs["sample_ids"] = self._cuda_malloc(1 * n_tokens * 8)  # int64
+        return bufs

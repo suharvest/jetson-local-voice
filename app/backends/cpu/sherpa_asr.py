@@ -32,6 +32,7 @@ STREAMING_MODEL_DIR = os.environ.get(
     _DEFAULT_ASR_DIRS.get(LANGUAGE_MODE, _DEFAULT_ASR_DIRS["zh_en"]),
 )
 ASR_PROVIDER = os.environ.get("STREAMING_ASR_PROVIDER", "cuda")
+OFFLINE_ASR_PROVIDER = os.environ.get("OFFLINE_ASR_PROVIDER", os.environ.get("ASR_PROVIDER", ASR_PROVIDER))
 ASR_NUM_THREADS = int(os.environ.get("STREAMING_ASR_NUM_THREADS", "4"))
 
 # ---------------------------------------------------------------------------
@@ -196,7 +197,9 @@ class SherpaASRBackend(ASRBackend):
 
     @property
     def capabilities(self) -> set[ASRCapability]:
-        caps = {ASRCapability.OFFLINE}
+        caps = set()
+        if self._offline_recognizer is not None:
+            caps.add(ASRCapability.OFFLINE)
         if self._online_recognizer is not None:
             caps.add(ASRCapability.STREAMING)
         return caps
@@ -309,19 +312,22 @@ class SherpaASRBackend(ASRBackend):
         """Load SenseVoice offline recognizer."""
         import sherpa_onnx
 
-        base = os.path.join(os.environ.get("MODEL_DIR", "/opt/models"), "sensevoice")
+        model_root = os.environ.get("MODEL_DIR", "/opt/models")
+        base = os.path.join(model_root, "sensevoice")
         dirs = glob.glob(os.path.join(base, "sherpa-onnx-sense-voice-*"))
+        if not dirs:
+            dirs = glob.glob(os.path.join(model_root, "sherpa-onnx-sense-voice-*"))
         model_dir = dirs[0] if dirs else base
 
         model_path = os.path.join(model_dir, "model.int8.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
 
-        logger.info("Loading SenseVoice model from %s (provider=cuda)", model_dir)
+        logger.info("Loading SenseVoice model from %s (provider=%s)", model_dir, OFFLINE_ASR_PROVIDER)
         recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path,
             tokens=tokens_path,
             use_itn=True,
-            provider="cuda",
+            provider=OFFLINE_ASR_PROVIDER,
         )
         logger.info("SenseVoice model loaded.")
         return recognizer

@@ -150,6 +150,8 @@ class ASRClient:
         if eos_mode == "vad" and self.vad_backend:
             query["vad"] = self.vad_backend
             query["vad_silence_ms"] = str(self.vad_silence_ms)
+        elif eos_mode in ("forced", "eou"):
+            query["vad"] = "none"
         qs = urllib.parse.urlencode(query)
 
         ws = websocket.create_connection(
@@ -158,6 +160,8 @@ class ASRClient:
         )
         t_first_send = time.monotonic()
         t_first_partial: float | None = None
+        final_text = ""
+        final_received = False
 
         # Pump audio in a thread so we can read partials concurrently
         # Simpler approach: send each chunk, then non-blocking poll for partials
@@ -189,8 +193,6 @@ class ASRClient:
                 time.sleep(chunk_dur)
         ws.settimeout(self.timeout)
 
-        final_text = ""
-        final_received = False
         t_eos = time.monotonic()
         if final_received:
             # VAD detected end during real audio — server already sent final.

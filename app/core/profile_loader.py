@@ -19,11 +19,19 @@ logger = logging.getLogger(__name__)
 _CURRENT_PROFILE: dict = {}
 
 
+def _env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
 def current_profile() -> dict:
     """Return the most recently loaded profile dict.
 
     If no profile has been applied (apply_profile_from_env returned early
-    because no SEEED_LOCAL_VOICE_PROFILE env was set, or it raised), this
+    because no OVS_PROFILE / SEEED_LOCAL_VOICE_PROFILE env was set, or it raised), this
     returns an empty dict. Callers that require a key should raise on miss.
     """
     return _CURRENT_PROFILE
@@ -47,10 +55,9 @@ def apply_profile_from_env() -> dict:
     """Apply profile environment defaults selected by env.
 
     Resolution order:
-      1. ``SEEED_LOCAL_VOICE_PROFILE_JSON`` — explicit path to a profile JSON.
-      2. ``SEEED_LOCAL_VOICE_PROFILE``      — explicit profile *name* (looked
-         up in configs/profiles/).
-      3. ``SEEED_LOCAL_VOICE_PRESET``       — high-level preset
+      1. ``OVS_PROFILE_JSON`` / ``SEEED_LOCAL_VOICE_PROFILE_JSON`` — explicit path.
+      2. ``OVS_PROFILE`` / ``SEEED_LOCAL_VOICE_PROFILE`` — profile name.
+      3. ``OVS_PRESET`` / ``SEEED_LOCAL_VOICE_PRESET`` — high-level preset
          (voice_clone / multilang / lite_zh_en / ...) resolved via
          ``profile_selector`` against the auto-detected device tier.
 
@@ -58,11 +65,18 @@ def apply_profile_from_env() -> dict:
     Environment variables already set by the operator are preserved.
     """
     profile_ref = (
-        os.environ.get("SEEED_LOCAL_VOICE_PROFILE_JSON")
-        or os.environ.get("SEEED_LOCAL_VOICE_PROFILE")
+        _env("OVS_PROFILE_JSON", "SEEED_LOCAL_VOICE_PROFILE_JSON")
+        or _env("OVS_PROFILE", "SEEED_LOCAL_VOICE_PROFILE")
+        or _env("OVS_PROFILE_DEFAULT", "SEEED_LOCAL_VOICE_PROFILE_DEFAULT")
     )
     if not profile_ref:
-        preset = os.environ.get("SEEED_LOCAL_VOICE_PRESET")
+        language_mode = os.environ.get("LANGUAGE_MODE", "").strip()
+        if language_mode == "zh_en":
+            profile_ref = "jetson-zh-en"
+        elif language_mode == "multilanguage":
+            profile_ref = "jetson-multilang-highperf"
+    if not profile_ref:
+        preset = _env("OVS_PRESET", "SEEED_LOCAL_VOICE_PRESET")
         if preset:
             from app.core.profile_selector import resolve_profile_name, UnsupportedPreset
             try:
@@ -92,10 +106,11 @@ def apply_profile_from_env() -> dict:
             os.environ[key] = os.path.expandvars(str(value))
             applied.append(key)
 
-    os.environ.setdefault("SEEED_LOCAL_VOICE_PROFILE_NAME", profile.get("name", path.stem))
+    os.environ.setdefault("OVS_PROFILE_NAME", profile.get("name", path.stem))
+    os.environ.setdefault("SEEED_LOCAL_VOICE_PROFILE_NAME", os.environ["OVS_PROFILE_NAME"])
     logger.info(
         "Applied profile %s from %s (%d env defaults; explicit env wins)",
-        os.environ.get("SEEED_LOCAL_VOICE_PROFILE_NAME"),
+        os.environ.get("OVS_PROFILE_NAME"),
         path,
         len(applied),
     )

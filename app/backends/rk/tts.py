@@ -2,7 +2,7 @@
 
 rkvoice-stream's TTSBackend ABC is smaller than ours (no `capabilities`,
 no `language` arg, `speaker_id` is int with default 0); the adapter
-forwards everything the seeed-local-voice contract requires and exposes
+forwards everything the OpenVoiceStream contract requires and exposes
 a conservative default capability set.
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 
+from app.core.language import detect_zh_en
 from app.core.tts_backend import TTSBackend, TTSCapability
 
 
@@ -18,7 +19,11 @@ from app.core.tts_backend import TTSBackend, TTSCapability
 # backends (matcha_rknn, piper_rknn, qwen3_rknn) all do basic + streaming
 # TTS, so declare that as the floor. The wire layer feature-detects optional
 # things (voice clone, etc.) via has_capability().
-_DEFAULT_RK_TTS_CAPS = {TTSCapability.BASIC_TTS, TTSCapability.STREAMING}
+_DEFAULT_RK_TTS_CAPS = {
+    TTSCapability.BASIC_TTS,
+    TTSCapability.STREAMING,
+    TTSCapability.MULTI_LANGUAGE,
+}
 
 
 class RKTTSBackend(TTSBackend):
@@ -60,8 +65,8 @@ class RKTTSBackend(TTSBackend):
         # rkvoice-stream's synthesize() doesn't take `language`; pass it
         # through kwargs only when explicitly set so backends that ignore it
         # are unaffected.
-        if language is not None:
-            kwargs.setdefault("language", language)
+        language = detect_zh_en(text, language)
+        kwargs.setdefault("language", language)
         return self._inner.synthesize(
             text=text,
             speaker_id=speaker_id if speaker_id is not None else 0,
@@ -84,9 +89,8 @@ class RKTTSBackend(TTSBackend):
         speaker_id = kwargs.pop("speaker_id", 0) or 0
         speed = kwargs.pop("speed", None)
         pitch_shift = kwargs.pop("pitch_shift", None)
-        language = kwargs.pop("language", None)
-        if language is not None:
-            kwargs.setdefault("language", language)
+        language = detect_zh_en(text, kwargs.pop("language", None))
+        kwargs.setdefault("language", language)
         for item in self._inner.synthesize_stream(
             text=text,
             speaker_id=speaker_id,
@@ -124,8 +128,8 @@ class RKTTSBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> Iterator[tuple[np.ndarray, dict]]:
-        if language is not None:
-            kwargs.setdefault("language", language)
+        language = detect_zh_en(text, language)
+        kwargs.setdefault("language", language)
         yield from self._inner.synthesize_stream(
             text=text,
             speaker_id=speaker_id if speaker_id is not None else 0,

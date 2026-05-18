@@ -17,7 +17,7 @@ def _write_pcm16_wav(path: str, pcm: bytes, sample_rate: int = 24000) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Seeed Local Voice product explicit-KV Qwen3-TTS path.")
+    parser = argparse.ArgumentParser(description="Run the OpenVoiceStream product explicit-KV Qwen3-TTS path.")
     parser.add_argument("--text", default="语音合成的稳定性。")
     parser.add_argument("--output", default="/tmp/jetson_voice_product_explicit_kv.wav")
     parser.add_argument("--max-audio-length", type=int, default=160)
@@ -27,8 +27,10 @@ def main() -> None:
     parser.add_argument("--streaming", action="store_true")
     args = parser.parse_args()
 
-    os.environ["SEEED_LOCAL_VOICE_TTS_BACKEND"] = "product_explicit_kv"
-    os.environ["SEEED_LOCAL_VOICE_TTS_SEED"] = str(args.seed)
+    os.environ["OVS_TTS_BACKEND"] = "product_explicit_kv"
+    os.environ["OVS_TTS_SEED"] = str(args.seed)
+    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_BACKEND", os.environ["OVS_TTS_BACKEND"])
+    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_SEED", os.environ["OVS_TTS_SEED"])
     backend = TRTEdgeLLMTTSBackend()
     backend.preload()
     if args.streaming:

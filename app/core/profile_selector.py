@@ -1,8 +1,8 @@
 """Map a user-facing ``preset`` (voice_clone / multilang / lite_zh_en / ...)
 plus the auto-detected device tier to a concrete profile JSON name.
 
-Operators set ``SEEED_LOCAL_VOICE_PRESET`` (or pass an explicit
-``SEEED_LOCAL_VOICE_PROFILE`` to override). This module owns:
+Operators set ``OVS_PRESET`` (or pass an explicit ``OVS_PROFILE`` to override).
+Legacy ``SEEED_LOCAL_VOICE_*`` variables remain supported. This module owns:
 
   1. Detecting which device the container is running on (Jetson Nano/NX/AGX
      are the same image but different SKUs; RK and RPi each have their own
@@ -145,9 +145,9 @@ def detect_device_tier() -> str:
     """Best-effort detection. Falls back to ``unknown`` so callers can decide
     whether to error or accept an explicit override.
 
-    Operators can force a tier by setting ``SEEED_LOCAL_VOICE_DEVICE_TIER``.
+    Operators can force a tier by setting ``OVS_DEVICE_TIER``.
     """
-    override = os.environ.get("SEEED_LOCAL_VOICE_DEVICE_TIER")
+    override = os.environ.get("OVS_DEVICE_TIER") or os.environ.get("SEEED_LOCAL_VOICE_DEVICE_TIER")
     if override:
         logger.info("device tier from env: %s", override)
         return override

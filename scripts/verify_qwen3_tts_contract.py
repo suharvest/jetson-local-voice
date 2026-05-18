@@ -127,13 +127,17 @@ def _expect_path_under_any(path: str, roots: list[str], label: str) -> None:
 
 
 def collect_contract(args: argparse.Namespace) -> dict[str, Any]:
-    os.environ["SEEED_LOCAL_VOICE_TTS_BACKEND"] = "product_explicit_kv"
-    os.environ["SEEED_LOCAL_VOICE_TTS_SEED"] = str(args.seed)
-    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", args.model_base)
-    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", args.native_module_dir)
+    os.environ["OVS_TTS_BACKEND"] = "product_explicit_kv"
+    os.environ["OVS_TTS_SEED"] = str(args.seed)
+    os.environ.setdefault("OVS_TTS_MODEL_BASE", args.model_base)
+    os.environ.setdefault("OVS_TTS_NATIVE_MODULE_DIR", args.native_module_dir)
+    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_BACKEND", os.environ["OVS_TTS_BACKEND"])
+    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_SEED", os.environ["OVS_TTS_SEED"])
+    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", os.environ["OVS_TTS_MODEL_BASE"])
+    os.environ.setdefault("SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", os.environ["OVS_TTS_NATIVE_MODULE_DIR"])
 
     app_dir = args.app_dir
-    overlay = os.environ["SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR"]
+    overlay = os.environ["OVS_TTS_NATIVE_MODULE_DIR"]
     overlay_backends = str(Path(overlay) / "backends")
     for path in (app_dir, overlay, overlay_backends):
         if path and Path(path).is_dir() and path not in sys.path:
@@ -163,7 +167,7 @@ def collect_contract(args: argparse.Namespace) -> dict[str, Any]:
     else:
         _expect_path_under(so_file, overlay, "qwen3_speech_engine")
 
-    model_base = Path(os.environ["SEEED_LOCAL_VOICE_TTS_MODEL_BASE"])
+    model_base = Path(os.environ["OVS_TTS_MODEL_BASE"])
     engines_dir = model_base / "engines"
     onnx_dir = model_base / "onnx"
     config_path = onnx_dir / "config.json"

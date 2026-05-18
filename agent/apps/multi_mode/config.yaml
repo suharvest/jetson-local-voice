@@ -1,0 +1,56 @@
+# MultiModeApp config — voice app with runtime-switchable modes.
+#
+# Env vars are expanded with ${VAR} or ${VAR:-default}.
+# SLV defaults to localhost:8621 (per CLAUDE memory).
+# edge-llm-chat-service defaults to localhost:8000.
+
+slv_url: "${OVS_SLV_URL:-ws://localhost:8621/v2v/stream}"
+
+slv_config:
+  asr_language: "auto"
+  tts_language: "zh"
+  tts_voice: "default"
+  tts_speed: 1.0
+  sample_rate: 16000
+  vad: "none"             # server VAD off; client-side VAD drives asr_eos
+  multi_utterance: true   # required: single persistent WS
+
+# Client-side VAD. Silero is preferred if installed; energy falls back
+# automatically. Speech-end triggers an explicit asr_eos so Paraformer
+# only finalises once it has enough audio (>= ~610ms).
+client_vad_backend: "auto"
+client_vad_threshold: 0.005  # MacBook built-in mic has high noise floor
+client_vad_speech_min_ms: 200
+client_vad_silence_ms: 600
+client_vad_drive_eos: true  # SLVClient auto-reconnects per turn
+
+llm_backend: "edge_llm"
+llm_base_url: "${OVS_LLM_URL:-http://localhost:8000/v1}"
+llm_api_key: "${OVS_LLM_KEY:-EMPTY}"
+llm_model: "${OVS_LLM_MODEL:-qwen2.5-3b-instruct}"
+
+system_prompt: |
+  你是一个亲切、简洁的语音助手。回答要口语化、控制在两三句话以内，
+  避免使用 Markdown 或列表符号。
+
+audio_input_device: null
+audio_output_device: null
+audio_input_sample_rate: 16000
+audio_output_sample_rate: 24000
+
+log_level: "INFO"
+
+# AppMode framework: which mode the app starts in. Built-ins are
+# chat / interpreter / monologue / transcribe. Use the dashboard's
+# Mode dropdown (top toolbar) to switch at runtime.
+default_mode: "chat"
+
+# Per-mode overrides (optional). Keyed by mode.name.
+# mode_overrides:
+#   chat:
+#     system_prompt: "你是一个更严肃的助手。"
+#   interpreter:
+#     system_prompt: "Translate Chinese to fluent English. Output only translation."
+
+metadata:
+  dashboard_port: 18000

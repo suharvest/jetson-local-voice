@@ -1,0 +1,51 @@
+# CompanionRobotApp config — voice agent for embodied robots (Reachy etc.).
+#
+# Inherits the full MultiModeApp pipeline (chat / interpreter / monologue /
+# transcribe) and adds robot-specific slots that motion / vision plugins
+# can read. The actual robot wiring lives in the consuming project
+# (e.g. clawd-reachy-mini); this file just gives that project a starting
+# template.
+
+slv_url: "${OVS_SLV_URL:-ws://localhost:8621/v2v/stream}"
+
+slv_config:
+  asr_language: "auto"
+  tts_language: "zh"
+  tts_voice: "default"
+  tts_speed: 1.0
+  sample_rate: 16000
+  vad: "none"
+  multi_utterance: true
+
+client_vad_backend: "auto"
+client_vad_threshold: 0.005
+client_vad_speech_min_ms: 200
+client_vad_silence_ms: 600
+client_vad_drive_eos: true
+
+llm_backend: "edge_llm"
+llm_base_url: "${OVS_LLM_URL:-http://localhost:8000/v1}"
+llm_api_key: "${OVS_LLM_KEY:-EMPTY}"
+llm_model: "${OVS_LLM_MODEL:-qwen2.5-3b-instruct}"
+
+system_prompt: |
+  你是一个亲切、简洁的语音助手。回答要口语化、控制在两三句话以内，
+  避免使用 Markdown 或列表符号。
+
+audio_input_device: null
+audio_output_device: null
+audio_input_sample_rate: 16000
+audio_output_sample_rate: 24000
+
+log_level: "INFO"
+
+default_mode: "chat"
+
+# ── Robot-specific (uncomment + tune in your reachy-claw fork) ──
+# reachy_host: localhost
+# reachy_port: 38001
+# motor_enabled: true
+# emotion_default: neutral
+
+metadata:
+  dashboard_port: 18000

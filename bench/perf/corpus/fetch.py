@@ -68,7 +68,7 @@ def fetch_cdn() -> int:
     import tarfile, tempfile, urllib.request
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
         print(f"Downloading {CDN_URL} ...")
-        req = urllib.request.Request(CDN_URL, headers={"User-Agent": "seeed-local-voice/1.0"})
+        req = urllib.request.Request(CDN_URL, headers={"User-Agent": "openvoicestream/1.0"})
         with urllib.request.urlopen(req, timeout=120) as resp:
             shutil.copyfileobj(resp, tmp)
         tmp_path = tmp.name
@@ -81,7 +81,7 @@ def fetch_cdn() -> int:
 
 def _try_one(url: str, dst: Path, timeout: int = 30) -> bool:
     import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "seeed-local-voice/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "openvoicestream/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp, dst.open("wb") as f:
             shutil.copyfileobj(resp, f)

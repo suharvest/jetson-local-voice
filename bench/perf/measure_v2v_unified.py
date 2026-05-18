@@ -19,7 +19,7 @@ session_complete=true.
 Usage:
     uv run --with websocket-client --with soundfile --with numpy \
         python bench/measure_v2v_unified.py \
-        --host 100.89.94.11:8000 \
+        --host 100.89.94.11:8621 \
         --wav tests/data/short_zh.wav \
         --runs 5 \
         --tts            # enable round-trip TTS measurement

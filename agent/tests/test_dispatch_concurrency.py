@@ -2,7 +2,9 @@
 
 While `on_user_utterance` streams tokens, the dispatch loop must still
 process queued TTSAudio (so the speaker plays) and ASRPartial (so
-barge-in fires `slv.abort()`).
+barge-in fires `slv.abort()` AND cancels the in-flight LLM turn — per
+HIGH-2 fix; otherwise streaming tokens immediately re-start TTS and
+undo the barge-in stop_playback).
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import pytest
 
 from openvoicestream_agent.app_base import BaseApp
 from openvoicestream_agent.slv_client import ASRFinal, ASRPartial, TTSAudio
+from openvoicestream_agent.state import ConvState
 
 
 class _FakeAudio:
@@ -33,9 +36,13 @@ class _FakeAudio:
 class _FakeSLV:
     def __init__(self) -> None:
         self.aborted = 0
+        self.reconnects = 0
 
     async def abort(self) -> None:
         self.aborted += 1
+
+    async def reconnect(self) -> None:
+        self.reconnects += 1
 
 
 @pytest.mark.asyncio
@@ -46,6 +53,8 @@ async def test_dispatch_does_not_block_on_llm_turn():
     app.plugins = []
     app._first_tts_seen = False
     app._llm_turn_task = None
+    app._state = ConvState.IDLE
+    app._slv_reconnect_count = 0
 
     llm_started = asyncio.Event()
     llm_release = asyncio.Event()
@@ -53,7 +62,10 @@ async def test_dispatch_does_not_block_on_llm_turn():
 
     async def slow_on_user_utterance(text: str) -> None:
         llm_started.set()
-        await llm_release.wait()  # block until test releases
+        try:
+            await llm_release.wait()  # block until test releases
+        except asyncio.CancelledError:
+            raise
 
     app.on_user_utterance = slow_on_user_utterance  # type: ignore[assignment]
 
@@ -70,9 +82,13 @@ async def test_dispatch_does_not_block_on_llm_turn():
     await app._dispatch_one(ASRPartial(text="wait"))
     seen_during_llm["abort"] = app.slv.aborted == 1
 
-    assert not app._llm_turn_task.done(), "LLM turn finished prematurely"
+    # HIGH-2 fix: barge-in MUST cancel the in-flight LLM turn so streaming
+    # tokens don't immediately restart TTS and undo stop_playback.
+    assert app._llm_turn_task.done(), "LLM turn should be cancelled by barge-in"
+    assert app._llm_turn_task.cancelled() or isinstance(
+        app._llm_turn_task.exception(), asyncio.CancelledError
+    ), "LLM turn should be cancelled, not completed normally"
     assert seen_during_llm["audio"], "TTSAudio not played while LLM streaming"
     assert seen_during_llm["abort"], "ASRPartial did not trigger abort while LLM streaming"
 
-    llm_release.set()
-    await asyncio.wait_for(app._llm_turn_task, timeout=1.0)
+    llm_release.set()  # no-op now; task already cancelled

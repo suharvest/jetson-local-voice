@@ -4,7 +4,7 @@ services:
     runtime: nvidia
     ipc: host
     ports:
-      - "8000:8000"
+      - "9360:8000"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       # TTS backend: "sherpa" (Matcha/Kokoro) or "qwen3_trt" (Qwen3-TTS C++ TRT)

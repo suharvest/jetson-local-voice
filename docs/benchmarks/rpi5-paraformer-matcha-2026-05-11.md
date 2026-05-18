@@ -46,12 +46,12 @@ Long-text scaling: 8.49s of audio synthesised in 703ms (RTF 0.083); first chunk 
 cd ~/jetson-voice-rpi && docker build -f Dockerfile.rpi -t jetson-voice:rpi5 .
 
 # Run
-docker run -d --name jvrpi -p 8000:8000 \
+docker run -d --name jvrpi -p 8621:8000 \
   -v ~/jetson-voice-rpi/models:/opt/models \
   jetson-voice:rpi5
 
 # Health
-curl http://localhost:8000/health
+curl http://localhost:8621/health
 
 # Bench
 docker exec jvrpi python3 /opt/speech/bench/rpi_bench.py --mode asr

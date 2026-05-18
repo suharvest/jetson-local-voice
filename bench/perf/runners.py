@@ -316,7 +316,8 @@ def run_asr_noisy(asr: ASRClient, corpus: list[dict],
 def run_concurrent(asr: ASRClient, tts: TTSClient,
                    corpus: list[dict], prompts: list[dict],
                    parallel: int = 2, runs_per_worker: int = 5,
-                   mode: str = "asr_tts_simul") -> list[dict]:
+                   mode: str = "asr_tts_simul",
+                   eos_mode: str = "forced") -> list[dict]:
     """
     mode:
       - "asr_only":      N parallel ASR streams
@@ -335,6 +336,7 @@ def run_concurrent(asr: ASRClient, tts: TTSClient,
                 r = asr.transcribe_streaming(
                     entry["bytes"],
                     "Chinese" if entry["lang"] == "zh" else "English",
+                    eos_mode=eos_mode,
                 )
                 out.append({"worker": wid, "kind": "asr", "k": k, "id": entry["id"],
                             **r.as_dict, "wall_ms": (time.monotonic() - t0) * 1000})
@@ -377,5 +379,6 @@ def run_concurrent(asr: ASRClient, tts: TTSClient,
     for r in records:
         r["parallel"] = parallel
         r["concurrency_mode"] = mode
+        r["eos_mode"] = eos_mode
         r["scenario_wall_ms"] = wall_total_ms
     return records

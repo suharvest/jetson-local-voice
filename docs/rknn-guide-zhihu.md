@@ -614,7 +614,7 @@ RKNPU 驱动 0.9.8 在进程异常退出时不清理 matmul context 的 DMA hand
 - **GitHub: [suharvest/rknn-matmul-parallel](https://github.com/suharvest/rknn-matmul-parallel)**
   开源的 RK3576/3588 NPU matmul 加速库，支持 FP16/INT8，双核并行，含 Qwen3-ASR 完整示例
 
-- **主项目: suharvest/seeed-local-voice**
+- **主项目: suharvest/openvoicestream**
   ARM64 边缘设备低延迟语音交互系统（Jetson + RK3576），后续会拆出独立的 RKNN 部署项目
 
 如果这篇文章帮到了你，欢迎给 rknn-matmul-parallel 点个 star。如果你也在 RK 上踩了别的坑，欢迎在评论区分享——让后来人少走一点弯路。

@@ -13,7 +13,7 @@ Workflow:
 Output layout under --out:
   <out>/models/<model_id>/manifest.json
   <out>/models/<model_id>/engines/<host_sig>.tar.gz
-  <out>/models/<model_id>/onnx/<file>.onnx          (optional, copied for cold deploys)
+  <out>/models/<model_id>/<model-relative ONNX>     (optional, copied for cold deploys)
 
 Usage:
   uv run --project . scripts/build_engine_bundle.py \\
@@ -98,10 +98,15 @@ def _bundle_per_model(
         if bundle_path.exists():
             bundle_path.unlink()
         with tarfile.open(bundle_path, "w:gz") as tf:
+            added: set[Path] = set()
             for spec in specs:
                 if spec.hf_only or not spec.engine_path.exists():
                     continue
-                tf.add(spec.engine_path, arcname=spec.engine_path.name)
+                for engine_path in _bundle_engine_paths(spec):
+                    if not engine_path.exists() or engine_path in added:
+                        continue
+                    tf.add(engine_path, arcname=engine_path.name)
+                    added.add(engine_path)
                 meta = engine_resolver._meta_path(spec.engine_path)
                 if meta.exists():
                     tf.add(meta, arcname=meta.name)
@@ -117,24 +122,14 @@ def _bundle_per_model(
         }
         # Also include ONNX inputs if present and requested.
         for spec in specs:
-            if not spec.onnx_input:
-                continue
-            onnx_src = spec.engine_path.parent.parent / "onnx" / spec.onnx_input
-            if not onnx_src.exists():
-                logger.warning(
-                    "onnx not on host for %s — skipping in manifest (cold deploys will need fallback path)",
-                    spec.onnx_input,
-                )
-                continue
-            onnx_dst_dir = model_dir / "onnx"
-            onnx_dst_dir.mkdir(parents=True, exist_ok=True)
-            onnx_dst = onnx_dst_dir / spec.onnx_input
-            shutil.copy2(onnx_src, onnx_dst)
-            rel_onnx = f"onnx/{spec.onnx_input}"
-            files[rel_onnx] = {
-                "sha256": _sha256(onnx_dst),
-                "size": onnx_dst.stat().st_size,
-            }
+            for rel_onnx, onnx_src in _bundle_onnx_paths(spec):
+                onnx_dst = model_dir / rel_onnx
+                onnx_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(onnx_src, onnx_dst)
+                files[rel_onnx] = {
+                    "sha256": _sha256(onnx_dst),
+                    "size": onnx_dst.stat().st_size,
+                }
 
         manifest = {
             "model_id": model_id,
@@ -143,6 +138,76 @@ def _bundle_per_model(
         }
         (model_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
         logger.info("manifest written: %s", model_dir / "manifest.json")
+
+
+def _bundle_engine_paths(spec: engine_resolver.EngineSpec) -> list[Path]:
+    """Return engine files that must travel together for a profile entry.
+
+    Matcha split TRT uses step0 as the resolver anchor, but runtime loads
+    step0/step1/step2 from the same directory. The build script creates all
+    three, so the HF bundle must include all three even though only step0 is
+    declared as a required engine.
+    """
+    paths = [spec.engine_path]
+    if spec.engine_file == "matcha_estimator_step0_bf16.engine":
+        base = spec.engine_path.parent
+        paths.extend(base / f"matcha_estimator_step{i}_bf16.engine" for i in (1, 2))
+    return paths
+
+
+def _bundle_onnx_paths(spec: engine_resolver.EngineSpec) -> list[tuple[str, Path]]:
+    """Return model-relative ONNX files that should be published.
+
+    The primary ONNX comes from the profile entry. Matcha split TRT also
+    generates a fixed ONNX encoder plus three estimator-step ONNX files that
+    are useful for cold deploys and reproducibility, even though step0 is the
+    only resolver anchor.
+    """
+    root = spec.engine_path.parent.parent
+    seen: set[str] = set()
+    result: list[tuple[str, Path]] = []
+
+    def add(path: Path, label: str) -> None:
+        rel = engine_resolver._path_under(path, root)
+        if rel is None:
+            logger.warning("onnx path for %s escapes model root: %s", label, path)
+            return
+        if not path.exists():
+            logger.warning(
+                "onnx not on host for %s — skipping in manifest (cold deploys will need fallback path)",
+                label,
+            )
+            return
+        rel_s = rel.as_posix()
+        if rel_s in seen:
+            return
+        seen.add(rel_s)
+        result.append((rel_s, path))
+
+    if spec.onnx_input:
+        candidates = engine_resolver._onnx_manifest_candidates(spec)
+        if not candidates:
+            logger.warning("no ONNX candidates for %s", spec.engine_file)
+        for rel, path in candidates:
+            if path.exists():
+                add(path, rel)
+                break
+        else:
+            logger.warning(
+                "onnx not on host for %s — skipping in manifest (cold deploys will need fallback path)",
+                spec.onnx_input,
+            )
+
+    if spec.engine_file == "matcha_estimator_step0_bf16.engine":
+        onnx_dir = root / "onnx"
+        add(onnx_dir / "matcha_encoder_trt.onnx", "matcha_encoder_trt.onnx")
+        for step in (0, 1, 2):
+            add(
+                onnx_dir / f"matcha_estimator_step{step}_trt.onnx",
+                f"matcha_estimator_step{step}_trt.onnx",
+            )
+
+    return result
 
 
 def main() -> int:

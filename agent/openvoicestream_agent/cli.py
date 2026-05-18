@@ -37,7 +37,11 @@ def _load_app_class(app_name: str):  # noqa: ANN001
         except ImportError as e:
             last_err = e
             continue
-        cls = getattr(mod, "App", None) or getattr(mod, "DialogueApp", None)
+        cls = (
+            getattr(mod, "App", None)
+            or getattr(mod, "MultiModeApp", None)
+            or getattr(mod, "DialogueApp", None)
+        )
         if cls is None:
             raise ImportError(f"{mod_name} found but no `App` symbol")
         return cls
@@ -51,7 +55,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="run an app")
-    p_run.add_argument("app_name", help="app under agent/apps/, e.g. 'dialogue'")
+    p_run.add_argument(
+        "app_name",
+        nargs="?",
+        default="multi_mode",
+        help="app under agent/apps/, e.g. 'multi_mode' (default)",
+    )
     p_run.add_argument(
         "--config",
         type=Path,

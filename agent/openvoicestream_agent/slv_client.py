@@ -113,10 +113,42 @@ class SLVClient:
 
     async def connect(self) -> None:
         if self._ws is not None:
-            raise RuntimeError("SLVClient.connect() called twice -- one WS per lifetime")
+            return  # idempotent
+        self._reader_done.clear()
         self._ws = await ws_connect(self.url, max_size=None)
         await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
         self._reader_task = asyncio.create_task(self._reader_loop(), name="slv-reader")
+
+    async def reconnect(self) -> None:
+        """Tear down current WS and open a fresh one, replaying config.
+
+        SLV closes the session after asr_eos (even in multi_utterance), so
+        the agent must reopen for the next utterance. Audio capture stays
+        alive; only the SLV transport flips. Holds _send_lock so concurrent
+        send_audio() blocks until reconnect completes.
+        """
+        if self._closed:
+            return
+        async with self._send_lock:
+            old_reader = self._reader_task
+            old_ws = self._ws
+            self._ws = None
+            self._reader_task = None
+            if old_reader is not None and not old_reader.done():
+                old_reader.cancel()
+                try:
+                    await old_reader
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if old_ws is not None:
+                try:
+                    await old_ws.close()
+                except Exception:
+                    pass
+            self._reader_done.clear()
+            self._ws = await ws_connect(self.url, max_size=None)
+            await self._ws.send(json.dumps({"type": CLIENT_CONFIG, **self.config}))
+            self._reader_task = asyncio.create_task(self._reader_loop(), name="slv-reader")
 
     async def close(self) -> None:
         self._closed = True
@@ -136,16 +168,30 @@ class SLVClient:
     # ── send helpers ────────────────────────────────────────────────
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
-        if self._ws is None:
-            raise RuntimeError("SLVClient not connected")
         async with self._send_lock:
-            await self._ws.send(json.dumps(payload))
+            if self._ws is None:
+                if self._closed:
+                    return
+                await self.connect()
+            try:
+                await self._ws.send(json.dumps(payload))
+            except websockets.ConnectionClosed:
+                logger.info("send_json: WS closed mid-send, dropping %s", payload.get("type"))
 
     async def send_audio(self, pcm: bytes) -> None:
-        if self._ws is None:
-            raise RuntimeError("SLVClient not connected")
         async with self._send_lock:
-            await self._ws.send(pcm)
+            if self._ws is None:
+                if self._closed:
+                    return
+                await self.connect()
+            try:
+                await self._ws.send(pcm)
+            except websockets.ConnectionClosed:
+                # Reader will notice and signal _reader_done; dispatch can
+                # decide to reconnect. Audio chunks during reconnect are
+                # naturally dropped — first ASR utterance after reconnect
+                # picks up from the new chunks.
+                pass
 
     async def send_text(self, text: str) -> None:
         await self._send_json({"type": CLIENT_TEXT, "text": text})

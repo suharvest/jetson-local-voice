@@ -42,9 +42,9 @@ against `manifest.json`).
 ### Option A — Synthesize with our own TTS (deterministic, no licensing)
 
 ```bash
-# On a Jetson with the voice_clone preset running on :8000
+# On a Jetson with the voice_clone preset running on :8621
 python bench/perf/corpus/synthesize_from_tts.py \
-  --base-url http://localhost:8000 \
+  --base-url http://localhost:8621 \
   --voice default \
   --out-dir bench/perf/corpus
 ```

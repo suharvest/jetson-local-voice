@@ -1,16 +1,17 @@
 # syntax=docker/dockerfile:1.6
 #
-# Seeed Local Voice — Raspberry Pi 4 / 5 (linux/arm64, ONNX Runtime CPU EP)
+# OpenVoiceStream — Raspberry Pi 4 / 5 (linux/arm64, ONNX Runtime CPU EP)
 #
 # Paraformer streaming ASR + Matcha TTS via sherpa-onnx (CPU only).
 #
 # Build (from repo root):
-#   docker build -f deploy/docker/Dockerfile.rpi -t seeed-local-voice:rpi5 .
+#   docker build -f deploy/docker/Dockerfile.rpi \
+#     -t sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx .
 #
 # Run:
-#   docker run -p 8000:8000 \
-#     -v ~/seeed-local-voice-rpi/models:/opt/models \
-#     seeed-local-voice:rpi5
+#   docker run -p 8621:8000 \
+#     -v ~/openvoicestream-rpi/models:/opt/models \
+#     openvoicestream:rpi5
 
 FROM debian:12-slim
 
@@ -25,7 +26,7 @@ ENV PIP_INDEX_URL=${PIP_INDEX}
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv \
-        libasound2 libsndfile1 sox curl \
+        libasound2 libsndfile1 sox curl bzip2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps (CPU-only stack)
@@ -50,21 +51,22 @@ COPY configs/  /opt/speech/configs/
 RUN mkdir -p /opt/models
 
 ENV MODEL_DIR=/opt/models \
+    OVS_PROFILE_DEFAULT=rpi5-default \
     LANGUAGE_MODE=zh_en \
     ASR_BACKEND=sherpa \
     TTS_BACKEND=sherpa \
     STREAMING_ASR_PROVIDER=cpu \
+    OFFLINE_ASR_PROVIDER=cpu \
+    ENSURE_OFFLINE_ASR=1 \
     TTS_PROVIDER=cpu \
     TTS_NUM_THREADS=4 \
     STREAMING_ASR_NUM_THREADS=4
-# NOTE: do NOT bake SEEED_LOCAL_VOICE_PROFILE here. Operator picks via
-# SEEED_LOCAL_VOICE_PRESET at docker run time (auto-resolves via
-# profile_selector). A baked PROFILE default would override the
-# operator's PRESET choice — profile_loader resolves PROFILE before
-# PRESET.
+# RPi must not inherit the LANGUAGE_MODE=zh_en -> jetson-zh-en fallback in
+# profile_loader. Keep the image pinned to the CPU-only RPi profile unless an
+# operator explicitly overrides OVS_PROFILE.
 
-LABEL org.opencontainers.image.title="Seeed Local Voice (Raspberry Pi)" \
-      org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \
+LABEL org.opencontainers.image.title="OpenVoiceStream (Raspberry Pi)" \
+      org.opencontainers.image.source="https://github.com/suharvest/openvoicestream" \
       org.opencontainers.image.description="CPU speech service for Raspberry Pi 4/5"
 
 WORKDIR /opt/speech

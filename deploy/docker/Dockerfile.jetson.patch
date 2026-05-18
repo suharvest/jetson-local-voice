@@ -4,17 +4,17 @@
 #
 # Build (default base = jetson-v1.11):
 #   docker build -f deploy/docker/Dockerfile.jetson.patch \
-#       -t seeed-local-voice:jetson-v1.12 .
+#       -t openvoicestream:jetson-v1.12 .
 #
 # Override base:
 #   docker build -f deploy/docker/Dockerfile.jetson.patch \
-#       --build-arg BASE=seeed-local-voice:jetson-v1.11 \
-#       -t seeed-local-voice:jetson-v1.12 .
+#       --build-arg BASE=openvoicestream:jetson-v1.11 \
+#       -t openvoicestream:jetson-v1.12 .
 #
 # If you added pip deps, do NOT use this — fall back to the full
 # Dockerfile.jetson rebuild path.
 
-ARG BASE=seeed-local-voice:jetson-v1.11
+ARG BASE=openvoicestream:jetson-v1.11
 FROM ${BASE}
 
 # Only the Python tree is hot — everything else inherited.
@@ -22,6 +22,6 @@ COPY app/      /opt/speech/app/
 COPY configs/  /opt/speech/configs/
 COPY scripts/  /opt/speech/scripts/
 
-LABEL org.opencontainers.image.title="Seeed Local Voice (Jetson, patched)"
+LABEL org.opencontainers.image.title="OpenVoiceStream (Jetson, patched)"
 LABEL build.diff-base="${BASE}"
 LABEL build.diff-type="python-only"

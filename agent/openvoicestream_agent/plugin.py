@@ -71,3 +71,57 @@ class Plugin(ABC):
 
     async def on_error(self, exc: BaseException) -> None:
         """Any V2V transport/protocol error. Default: no-op."""
+
+    # ── v2 hooks (state machine + dashboard instrumentation) ───────
+
+    async def on_state_change(self, data: dict) -> None:
+        """ConvState transition. data = {"state": str, "prev": str}."""
+
+    async def on_user_stop_intent(self, data: str) -> None:
+        """User said a stop-word; assistant was silenced. data = matched text."""
+
+    async def on_user_speech_end_client(self, data: dict) -> None:
+        """Client-side VAD detected end of speech. data = {"ts": int, "drove_eos": bool}."""
+
+    async def on_slv_reconnect(self, data: dict) -> None:
+        """SLV WebSocket was reconnected. data = {"count": int}."""
+
+    async def on_mic_rms(self, data: dict) -> None:
+        """Per-chunk mic RMS sample. data = {"rms": float, "threshold": float, "state": str}."""
+
+    async def on_llm_cache_metrics(self, data: dict) -> None:
+        """Per-turn LLM prefix-cache stats. data = {"hit_tokens": int, "total_tokens": int}."""
+
+    async def on_tts_audio_frame(self, data: dict) -> None:
+        """First TTS audio frame of a turn. data = {"sample_rate": int, "frame_len": int}."""
+
+    async def on_mode_change(self, data: dict) -> None:
+        """AppMode switched. data = {"name": str, "display_name": str, "icon": str, "prev": str | None}."""
+
+    async def on_mode_override_change(self, data: dict) -> None:
+        """Per-mode override (system_prompt/temperature) was edited via the
+        dashboard. data = {"name": str, "override": dict, "persisted": bool}."""
+
+    async def on_transcribed(self, data: dict) -> None:
+        """TranscribeMode emitted a finalised user utterance. data = {"text": str}."""
+
+    # ── pipeline_mode hooks (wake_word / push_to_talk) ────────────
+
+    async def on_wake(self, data: dict) -> None:
+        """Agent transitioned SLEEPING → IDLE. data = {"source": str}."""
+
+    async def on_sleep(self, data) -> None:
+        """Agent transitioned (any) → SLEEPING. data is None."""
+
+    # ── runtime config / mode-registry hooks ──────────────────────
+
+    async def on_agent_settings_change(self, data: dict) -> None:
+        """Agent-level settings (pipeline_mode / sleep_timeout_s /
+        stop_words) were edited via the dashboard. data carries the
+        updated fields, e.g. {"pipeline_mode": str, "sleep_timeout_s":
+        float, "stop_words": list[str], "persisted": bool}. Default: no-op."""
+
+    async def on_mode_registered(self, data: dict) -> None:
+        """A new AppMode was registered after ModeManager.start() — the
+        dashboard listens to refresh its dropdown. data = {"name": str,
+        "display_name": str, "icon": str, "description": str}. Default: no-op."""

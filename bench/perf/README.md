@@ -29,7 +29,7 @@ cd bench/perf/corpus
 python fetch.py --from ~/bench/wavs          # or --from cdn  once Seeed CDN bundle exists
 python fetch.py --verify                     # checks SHA256 against manifest.json
 #  OR — bootstrap by synthesizing from our own TTS on one stable device:
-# python synthesize_from_tts.py --base-url http://localhost:8000
+# python synthesize_from_tts.py --base-url http://localhost:8621
 # python fetch.py --recompute-hashes && git add -p manifest.json
 
 # 2. Install client deps (one-time)
@@ -40,23 +40,23 @@ pip install websocket-client requests numpy
 
 ```bash
 # ASR streaming, 10 runs after 3 warmups
-python bench/perf/perf.py asr --base-url http://localhost:8000
+python bench/perf/perf.py asr --base-url http://localhost:8621
 
 # TTS, short prompts only
-python bench/perf/perf.py tts --base-url http://localhost:8000 --category short
+python bench/perf/perf.py tts --base-url http://localhost:8621 --category short
 
 # V2V net latency (no LLM)
-python bench/perf/perf.py v2v --base-url http://localhost:8000 --llm-delay 0
+python bench/perf/perf.py v2v --base-url http://localhost:8621 --llm-delay 0
 
 # V2V with 800ms LLM placeholder + VAD-driven EOS (realistic)
-python bench/perf/perf.py v2v --base-url http://localhost:8000 --llm-delay 800 --eos vad
+python bench/perf/perf.py v2v --base-url http://localhost:8621 --llm-delay 800 --eos vad
 
 # 2-way concurrent ASR+TTS simultaneous interpretation
 python bench/perf/perf.py concurrent --parallel 2 --mode asr_tts_simul \
-  --base-url http://localhost:8000
+  --base-url http://localhost:8621
 
 # Full matrix (10-15 min on Jetson; longer on RPi)
-python bench/perf/perf.py matrix --base-url http://localhost:8000 \
+python bench/perf/perf.py matrix --base-url http://localhost:8621 \
   --container seeed-nano-v111
 
 # === Tier-1 (customer eval) ===
@@ -84,7 +84,7 @@ python bench/perf/perf.py stability --duration-min 30 --container seeed-nano-v11
 Default benchmark endpointing matches open-dialogue deployment:
 `--eos vad --vad-backend silero --vad-silence-ms 400`. Tune the silence
 threshold per run with `--vad-silence-ms`, or in service deployment with
-`SEEED_LOCAL_VOICE_VAD_SILENCE_MS`.
+`OVS_VAD_SILENCE_MS`.
 
 ## Two test modes (important!)
 
@@ -93,8 +93,8 @@ perf client runs:
 
 | Mode | When to use | Setup | Result tag |
 |---|---|---|---|
-| **local** (on-device) | "How fast is *this device* at compute?" Fair cross-device comparison. | client + service on the same box, talks to `localhost:8000` | `*_local_<timestamp>.{json,md}` |
-| **remote** (over network) | "What latency does the user actually feel?" Real product SLA. | client elsewhere (your laptop, the robot brain, etc.) → device:8000 | `*_remote_<timestamp>.{json,md}` |
+| **local** (on-device) | "How fast is *this device* at compute?" Fair cross-device comparison. | client + service on the same box, talks to `localhost:8621` | `*_local_<timestamp>.{json,md}` |
+| **remote** (over network) | "What latency does the user actually feel?" Real product SLA. | client elsewhere (your laptop, the robot brain, etc.) → device:8621 | `*_remote_<timestamp>.{json,md}` |
 
 Mode is auto-inferred from `--base-url` (loopback = local, anything else =
 remote) and stamped into result files + meta. Force with `--mode-label`.
@@ -112,7 +112,7 @@ bench/perf/run_on_device.sh orin-nano -- matrix
 ### Remote-mode (current Mac→device path)
 
 ```bash
-python bench/perf/perf.py asr --base-url http://orin-nano.local:8000
+python bench/perf/perf.py asr --base-url http://orin-nano.local:8621
 ```
 
 Remote-mode numbers will include client↔device RTT in every TFD / EOS metric.
@@ -121,16 +121,16 @@ Don't mix local-mode and remote-mode numbers in the same cross-device table.
 ## Per-device launch examples
 
 ```bash
-# Jetson Orin Nano (voice_clone preset on :8000)
-python bench/perf/perf.py matrix --base-url http://orin-nano.local:8000 \
+# Jetson Orin Nano (voice_clone preset on :8621)
+python bench/perf/perf.py matrix --base-url http://orin-nano.local:8621 \
   --container seeed-nano-v111
 
 # Radxa ROCK 5T (RK3588, multilang preset)
-python bench/perf/perf.py matrix --base-url http://radxa.local:8000 \
+python bench/perf/perf.py matrix --base-url http://radxa.local:8621 \
   --container seeed-rk-v11
 
 # Raspberry Pi 5 (lite_zh_en preset)
-python bench/perf/perf.py matrix --base-url http://harvest-pi.local:8000 \
+python bench/perf/perf.py matrix --base-url http://harvest-pi.local:8621 \
   --container seeed-rpi-litezhen
 ```
 

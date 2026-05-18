@@ -1,4 +1,4 @@
-"""HuggingFace artifact downloader for seeed-local-voice.
+"""HuggingFace artifact downloader for OpenVoiceStream.
 
 Downloads ONNX models and pre-built TRT engine bundles from HuggingFace,
 with optional China mirror support via HF_ENDPOINT env. Designed to be
@@ -8,7 +8,7 @@ Layout convention on the artifact repo:
     <HF_REPO>/
         models/<model_id>/
             manifest.json              # files + SHA-256 + sizes
-            onnx/<file>.onnx           # raw model inputs (used by trtexec fallback)
+            <model-relative ONNX>      # raw / graph-surgery inputs for fallback rebuilds
             engines/<host_sig>.tar.gz  # pre-built engines for a specific host
 
 Where host_sig is "sm<NN>-trt<X.Y>-jp<X.Y>-cuda<X.Y>" — see engine_resolver.
@@ -18,6 +18,7 @@ manifest.json schema (top level):
       "model_id": "matcha-icefall-zh-en",
       "files": {
         "onnx/matcha_encoder_s64_trt.onnx": {"sha256": "...", "size": 12345},
+        "model-steps-3.onnx": {"sha256": "...", "size": 12345},
         "engines/sm87-trt10.3-jp6.2-cuda12.6.tar.gz": {"sha256": "...", "size": 67890}
       }
     }
@@ -43,7 +44,7 @@ DEFAULT_REPO = "harvestsu/seeed-local-voice-artifacts"
 
 # hf-mirror.com rejects Python-urllib/x.y default User-Agent with 403.
 # Use a hf_hub-style UA that mirrors what huggingface_hub sends.
-_UA = "seeed-local-voice/1.0; hf_hub-emulating"
+_UA = "openvoicestream/1.0; hf_hub-emulating"
 
 
 def _open(url: str, timeout: float = 30.0):

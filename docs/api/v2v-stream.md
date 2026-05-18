@@ -6,10 +6,10 @@ is a `config` that decides which features light up:
 | Config key | Effect |
 |---|---|
 | `asr_language` set | ASR is enabled. Client may send PCM binary frames; server emits `asr_partial` / `asr_endpoint` / `asr_final` JSON. |
-| `tts_language` set | TTS is enabled. Client may send `text` JSON frames; server emits PCM binary chunks + `tts_started` / `tts_sentence_done` / `tts_done` JSON. |
+| `tts_language` set | TTS is enabled. Client may send `text` JSON frames; server emits PCM binary chunks + `tts_started` / `tts_sentence_done` / `tts_done` JSON. Use `"auto"` to enable TTS while delegating language selection to the backend (qwen3 inspects the text; backends without auto-detect fall back to their default). |
 | Both set | Full V2V duplex. Binary in both directions: client → ASR input, server → TTS output. |
 | `vad` | Server-side VAD backend (default `silero` if ASR enabled, `none` otherwise). |
-| `vad_silence_ms` | How long silence to trigger auto `asr_endpoint`. Default is `SEEED_LOCAL_VOICE_VAD_SILENCE_MS` or 400 ms. |
+| `vad_silence_ms` | How long silence to trigger auto `asr_endpoint`. Default is `OVS_VAD_SILENCE_MS` or 400 ms. |
 | `multi_utterance` | If `true`, the session stays open across utterances; each VAD/backend endpoint emits a mid-session `asr_final` with `session_complete: false` and the loop keeps listening. Default `false` (single-utterance, current behaviour). |
 
 Existing `/asr/stream` and `/tts/stream` endpoints stay unchanged for
@@ -19,11 +19,13 @@ breaking anything.
 Deployment defaults:
 
 ```bash
-SEEED_LOCAL_VOICE_VAD_BACKEND=silero
-SEEED_LOCAL_VOICE_VAD_SILENCE_MS=400
+OVS_VAD_BACKEND=silero
+OVS_VAD_SILENCE_MS=400
 ```
 
-Clients can still override per connection with `vad` and `vad_silence_ms`.
+The legacy `SEEED_LOCAL_VOICE_VAD_*` variables are still accepted for
+older deployments. Clients can still override per connection with `vad`
+and `vad_silence_ms`.
 
 ## Protocol
 
@@ -147,7 +149,7 @@ synchronously to the user while the user can talk back and barge in.
 import asyncio, json, struct, websockets
 
 async def v2v_session(transcribe_partial_cb, llm_token_stream):
-    uri = "ws://device:8000/v2v/stream"
+    uri = "ws://device:8621/v2v/stream"
     async with websockets.connect(uri) as ws:
         # 1. config
         await ws.send(json.dumps({

@@ -1,5 +1,5 @@
 """RK ASR adapter — wraps rkvoice_stream.create_asr() output to fit the
-seeed-local-voice ASRBackend interface.
+OpenVoiceStream ASRBackend interface.
 
 The two ABCs (ours in app.core.asr_backend and theirs in
 rkvoice_stream.engine.asr) are intentionally near-identical; this module

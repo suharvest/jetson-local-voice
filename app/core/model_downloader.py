@@ -32,19 +32,24 @@ MODELS = {
         "zipformer-en": ("models-zipformer-en.tar.gz", "Zipformer streaming ASR (English)"),
     },
     "shared": {
-        "sensevoice": ("models-sensevoice.tar.gz", "SenseVoice offline ASR (5 languages)"),
+        "sensevoice": (
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+            "SenseVoice offline ASR (5 languages)",
+        ),
     },
 }
 
-# Per-model marker file the freshness check insists on seeing.
+# Per-model files the freshness check insists on seeing.
 # Without this, model dirs that engine_resolver populated with only
 # auxiliary subdirs (engines/, onnx/ skeletons) pass the "non-empty"
-# heuristic but still miss the load-bearing acoustic / decoder file.
-_MARKER_FILES = {
-    "matcha-icefall-zh-en": "model-steps-3.onnx",
-    "paraformer-streaming": "encoder.onnx",
-    "zipformer-en": "encoder.int8.onnx",
-    "kokoro-multi-lang-v1_0": "model.onnx",
+# heuristic but still miss load-bearing resources such as tokens.txt.
+_REQUIRED_FILES = {
+    "matcha-icefall-zh-en": ("model-steps-3.onnx", "tokens.txt", "lexicon.txt"),
+    "paraformer-streaming": ("encoder.onnx", "tokens.txt"),
+    "zipformer-en": ("encoder.int8.onnx", "tokens.txt"),
+    "kokoro-multi-lang-v1_0": ("model.onnx",),
+    "sensevoice": ("model.int8.onnx",),
 }
 
 
@@ -77,7 +82,7 @@ def _download_and_extract(url: str, dest_dir: str) -> None:
         logger.info("  Fetching %s ...", url)
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
-            req = urllib.request.Request(url, headers={"User-Agent": "seeed-local-voice/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "openvoicestream/1.0"})
             resp = urllib.request.urlopen(req, timeout=600)
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
@@ -102,40 +107,53 @@ def _download_and_extract(url: str, dest_dir: str) -> None:
 
 def ensure_models(language_mode: str = "zh_en", model_dir: str = "/opt/models") -> None:
     """Ensure all required models for the given language mode are present."""
-    if language_mode == "multilanguage":
-        _ensure_qwen3_artifacts()
-        # multilang preset (jetson-qwen3asr-matcha) pairs Qwen3 ASR with
-        # Matcha TTS, so the matcha-icefall-zh-en bundle is required as
-        # well for the acoustic ONNX (model-steps-3.onnx) + lexicon.
-        # vocos engine is fetched separately by engine_resolver from HF.
+    if language_mode == "rk":
+        _ensure_rk_artifacts()
+        if os.environ.get("RK_ENSURE_MATCHA_RESOURCES", "1").lower() in ("0", "false", "no"):
+            return
         matcha = MODELS.get("zh_en", {}).get("matcha-icefall-zh-en")
-        if matcha:
+        required = {"matcha-icefall-zh-en": matcha} if matcha else {}
+        model_dir = os.environ.get("TTS_MODEL_DIR") or model_dir
+
+    elif language_mode == "multilanguage":
+        _ensure_qwen3_artifacts()
+        # Some multilanguage profiles pair Qwen3 ASR with Matcha TTS. Only
+        # those need the Matcha acoustic ONNX + lexicon; pure Qwen3 profiles
+        # should not download or validate Matcha assets during startup.
+        try:
+            from app.core.profile_loader import current_profile
+            tts_backend = (current_profile() or {}).get("tts_backend")
+        except Exception:
+            tts_backend = None
+        matcha = MODELS.get("zh_en", {}).get("matcha-icefall-zh-en")
+        if tts_backend == "jetson.matcha_trt" and matcha:
             required = {"matcha-icefall-zh-en": matcha}
         else:
             return
     else:
         required = {}
         required.update(MODELS.get(language_mode, {}))
-        # SenseVoice is optional — don't block startup for it (lazy-loaded)
+        if os.environ.get("ENSURE_OFFLINE_ASR", "").lower() in ("1", "true", "yes"):
+            required.update(MODELS.get("shared", {}))
     if not required:
         return
 
     missing = []
     for dir_name, (cdn_file, desc) in required.items():
         model_path = os.path.join(model_dir, dir_name)
-        marker = _MARKER_FILES.get(dir_name)
-        # When a marker is declared, look for the actual load-bearing
-        # file recursively under the model dir (the tarball lays files
+        required_files = _REQUIRED_FILES.get(dir_name)
+        # When required files are declared, look for the actual load-bearing
+        # files recursively under the model dir (the tarball lays files
         # under subdirs in some upstream variants). Non-empty dir alone
         # is NOT a sufficient signal — engine_resolver may have written
         # the engines/ subdir before model_downloader runs.
         is_ready = False
         if os.path.isdir(model_path):
-            if marker:
+            if required_files:
+                found = set()
                 for root, _dirs, files in os.walk(model_path):
-                    if marker in files:
-                        is_ready = True
-                        break
+                    found.update(name for name in required_files if name in files)
+                is_ready = found == set(required_files)
             elif os.listdir(model_path):
                 is_ready = True
         if is_ready:
@@ -212,7 +230,7 @@ def _ensure_qwen3_artifacts() -> None:
         logger.warning(
             "Qwen3 artifact deploy script missing at %s. Clone "
             "https://github.com/suharvest/qwen3-edgellm-jetson.git as a sibling "
-            "of seeed-local-voice or set QWEN3_EDGELLM_JETSON_ROOT to point at it.",
+            "of OpenVoiceStream or set QWEN3_EDGELLM_JETSON_ROOT to point at it.",
             script,
         )
         return
@@ -220,12 +238,24 @@ def _ensure_qwen3_artifacts() -> None:
     cmd = [sys.executable, str(script), "--manifest", manifest, "--set", artifact_set]
     if root:
         cmd.extend(["--root", root])
+    if os.environ.get("QWEN3_ARTIFACT_VERIFY_SHA256", "1").lower() not in ("0", "false", "no"):
+        cmd.append("--verify-sha256")
     logger.info("Ensuring Qwen3 artifact set %s via %s", artifact_set, manifest)
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as exc:
         logger.error("Qwen3 artifact check/download failed with exit code %s", exc.returncode)
         sys.exit(exc.returncode)
+
+
+def _ensure_rk_artifacts() -> None:
+    """Verify or download RK model artifacts when an RK manifest is configured."""
+    try:
+        from app.core.rk_artifacts import ensure_rk_artifacts
+        ensure_rk_artifacts()
+    except Exception as exc:
+        logger.error("RK artifact check/download failed: %s", exc)
+        sys.exit(1)
 
 
 # Custom voice patches: replace unused speakers in voices.bin with custom voices.

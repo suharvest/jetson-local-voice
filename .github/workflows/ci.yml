@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - high-perf
+
+jobs:
+  local-gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Shell syntax
+        run: bash -n deploy/install.sh deploy/verify.sh deploy/jetson-release-highperf.sh
+
+      - name: Docker compose config
+        run: |
+          docker compose -f deploy/docker-compose.yml config --quiet
+          docker compose -f deploy/docker-compose.rk.yml config --quiet
+          docker compose -f deploy/docker-compose.radxa.yml config --quiet
+          docker compose -f deploy/docker-compose.rpi.yml config --quiet
+
+      - name: Python compile gate
+        run: |
+          python -m py_compile \
+            app/core/language.py \
+            app/core/model_downloader.py \
+            app/core/rk_artifacts.py \
+            app/backends/cpu/sherpa.py \
+            app/backends/cpu/sherpa_asr.py \
+            app/backends/jetson/matcha_trt.py \
+            app/backends/rk/tts.py \
+            bench/product_eval.py \
+            deploy/roundtrip_verify.py
+
+      - name: Service unit tests
+        run: uv run pytest app/tests/test_tts_language.py
+
+      - name: Agent unit tests
+        working-directory: agent
+        run: uv run pytest tests --ignore=tests/e2e --ignore=tests/test_e2e_orin.py

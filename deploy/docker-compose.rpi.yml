@@ -1,0 +1,34 @@
+# OpenVoiceStream — Raspberry Pi 5 / CM5 (CPU ONNX).
+#
+# Usage on RPi:
+#   docker compose -f deploy/docker-compose.rpi.yml up -d
+#
+# RPi uses sherpa-onnx / ONNX Runtime CPU directly. There is no TensorRT,
+# RKNN, or engine-version gate on this path.
+
+services:
+  speech:
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx
+    container_name: openvoicestream
+    init: true
+    network_mode: host
+    command: ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8621"]
+    volumes:
+      - speech-models:/opt/models
+    environment:
+      - OVS_PROFILE=${OVS_PROFILE:-}
+      - SEEED_LOCAL_VOICE_PROFILE=${SEEED_LOCAL_VOICE_PROFILE:-rpi5-default}
+      - LANGUAGE_MODE=${LANGUAGE_MODE:-zh_en}
+      - MODEL_DIR=${MODEL_DIR:-/opt/models}
+      - ASR_BACKEND=${ASR_BACKEND:-sherpa}
+      - TTS_BACKEND=${TTS_BACKEND:-sherpa}
+      - STREAMING_ASR_PROVIDER=${STREAMING_ASR_PROVIDER:-cpu}
+      - OFFLINE_ASR_PROVIDER=${OFFLINE_ASR_PROVIDER:-cpu}
+      - ENSURE_OFFLINE_ASR=${ENSURE_OFFLINE_ASR:-1}
+      - TTS_PROVIDER=${TTS_PROVIDER:-cpu}
+      - STREAMING_ASR_NUM_THREADS=${STREAMING_ASR_NUM_THREADS:-4}
+      - TTS_NUM_THREADS=${TTS_NUM_THREADS:-4}
+    restart: unless-stopped
+
+volumes:
+  speech-models:

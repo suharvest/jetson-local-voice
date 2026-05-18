@@ -1,6 +1,6 @@
 {
   "name": "rk3588-default",
-  "description": "Rockchip RK3588 NPU profile. Same backend stack as rk3576 (rkvoice-stream submodule); only RK_PLATFORM differs. Override TTS_BACKEND / matcha vars if you build platform-specific .rknn artifacts.",
+  "description": "Rockchip RK3588 release profile: Qwen3 ASR on RKNN/RKLLM plus Matcha hybrid TTS (ORT acoustic + RKNN Vocos) validated by TTS-to-ASR closed-loop.",
   "asr_backend": "rk.asr",
   "tts_backend": "rk.tts",
   "execution_policy": {
@@ -11,20 +11,26 @@
     "LANGUAGE_MODE": "rk",
     "RK_PLATFORM": "rk3588",
     "ASR_BACKEND": "qwen3_asr_rk",
-    "SEEED_LOCAL_VOICE_VAD_BACKEND": "silero",
-    "SEEED_LOCAL_VOICE_VAD_SILENCE_MS": "400",
+    "OVS_VAD_BACKEND": "silero",
+    "OVS_VAD_SILENCE_MS": "400",
     "ASR_DECODER_TYPE": "rkllm",
+    "ASR_DECODER_QUANT": "fp16",
     "ASR_MODEL_DIR": "/opt/asr/models",
     "RKLLM_LIB_PATH": "/opt/asr/lib/librkllmrt.so",
+    "QWEN3_ASR_CHUNK_CONFIRM": "0",
     "QWEN3_ASR_STREAM_TRUE": "1",
-    "TTS_BACKEND": "matcha_rknn",
     "TTS_MODEL_DIR": "/opt/tts/models",
+    "TTS_BACKEND": "matcha_rknn",
+    "SHERPA_TTS_MODEL_DIR": "/opt/tts/models/matcha-icefall-zh-en",
+    "TTS_PROVIDER": "cpu",
+    "TTS_NUM_THREADS": "4",
+    "TTS_DEFAULT_SID": "0",
     "MODEL_DIR": "/opt/tts/models",
     "MATCHA_USE_ORT": "1",
     "MATCHA_MODEL": "matcha-s64.rknn",
     "MATCHA_MAX_PHONEMES": "64",
     "MATCHA_MODEL_SEQ_LEN": "80",
     "VOCOS_MODEL": "vocos-16khz-600.rknn",
-    "VOCOS_FRAMES": "600"
+    "VOCOS_FRAMES": "256"
   }
 }

@@ -20,6 +20,14 @@ from app.core.tts_backend import TTSBackend, TTSCapability
 logger = logging.getLogger(__name__)
 
 
+def _env(*names: str, default: str | None = None) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
 def _sampling_uniforms(seed: int, max_frames: int) -> list[float]:
     if seed == 0 or os.environ.get("QWEN3_TTS_NUMPY_SAMPLING", "1").lower() in ("0", "false", "no"):
         return []
@@ -338,7 +346,7 @@ class Qwen3TRTBackend(TTSBackend):
             and os.environ.get("QWEN3_TTS_OFFLINE_STREAMING_FOR_LONG", "1").lower()
             not in ("0", "false", "no")
         )
-        seed = int(kwargs.get("seed", os.environ.get("SEEED_LOCAL_VOICE_TTS_SEED", "0")))
+        seed = int(kwargs.get("seed", _env("OVS_TTS_SEED", "SEEED_LOCAL_VOICE_TTS_SEED", default="0")))
         segment_text = kwargs.get("product_segment_text", True)
         if isinstance(segment_text, str):
             segment_text = segment_text.lower() not in ("0", "false", "no")
@@ -494,7 +502,7 @@ class Qwen3TRTBackend(TTSBackend):
         first_chunk_frames = kwargs.get("first_chunk_frames", 5)
         chunk_frames = kwargs.get("chunk_frames", 25)
         max_frames = kwargs.get("max_frames", 200)
-        seed = int(kwargs.get("seed", os.environ.get("SEEED_LOCAL_VOICE_TTS_SEED", "0")))
+        seed = int(kwargs.get("seed", _env("OVS_TTS_SEED", "SEEED_LOCAL_VOICE_TTS_SEED", default="0")))
         random_values = _sampling_uniforms(seed, int(max_frames))
 
         token_ids = self._tokenize(text)

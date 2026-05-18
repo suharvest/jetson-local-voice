@@ -1,38 +1,33 @@
-# Seeed Local Voice — Rockchip RK3588 (radxa).
+# OpenVoiceStream — Rockchip RK3588 (radxa).
 #
 # Usage (on radxa, repo root as cwd):
 #   docker compose -f deploy/docker-compose.radxa.yml up -d
 #
 # Same Docker image as deploy/docker-compose.rk.yml (RK3576 cat-remote);
-# only the host bind-mount paths differ between the two boards.
+# only the artifact set and runtime tuning differ between the two boards.
 #
 # Hardware: needs /dev (RKNN NPU char devs) and host networking. The image
 # is built against Debian 12 slim; see deploy/docker/Dockerfile.rk.
 
 services:
   speech:
-    build:
-      context: ..
-      dockerfile: deploy/docker/Dockerfile.rk
-    image: seeed-local-voice:rk
-    container_name: seeed-local-voice
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop
+    container_name: openvoicestream
     privileged: true
     init: true
     network_mode: host
+    command: ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8621"]
     mem_limit: 7500m
     memswap_limit: 7500m
     volumes:
       - /dev:/dev
-      - /usr/lib/librknnrt.so:/usr/lib/librknnrt.so:ro
-      # TTS assets
-      - /home/radxa/models/tts/matcha-icefall-zh-en:/opt/tts/models/matcha-icefall-zh-en:ro
-      - /home/radxa/models/tts/matcha-s64.rknn:/opt/tts/models/matcha-s64.rknn:ro
-      - /home/radxa/models/tts/vocos-16khz-600.rknn:/opt/tts/models/vocos-16khz-600.rknn:ro
-      - /home/radxa/matcha-data:/home/radxa/matcha-data:ro
-      # ASR assets
-      - /home/radxa/models:/opt/asr/models:ro
-      - /home/radxa/lib/librkllmrt.so:/opt/asr/lib/librkllmrt.so:ro
+      - ../configs:/opt/speech/configs:ro
+      - rk-asr-models:/opt/asr/models
+      - rk-tts-models:/opt/tts/models
     environment:
+      - OVS_PROFILE=${OVS_PROFILE:-}
+      - OVS_VAD_BACKEND=${OVS_VAD_BACKEND:-}
+      - OVS_VAD_SILENCE_MS=${OVS_VAD_SILENCE_MS:-}
       - SEEED_LOCAL_VOICE_PROFILE=${SEEED_LOCAL_VOICE_PROFILE:-rk3588-default}
       # Open-dialogue endpointing defaults. Override in .env for product tuning.
       - SEEED_LOCAL_VOICE_VAD_BACKEND=${SEEED_LOCAL_VOICE_VAD_BACKEND:-silero}
@@ -40,27 +35,46 @@ services:
       # ── ASR ─────────────────────────────────────────────────────────
       - ASR_BACKEND=qwen3_asr_rk
       - ASR_DECODER_TYPE=rkllm
+      - ASR_DECODER_QUANT=fp16
       - ASR_PLATFORM=rk3588
       - ASR_ENABLED_CPUS=4
       - ASR_NPU_CORE_MASK=NPU_CORE_AUTO
       - ASR_MODEL_DIR=/opt/asr/models
       - RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so
+      - RK_ARTIFACT_AUTO_DOWNLOAD=${RK_ARTIFACT_AUTO_DOWNLOAD:-1}
+      - RK_ARTIFACT_REPO_ID=${RK_ARTIFACT_REPO_ID:-harvestsu/seeed-local-voice-rk-artifacts}
+      - RK_ARTIFACT_MANIFEST=${RK_ARTIFACT_MANIFEST:-/opt/speech/deploy/artifacts/rk_manifest.json}
+      - RK_ARTIFACT_SET=${RK_ARTIFACT_SET:-rk3588-multilang-2026-05-17}
+      - RK_ARTIFACT_ROOT=${RK_ARTIFACT_ROOT:-/}
+      - RK_ARTIFACT_REVISION=${RK_ARTIFACT_REVISION:-main}
+      - HF_ENDPOINT=${HF_ENDPOINT:-}
       # True streaming: 400 ms chunks + left-context encoder + silero VAD
       # endpoint pre-fire → near-zero stop→final latency. Required for the
       # multi_utterance V2V path (see docs/api/v2v-stream.md).
+      - QWEN3_ASR_CHUNK_CONFIRM=0
       - QWEN3_ASR_STREAM_TRUE=1
       - QWEN3_ASR_TRUE_ROLL_SEC=15
       - VAD_ENDPOINT_SILENCE_MS=800
       # ── TTS ─────────────────────────────────────────────────────────
       - TTS_BACKEND=matcha_rknn
       - TTS_MODEL_DIR=/opt/tts/models
+      - SHERPA_TTS_MODEL_DIR=/opt/tts/models/matcha-icefall-zh-en
+      - TTS_PROVIDER=cpu
+      - TTS_NUM_THREADS=4
+      - TTS_DEFAULT_SID=0
       - MATCHA_MAX_PHONEMES=64
       - MATCHA_MODEL_SEQ_LEN=80
       - MATCHA_USE_ORT=1
       - MATCHA_MODEL=matcha-s64.rknn
       - VOCOS_MODEL=vocos-16khz-600.rknn
-      - VOCOS_FRAMES=600
-      - MATCHA_ONNX_PATH=/home/radxa/matcha-data/model-steps-3.onnx
+      - VOCOS_FRAMES=256
+      - MATCHA_ONNX_PATH=/opt/tts/models/model-steps-3.onnx
       # ── Misc ────────────────────────────────────────────────────────
       - MODEL_DIR=/opt/tts/models
     restart: unless-stopped
+
+volumes:
+  rk-asr-models:
+    name: rk-asr-models
+  rk-tts-models:
+    name: rk-tts-models

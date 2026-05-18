@@ -40,7 +40,21 @@ from app.backends.jetson.trt_edge_llm_ipc import (
 
 logger = logging.getLogger(__name__)
 
-_QWEN3_TTS_MODEL_BASE = os.environ.get("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", os.environ.get("QWEN3_MODEL_BASE", "/opt/models/qwen3-tts"))
+
+def _env(*names: str, default: str | None = None) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+_QWEN3_TTS_MODEL_BASE = _env(
+    "OVS_TTS_MODEL_BASE",
+    "SEEED_LOCAL_VOICE_TTS_MODEL_BASE",
+    "QWEN3_MODEL_BASE",
+    default="/opt/models/qwen3-tts",
+)
 _QWEN3_SPEAKER_ENCODER = os.environ.get(
     "QWEN3_SPEAKER_ENCODER", os.path.join(_QWEN3_TTS_MODEL_BASE, "onnx", "speaker_encoder.onnx")
 )
@@ -72,6 +86,18 @@ def _tts_stateful_code2wav_enabled() -> bool:
     # Stateful Code2Wav is the validated low-latency streaming path. It keeps
     # subsequent chunks small and continuous instead of optimizing only TTFA.
     return _env_flag("EDGE_LLM_TTS_STATEFUL_CODE2WAV", default=qwen3_highperf_enabled())
+
+
+def _code2wav_engine_path() -> str:
+    """Return the Code2Wav engine path used by current Qwen3 artifact sets."""
+    candidates = [
+        os.path.join(TTS_CODE2WAV_DIR, "code2wav.engine"),
+        os.path.join(TTS_CODE2WAV_DIR, "code2wav_stateful.engine"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 def _detect_language(text: str) -> str:
@@ -315,12 +341,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         return self._ready
 
     def _backend_mode(self) -> str:
-        mode = os.environ.get("SEEED_LOCAL_VOICE_TTS_BACKEND", os.environ.get("EDGE_LLM_TTS_BACKEND", "edgellm_worker"))
+        mode = _env("OVS_TTS_BACKEND", "SEEED_LOCAL_VOICE_TTS_BACKEND", "EDGE_LLM_TTS_BACKEND", default="edgellm_worker")
         return mode.strip().lower().replace("-", "_")
 
     def _load_product_explicit_kv_backend(self):
-        model_base = os.environ.get("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", "/home/harvest/voice_test/models/qwen3-tts")
-        overlay = os.environ.get("SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", "/home/harvest/voice_test/app_overlay")
+        model_base = _env("OVS_TTS_MODEL_BASE", "SEEED_LOCAL_VOICE_TTS_MODEL_BASE", default="/home/harvest/voice_test/models/qwen3-tts")
+        overlay = _env("OVS_TTS_NATIVE_MODULE_DIR", "SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", default="/home/harvest/voice_test/app_overlay")
         overlay_backends = os.path.join(overlay, "backends")
         for path in (overlay, overlay_backends):
             if os.path.isdir(path) and path not in sys.path:
@@ -337,7 +363,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         module = importlib.reload(module)
         backend = module.Qwen3TRTBackend()
         logger.info(
-            "Using Seeed Local Voice product_explicit_kv TTS backend (model_base=%s, talker=%s)",
+            "Using OpenVoiceStream product_explicit_kv TTS backend (model_base=%s, talker=%s)",
             model_base,
             os.environ.get("QWEN3_TALKER_ENGINE"),
         )
@@ -353,7 +379,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             return
         if mode not in ("edgellm", "edgellm_worker", "official"):
             raise ValueError(
-                "Unsupported SEEED_LOCAL_VOICE_TTS_BACKEND/EDGE_LLM_TTS_BACKEND value "
+                "Unsupported OVS_TTS_BACKEND/SEEED_LOCAL_VOICE_TTS_BACKEND/EDGE_LLM_TTS_BACKEND value "
                 f"{mode!r}; expected edgellm_worker or product_explicit_kv"
             )
 
@@ -378,7 +404,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             )
 
         # Code2Wav is optional (graceful fallback)
-        c2w_path = os.path.join(TTS_CODE2WAV_DIR, "code2wav.engine")
+        c2w_path = _code2wav_engine_path()
         if os.path.exists(c2w_path):
             logger.info("Code2Wav engine found at %s", c2w_path)
         else:
@@ -763,7 +789,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             if len(segments) > 1:
                 segment_kwargs = dict(kwargs)
                 segment_kwargs["segment_text"] = False
-                segment_kwargs.setdefault("seed", int(os.environ.get("SEEED_LOCAL_VOICE_TTS_SEED", "42")))
+                segment_kwargs.setdefault("seed", int(_env("OVS_TTS_SEED", "SEEED_LOCAL_VOICE_TTS_SEED", default="42")))
                 wav_parts: list[bytes] = []
                 segment_meta: list[dict] = []
                 total_elapsed = 0.0
@@ -952,7 +978,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             ]
 
             # Add code2wav if engine exists
-            c2w_path = os.path.join(TTS_CODE2WAV_DIR, "code2wav.engine")
+            c2w_path = _code2wav_engine_path()
             if os.path.exists(c2w_path):
                 cli_args += ["--code2wavEngineDir", TTS_CODE2WAV_DIR]
 

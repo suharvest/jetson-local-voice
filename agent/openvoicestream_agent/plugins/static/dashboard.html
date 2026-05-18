@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>OVS Agent Dashboard</title>
+<link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+<div id="toolbar">
+  <div class="tb-left">
+    <span id="statePill" class="state-pill state-idle">
+      <span class="state-dot"></span><span id="stateText">IDLE</span>
+    </span>
+    <div id="modeWrap" class="mode-wrap">
+      <button id="modeBtn" class="mode-btn" title="切换 App Mode">
+        <span id="modeIcon">💬</span>
+        <span id="modeLabel">对话</span>
+        <span class="caret">▼</span>
+      </button>
+      <div id="modeMenu" class="mode-menu hidden"></div>
+    </div>
+    <button id="modeSettingsBtn" class="ctl-btn" title="编辑当前模式的 system prompt / temperature">⚙ 设置</button>
+    <div class="filters" id="filters">
+      <label title="用户完整语句"><input type="checkbox" data-f="utt" checked /> 用户语句</label>
+      <label title="助手 LLM token 流"><input type="checkbox" data-f="tok" checked /> 助手回复</label>
+      <label title="ASR 中间识别（每 100ms 一次）"><input type="checkbox" data-f="partial" /> 识别中</label>
+      <label title="WS 连接 / 队列健康指标"><input type="checkbox" data-f="stats" /> 连接状态</label>
+      <label title="ConvState 切换 idle/listening/thinking/speaking"><input type="checkbox" data-f="state" /> 状态切换</label>
+      <label title="麦克风音量波形（10fps 噪声）"><input type="checkbox" data-f="mic" /> 麦克风电平</label>
+      <label title="错误"><input type="checkbox" data-f="error" checked /> 错误</label>
+    </div>
+  </div>
+  <div class="tb-right">
+    <button id="btnWake" class="ctl-btn pipeline-ctl hidden" title="唤醒 agent (从 SLEEPING → IDLE)">唤醒</button>
+    <button id="btnSleep" class="ctl-btn pipeline-ctl hidden" title="强制进入 SLEEPING">休眠</button>
+    <button id="btnPTT" class="ctl-btn pipeline-ctl hidden" title="按住说话 (Push to Talk)">按住说话</button>
+    <span id="pipelineBadge" class="pipeline-badge hidden"></span>
+    <button id="btnReconnect" class="ctl-btn" title="重新建立 SLV WebSocket 连接">重连 SLV</button>
+    <button id="btnAbort" class="ctl-btn" title="立刻中止当前 TTS 播放">中止 TTS</button>
+    <input id="sendInput" type="text" placeholder="跳过麦克风直接发文字给助手…" />
+    <button id="btnSend" class="ctl-btn primary">发送</button>
+    <button id="btnMenu" class="icon-btn" title="更多">⋮</button>
+    <div id="menu" class="menu hidden">
+      <button id="btnClear">清空日志</button>
+      <button id="btnPause">暂停</button>
+    </div>
+  </div>
+</div>
+
+<div id="main">
+  <section id="left">
+    <nav class="tabs">
+      <button class="tab active" data-tab="chat">对话</button>
+      <button class="tab" data-tab="events">事件流</button>
+      <button class="tab" data-tab="history">LLM 上下文</button>
+    </nav>
+    <div class="tab-panel active" id="tab-chat">
+      <div id="chat" class="chat-stream"></div>
+    </div>
+    <div class="tab-panel" id="tab-events">
+      <div id="events" class="event-stream"></div>
+    </div>
+    <div class="tab-panel" id="tab-history">
+      <div class="history-toolbar">
+        <button id="btnRefreshHist" class="ctl-btn">刷新</button>
+        <span class="muted">数据来源: <code>/api/session/history</code></span>
+      </div>
+      <div id="history" class="history-stream"></div>
+    </div>
+  </section>
+
+  <aside id="right">
+    <div class="card">
+      <h3>SLV WebSocket</h3>
+      <div class="row-flex">
+        <span><span id="wsDot" class="dot unknown"></span><span id="wsState">unknown</span></span>
+        <span class="muted">reconnects: <span id="rcCount">0</span></span>
+      </div>
+      <div class="muted small">uptime <span id="uptime">0s</span></div>
+      <div class="muted small">pipeline: <span id="pipelineModeText">always_on</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Latency</h3>
+      <table class="lat-tbl">
+        <tbody>
+          <tr><th>ASR</th>  <td class="lat-now" id="lat-asr">–</td>  <td class="lat-hist" id="lath-asr"></td>  <td class="lat-spark"><canvas id="spark-asr"  width="30" height="20"></canvas></td></tr>
+          <tr><th>TTFT</th> <td class="lat-now" id="lat-ttft">–</td> <td class="lat-hist" id="lath-ttft"></td> <td class="lat-spark"><canvas id="spark-ttft" width="30" height="20"></canvas></td></tr>
+          <tr><th>TTFA</th> <td class="lat-now" id="lat-ttfa">–</td> <td class="lat-hist" id="lath-ttfa"></td> <td class="lat-spark"><canvas id="spark-ttfa" width="30" height="20"></canvas></td></tr>
+          <tr><th>RTT</th>  <td class="lat-now" id="lat-rtt">–</td>  <td class="lat-hist" id="lath-rtt"></td>  <td class="lat-spark"><canvas id="spark-rtt"  width="30" height="20"></canvas></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Mic RMS</h3>
+      <canvas id="rmsChart" width="240" height="60"></canvas>
+      <div class="muted small">threshold <span id="rmsThr">–</span> · vad <span id="vadState">idle</span></div>
+    </div>
+
+    <div class="card">
+      <h3>TTS</h3>
+      <div id="ttsRow" class="tts-row inactive">
+        <span class="pulse-dot"></span>
+        <span id="ttsText" class="muted">idle</span>
+      </div>
+      <div class="muted small">本轮 sentence 数: <span id="ttsSentCount">0</span></div>
+      <div class="muted small">本轮累计字节: <span id="ttsBytesCur">0</span></div>
+      <div class="muted small">上轮 TTS 时长: <span id="ttsLastDur">–</span></div>
+    </div>
+
+    <div class="card error-card" id="errCard">
+      <h3>
+        <span id="errDot" class="err-dot hidden"></span>
+        Errors (<span id="errCount">0</span>)
+        <button id="btnErrClear" class="err-clear-btn" title="清空错误列表">⊘</button>
+      </h3>
+      <div id="errList" class="err-list"></div>
+    </div>
+
+    <div class="card" id="llm-health-card">
+      <h3>
+        LLM 健康
+        <button id="llm-probe-btn" class="ctl-btn" title="立刻重新探测 LLM 可用性">重新探测</button>
+      </h3>
+      <div class="health-row">
+        <span id="llm-health-dot" class="health-dot unknown"></span>
+        <span id="llm-health-state">未知</span>
+      </div>
+      <div class="health-meta muted small">
+        <div>上次成功: <span id="llm-last-ok">-</span></div>
+        <div>连续失败: <span id="llm-failures">0</span></div>
+        <div>探测间隔: <span id="llm-interval">-</span></div>
+      </div>
+      <div id="llm-prefix-cache-badge" class="badge hidden">prefix_cache 已禁用</div>
+    </div>
+
+    <div class="card settings-card" id="agentSettingsCard">
+      <h3>
+        <button id="btnAgentSettingsToggle" class="settings-toggle" title="展开/折叠">▸</button>
+        ⚙ Agent 设置
+      </h3>
+      <div id="agentSettingsBody" class="settings-body hidden">
+        <label class="ms-label">pipeline_mode</label>
+        <select id="setPipelineMode">
+          <option value="always_on">always_on</option>
+          <option value="wake_word">wake_word</option>
+          <option value="push_to_talk">push_to_talk</option>
+        </select>
+        <label class="ms-label">sleep_timeout_s</label>
+        <input id="setSleepTimeout" type="number" step="0.5" min="0" />
+        <label class="ms-label">stop_words (每行一个)</label>
+        <textarea id="setStopWords" rows="5" placeholder="停&#10;停下&#10;stop"></textarea>
+        <div class="settings-warn muted small">
+          ⚠ 修改 pipeline_mode 需要重启 agent 才能完全生效；sleep_timeout_s / stop_words 下一轮即热生效。
+        </div>
+        <div class="ms-actions">
+          <button id="btnAgentSettingsSave" class="ctl-btn primary">保存设置</button>
+          <button id="btnAgentSettingsReload" class="ctl-btn">重新加载</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div id="modeSettingsPanel" class="mode-settings-panel hidden">
+  <div class="ms-header">
+    <span>当前模式: <span id="msMode">–</span></span>
+    <button id="msClose" class="icon-btn" title="关闭">×</button>
+  </div>
+  <div class="ms-body">
+    <label class="ms-label">System prompt</label>
+    <textarea id="msSystemPrompt" rows="6" placeholder="(继承类默认)"></textarea>
+    <div class="ms-default muted small">默认: <span id="msSystemPromptDefault">–</span></div>
+
+    <button id="msAdvancedToggle" class="advanced-toggle ctl-btn">▾ 高级</button>
+    <div id="msAdvancedBody" class="hidden">
+      <label class="ms-label">Temperature</label>
+      <input id="msTemperature" type="number" step="0.1" min="0" max="2" placeholder="(继承)" />
+      <label class="ms-label">Max history</label>
+      <input id="msMaxHistory" type="number" step="1" min="0" placeholder="(继承)" />
+      <label class="ms-label">Barge-in</label>
+      <select id="msBargeIn">
+        <option value="">(继承)</option>
+        <option value="true">true (允许打断)</option>
+        <option value="false">false (禁止打断)</option>
+      </select>
+    </div>
+
+    <div class="ms-actions">
+      <button id="msSave" class="ctl-btn primary">保存</button>
+      <button id="msReset" class="ctl-btn">恢复默认</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

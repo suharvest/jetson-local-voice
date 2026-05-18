@@ -1,26 +1,26 @@
 {
   "name": "jetson-qwen3asr-matcha-nx",
-  "description": "Multilang preset on Jetson Orin NX/AGX: Qwen3 ASR (TRT-Edge-LLM worker) for multilingual input + Matcha TTS (ORT-CPU acoustic + TRT vocos) for zh+en output. Lighter than voice_clone (talker not loaded), supports multi-stream.",
+  "description": "Multilang preset on Jetson Orin NX/AGX: Qwen3 ASR (TRT-Edge-LLM worker) for multilingual input + Matcha TTS (ORT-CPU duration/encoder + TRT estimator + TRT vocos) for zh+en output. Lighter than voice_clone (talker not loaded), supports multi-stream.",
   "asr_backend": "jetson.trt_edge_llm",
   "tts_backend": "jetson.matcha_trt",
   "execution_policy": {
     "mode": "concurrent",
     "shared_resource": "gpu"
   },
-  "artifact_set": "orin-nx-highperf-2026-05-11",
+  "artifact_set": "orin-nx-highperf-2026-05-14",
   "env": {
     "LANGUAGE_MODE": "multilanguage",
     "ASR_BACKEND": "trt_edgellm",
     "TTS_BACKEND": "matcha_trt",
-    "SEEED_LOCAL_VOICE_VAD_BACKEND": "silero",
-    "SEEED_LOCAL_VOICE_VAD_SILENCE_MS": "400",
+    "OVS_VAD_BACKEND": "silero",
+    "OVS_VAD_SILENCE_MS": "400",
     "EDGE_LLM_QWEN3_PROFILE": "highperf",
     "EDGE_LLM_ASR_WORKER": "1",
     "EDGE_LLM_ASR_WORKER_BIN": "/opt/jv-workers/qwen3_asr_worker",
-    "EDGE_LLM_ASR_PLUGIN_PATH": "/opt/edgellm/libNvInfer_edgellm_plugin.so",
+    "EDGE_LLM_ASR_PLUGIN_PATH": "/opt/edgellm-bin/libNvInfer_edgellm_plugin_asr.so",
     "EDGE_LLM_ASR_VOCAB_PRUNED": "0",
     "QWEN3_ARTIFACT_MANIFEST": "deploy/artifacts/qwen3_manifest.json",
-    "QWEN3_ARTIFACT_SET": "orin-nx-highperf-2026-05-11",
+    "QWEN3_ARTIFACT_SET": "orin-nx-highperf-2026-05-14",
     "QWEN3_ARTIFACT_ROOT": "/opt/models/qwen3-edgellm",
     "QWEN3_EDGELLM_JETSON_ROOT": "/opt/qwen3-edgellm-jetson",
     "EDGE_LLM_ASR_STREAM_MODE": "worker",
@@ -29,9 +29,12 @@
     "EDGE_LLM_ASR_STREAM_UNFIXED_TOKENS": "5",
     "EDGE_LLM_ASR_MEL_SETTINGS": "${QWEN3_EDGELLM_JETSON_ROOT}/deploy/audio_preprocessing/whisper_feature_extractor.json",
     "EDGE_LLM_ASR_MEL_FILTERS": "${QWEN3_EDGELLM_JETSON_ROOT}/deploy/audio_preprocessing/mel_filters.bin",
-    "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/asr_thinker_full_fp8embed",
+    "EDGE_LLM_ASR_ENGINE_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf-v2/asr_thinker_full_fp8embed",
     "EDGE_LLM_ASR_AUDIO_ENC_DIR": "${QWEN3_ARTIFACT_ROOT}/engines/orin-nx/highperf/asr_audio_encoder",
-    "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en"
+    "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en",
+    "MATCHA_ACOUSTIC_EP": "SPLIT_TRT",
+    "MATCHA_SPLIT_ENCODER_ONNX": "/opt/models/matcha-icefall-zh-en/onnx/matcha_encoder_trt.onnx",
+    "MATCHA_SPLIT_ESTIMATOR_ENGINE": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine"
   },
   "required_engines": [
     {
@@ -43,6 +46,20 @@
       "build_script": "scripts/build_matcha_engines.sh",
       "build_env": {
         "VOCOS_NAME": "vocos_fp16.engine"
+      },
+      "hf_only": false,
+      "required": true
+    },
+    {
+      "model_id": "matcha-icefall-zh-en",
+      "engine_file": "matcha_estimator_step0_bf16.engine",
+      "engine_path": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine",
+      "env_var": "MATCHA_SPLIT_ESTIMATOR_ENGINE",
+      "onnx_input": "../model-steps-3.onnx",
+      "build_script": "scripts/build_matcha_estimator_trt.sh",
+      "build_env": {
+        "ONNX_DIR": "/opt/models/matcha-icefall-zh-en/onnx",
+        "OUT_DIR": "/opt/models/matcha-icefall-zh-en/engines"
       },
       "hf_only": false,
       "required": true

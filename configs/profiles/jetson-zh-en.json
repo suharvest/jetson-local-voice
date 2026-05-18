@@ -1,6 +1,6 @@
 {
   "name": "jetson-zh-en",
-  "description": "Jetson Orin (Nano/NX/AGX) zh_en default: Paraformer streaming ASR (TRT encoder + ORT decoder) + Matcha TTS (ORT acoustic + TRT vocos). Uses sherpa-onnx tokenizer/lexicon shipped under /opt/models.",
+  "description": "Jetson Orin (Nano/NX/AGX) zh_en default: Paraformer streaming ASR (TRT encoder + TRT decoder) + Matcha TTS (ORT-CPU duration/encoder + TRT estimator + TRT vocos). Uses numpy-only fbank, hand-rolled tokenizer.",
   "asr_backend": "jetson.paraformer_trt",
   "tts_backend": "jetson.matcha_trt",
   "execution_policy": {
@@ -11,7 +11,11 @@
     "LANGUAGE_MODE": "zh_en",
     "MODEL_DIR": "/opt/models",
     "PARAFORMER_MODEL_DIR": "/opt/models/paraformer-streaming",
-    "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en"
+    "PARAFORMER_PREROLL_MS": "100",
+    "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en",
+    "MATCHA_ACOUSTIC_EP": "SPLIT_TRT",
+    "MATCHA_SPLIT_ENCODER_ONNX": "/opt/models/matcha-icefall-zh-en/onnx/matcha_encoder_trt.onnx",
+    "MATCHA_SPLIT_ESTIMATOR_ENGINE": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine"
   },
   "required_engines": [
     {
@@ -29,6 +33,20 @@
       "required": true
     },
     {
+      "model_id": "paraformer-streaming",
+      "engine_file": "paraformer_decoder_fp16.plan",
+      "engine_path": "/opt/models/paraformer-streaming/engines/paraformer_decoder_fp16.plan",
+      "env_var": "PARAFORMER_DEC_ENGINE",
+      "onnx_input": "decoder.onnx",
+      "build_script": "scripts/build_paraformer_trt.sh",
+      "build_env": {
+        "ENGINE_NAME": "paraformer_decoder_fp16.plan",
+        "MODEL_DIR": "/opt/models/paraformer-streaming"
+      },
+      "hf_only": false,
+      "required": true
+    },
+    {
       "model_id": "matcha-icefall-zh-en",
       "engine_file": "vocos_fp16.engine",
       "engine_path": "/opt/models/matcha-icefall-zh-en/engines/vocos_fp16.engine",
@@ -37,6 +55,20 @@
       "build_script": "scripts/build_matcha_engines.sh",
       "build_env": {
         "VOCOS_NAME": "vocos_fp16.engine"
+      },
+      "hf_only": false,
+      "required": true
+    },
+    {
+      "model_id": "matcha-icefall-zh-en",
+      "engine_file": "matcha_estimator_step0_bf16.engine",
+      "engine_path": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine",
+      "env_var": "MATCHA_SPLIT_ESTIMATOR_ENGINE",
+      "onnx_input": "../model-steps-3.onnx",
+      "build_script": "scripts/build_matcha_estimator_trt.sh",
+      "build_env": {
+        "ONNX_DIR": "/opt/models/matcha-icefall-zh-en/onnx",
+        "OUT_DIR": "/opt/models/matcha-icefall-zh-en/engines"
       },
       "hf_only": false,
       "required": true

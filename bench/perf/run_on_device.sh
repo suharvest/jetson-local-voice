@@ -28,10 +28,24 @@ NODE="$1"; shift
 PERF_ARGS="${*:-asr --warmup 5 --runs 10}"
 REMOTE_DIR="/tmp/seeed-perf"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+STAGE_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$STAGE_DIR"
+}
+trap cleanup EXIT
 
 echo ">> Target: $NODE"
-echo ">> Pushing $LOCAL_DIR/  ->  $NODE:$REMOTE_DIR/"
-fleet push "$NODE" "$LOCAL_DIR"/  "$REMOTE_DIR"/
+echo ">> Staging perf harness without historical results..."
+(
+  cd "$LOCAL_DIR"
+  tar --exclude='./results' --exclude='./__pycache__' -cf - .
+) | (
+  cd "$STAGE_DIR"
+  tar -xf -
+)
+
+echo ">> Pushing staged harness -> $NODE:$REMOTE_DIR/"
+fleet push "$NODE" "$STAGE_DIR"/  "$REMOTE_DIR"/
 
 echo ">> Verifying corpus on device (fetch from HF if missing)..."
 fleet exec "$NODE" -- "
@@ -52,7 +66,7 @@ fleet exec "$NODE" -- "
 if [[ "$PERF_ARGS" != *"--base-url"* ]]; then
   SUB="${PERF_ARGS%% *}"
   REST="${PERF_ARGS#${SUB}}"      # everything after the subcommand, may be empty
-  PERF_ARGS="$SUB --base-url http://127.0.0.1:8000 --mode-label local$REST"
+  PERF_ARGS="$SUB --base-url http://127.0.0.1:${OVS_PORT:-${SEEED_LOCAL_VOICE_PORT:-8621}} --mode-label local$REST"
 fi
 
 echo ">> Running perf on-device: python perf.py $PERF_ARGS"

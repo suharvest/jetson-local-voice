@@ -3,8 +3,8 @@ import sys
 
 
 def _reload_ipc(monkeypatch):
-    monkeypatch.delitem(sys.modules, "backends.trt_edge_llm_ipc", raising=False)
-    import backends.trt_edge_llm_ipc as ipc
+    monkeypatch.delitem(sys.modules, "app.backends.jetson.trt_edge_llm_ipc", raising=False)
+    import app.backends.jetson.trt_edge_llm_ipc as ipc
 
     return importlib.reload(ipc)
 
@@ -18,7 +18,8 @@ def test_worker_paths_prefer_voice_native_build(monkeypatch, tmp_path):
     tts_worker.touch()
     asr_worker.touch()
 
-    monkeypatch.setenv("SEEED_LOCAL_VOICE_BASE", str(voice_root))
+    monkeypatch.setenv("OVS_BASE", str(voice_root))
+    monkeypatch.setenv("SEEED_LOCAL_VOICE_BASE", str(tmp_path / "legacy_voice"))
     monkeypatch.setenv("EDGE_LLM_BASE", str(tmp_path / "edge"))
     monkeypatch.setenv("EDGE_LLM_BUILD_DIR", "build_sm87")
     monkeypatch.delenv("EDGE_LLM_TTS_WORKER_BIN", raising=False)

@@ -10,9 +10,9 @@ Branch: `qwen3tts-accurate-20260507` (latest commit ≥ `f3ab241`).
 
 | Device class | Image | Size |
 |---|---|---|
-| Jetson Orin (Nano/NX/AGX) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.11` | 3.14 GB |
-| RK3576 / RK3588 | `seeed-local-voice:rk-v1.1` (local on radxa; not yet pushed to registry) | 1.38 GB |
-| RPi 4 / 5 (CM4 / CM5) | `seeed-local-voice:rpi-v1.1` (local on harvest-pi) | 560 MB |
+| Jetson Orin (Nano/NX/AGX) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf` | 3.14 GB class |
+| RK3576 / RK3588 | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop` | 767 MB |
+| RPi 4 / 5 (CM4 / CM5) | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx` | 560 MB class |
 
 History — Jetson image patches (each fix forced a rebake):
 - v1.0 → first slim bake (CMD `sleep 9999` bug, no TRT libs)
@@ -27,11 +27,12 @@ History — Jetson image patches (each fix forced a rebake):
 - v1.9 → engine_resolver manifest key alignment (model-relative vs full path)
 - v1.10 → multilang preset also pulls matcha-icefall-zh-en bundle from Seeed CDN
 - v1.11 → model_downloader marker-file freshness check (catches stale dir created by engine_resolver)
-Use v1.11 going forward.
+- v1.12-highperf → Qwen3 TensorRT-EdgeLLM high-performance artifacts and runtime sidecars aligned with the current release gate
+Use v1.12-highperf going forward.
 
-All three are self-contained for their device family. Pull jetson-v1.7 from
-the registry; rk-v1.1 / rpi-v1.1 are on-device builds — `docker save` or
-HF upload if you need to distribute.
+All three are self-contained for their device family. Jetson and RK images are
+in the mission registry; RPi images may still be on-device builds, so use
+`docker save` or registry push when distributing to new boards.
 
 ## Preset matrix (verified end-to-end)
 
@@ -52,10 +53,9 @@ After today's sweep:
 
 | Device | Container | Image | Port | Preset | /health |
 |---|---|---|---|---|---|
-| orin-nano | `seeed-nano-v111` | jetson-v1.11 | 8000 (host net) | voice_clone | ✅ both ready |
-| radxa | `seeed-rk-v11` | rk-v1.1 | 8000 (host net) | multilang | ✅ both ready |
-| harvest-pi | `seeed-rpi-litezhen` | rpi-v1.1 | 8765 | rpi5-default (lite_zh_en) | ✅ both ready |
-| harvest-pi | `seeed-rpi-asronly` | rpi-v1.1 | 8766 | asr_zh_en | ✅ asr ready, tts:null |
+| orin-nano | `seeed-local-voice` | jetson-v1.12-highperf | 8621 (host net) | jetson-multilang-highperf | ✅ both ready in latest product gate |
+| radxa | `seeed-local-voice` | rk-v1.4-closedloop | 8621 (host net) | rk3588-default / multilang | ✅ both ready in latest product gate |
+| harvest-pi | `seeed-local-voice` | rpi-v1.0-onnx | 8000 | rpi5-default | ✅ both ready in latest product gate |
 
 `docker ps` on each device confirms current state.
 
@@ -75,7 +75,7 @@ docker run -d --name seeed-jetson --runtime nvidia --network host \
   -e SEEED_LOCAL_VOICE_PRESET=voice_clone \
   -e HF_ENDPOINT=https://hf-mirror.com \
   -e QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.11
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf
 ```
 
 **multilang (Qwen3 ASR + Matcha TTS — supports multi-stream)**
@@ -86,11 +86,22 @@ docker run -d --name seeed-jetson-ml --runtime nvidia --network host \
   -e SEEED_LOCAL_VOICE_PRESET=multilang \
   -e HF_ENDPOINT=https://hf-mirror.com \
   -e QWEN3_ARTIFACT_ROOT=/opt/models/qwen3-edgellm \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.11
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf
 ```
 
-Engine resolver downloads Matcha vocos engine bundle from
-`harvestsu/seeed-local-voice-artifacts` on first start (~30s).
+Engine resolver downloads Paraformer/Matcha TensorRT bundles from
+[`harvestsu/seeed-local-voice-artifacts`](https://huggingface.co/harvestsu/seeed-local-voice-artifacts)
+on first start. Bundles are keyed by host signature, e.g.
+`sm87-trt10.3-jp6.2-cuda12.6.tar.gz`; the published manifest can also carry
+the graph-surgery ONNX inputs needed for cold rebuilds.
+
+Artifact decision flow:
+
+1. If the local engine sidecar matches the current host signature, use it.
+2. Else, if the HF manifest has an engine bundle for the current host
+   signature, download/extract that bundle and do not download ONNX.
+3. Else, download the ONNX inputs declared in the manifest and compile inside
+   the Jetson image.
 
 **lite_zh_en (Paraformer + Matcha — high throughput zh+en)**
 ```bash
@@ -98,7 +109,7 @@ docker run -d --name seeed-jetson-lite --runtime nvidia --network host \
   -v seeed-models:/opt/models \
   -e SEEED_LOCAL_VOICE_PRESET=lite_zh_en \
   -e HF_ENDPOINT=https://hf-mirror.com \
-  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.11
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:jetson-v1.12-highperf
 ```
 
 First start downloads sherpa Matcha (~120 MB) + Paraformer (~900 MB) ONNX
@@ -107,25 +118,56 @@ to volume; engine_resolver compiles or pulls TRT engines.
 ### RK3576 / RK3588 (radxa)
 
 Requires:
-- Host has `librknnrt.so` + `librkllmrt.so` + rkvoice-stream model bundle
-- `--privileged` for NPU device access
+- Host has NPU kernel driver/devices.
+- `--privileged` for NPU device access.
+- The RK image vendors pinned userspace runtime libraries under
+  `/opt/rk-runtime` and symlinks them to `/usr/lib/librknnrt.so` and
+  `/opt/asr/lib/librkllmrt.so`.
 
-**multilang on RK3588 (Qwen3 ASR via NPU + Matcha RKNN TTS)**
+RK does not use the Jetson `engine_resolver`; it has a separate artifact
+manifest for `.rknn` / `.rkllm` files. The generated RK artifacts are published
+to [`harvestsu/seeed-local-voice-rk-artifacts`](https://huggingface.co/harvestsu/seeed-local-voice-rk-artifacts)
+and consumed through `RK_ARTIFACT_REPO_ID` + `RK_ARTIFACT_SET`. Official
+upstream tokenizers / base resources are referenced instead of duplicated when
+available. The host BSP still supplies the kernel/NPU driver.
+
+The analogous RK flow should be:
+
+1. Check SoC, vendored RKNN/RKLLM runtime hashes, toolkit version, quant mode,
+   fixed-shape/bucket metadata, and artifact hashes.
+2. If compatible, download/use the published `.rknn` / `.rkllm` artifacts.
+3. If incompatible, build via a dedicated RK builder image or offline x86
+   conversion host, then publish a new artifact set. The runtime image only
+   includes `rknn-toolkit-lite2`, so it should not be treated as an RKNN
+   compiler image.
+4. If the runtime check fails, tell the operator to remove overriding host
+   mounts, update the device BSP/runtime, or use an artifact set that matches
+   the installed runtime. `RK_RUNTIME_STRICT=0` is only for debugging.
+
+RPi/CM profiles are simpler: there is no compiled engine gate; download the
+ONNX/sherpa model package and run it directly with CPU ONNX Runtime.
+
+**multilang on RK3588 (Qwen3 ASR via NPU + hybrid Matcha TTS)**
 ```bash
 docker run -d --name seeed-rk --privileged --network host \
   -v /dev:/dev \
-  -v /usr/lib/librknnrt.so:/usr/lib/librknnrt.so \
-  -v /home/radxa/lib/librkllmrt.so:/opt/asr/lib/librkllmrt.so \
-  -v /home/radxa/models:/opt/asr/models \
-  -v /home/radxa/models/tts/matcha-icefall-zh-en:/opt/tts/models/matcha-icefall-zh-en \
-  -v /home/radxa/models/tts/matcha-s64.rknn:/opt/tts/models/matcha-s64.rknn \
-  -v /home/radxa/models/tts/vocos-16khz-600.rknn:/opt/tts/models/vocos-16khz-600.rknn \
-  -v /home/radxa/matcha-data:/home/radxa/matcha-data:ro \
+  -v seeed-rk-asr:/opt/asr/models \
+  -v seeed-rk-tts:/opt/tts/models \
   -e SEEED_LOCAL_VOICE_PRESET=multilang \
-  seeed-local-voice:rk-v1.1
+  -e RK_ARTIFACT_REPO_ID=harvestsu/seeed-local-voice-rk-artifacts \
+  -e RK_ARTIFACT_SET=rk3588-multilang-2026-05-17 \
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rk-v1.4-closedloop
 ```
 
 profile_selector auto-detects rk3588 (or rk3576) via `/proc/cpuinfo` and picks `rk{soc}-multilang.json`.
+
+RK compose files now set the published HF repo and device-specific artifact
+set by default, with named volumes at `/opt/asr/models` and `/opt/tts/models`
+so first boot can populate artifacts without host-side model preparation. The
+validated RK3588 TTS release path uses `TTS_BACKEND=matcha_rknn`,
+`MATCHA_USE_ORT=1`, `MATCHA_MODEL_SEQ_LEN=80`, and `VOCOS_FRAMES=256`: Matcha
+acoustic runs on ORT and Vocos runs on RKNN/NPU. The full RKNN Matcha path
+(`MATCHA_USE_ORT=0`, sequence length 96, frames 256) remains experimental.
 
 ### Raspberry Pi 5 / 4 / CM4 / CM5 (harvest-pi)
 
@@ -133,20 +175,20 @@ CPU-only (sherpa-onnx). No `--runtime nvidia`, no `--privileged`.
 
 **asr_zh_en (RPi4/CM4 minimum: Paraformer streaming, no TTS)**
 ```bash
-docker run -d --name seeed-rpi-asr -p 8000:8000 \
+docker run -d --name seeed-rpi-asr -p 8621:8000 \
   -e SEEED_LOCAL_VOICE_PRESET=asr_zh_en \
   -v seeed-models:/opt/models \
-  seeed-local-voice:rpi-v1.1
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx
 ```
 
 **lite_zh_en on RPi5/CM5 (Paraformer + Matcha CPU)**
 
 Until `lite_zh_en × rpi5` is added to PRESET_TABLE, use explicit profile:
 ```bash
-docker run -d --name seeed-rpi-lite -p 8000:8000 \
+docker run -d --name seeed-rpi-lite -p 8621:8000 \
   -e SEEED_LOCAL_VOICE_PROFILE=rpi5-default \
   -v seeed-models:/opt/models \
-  seeed-local-voice:rpi-v1.1
+  sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:rpi-v1.0-onnx
 ```
 
 ## Endpoints to measure
@@ -214,7 +256,7 @@ Numbers to record into the perf table:
 ## Measured ASR perf (local mode, 2026-05-13)
 
 All numbers from **local-mode smoke** (`bench/perf/run_on_device.sh <node> -- asr --warmup 5 --runs 10`):
-client runs on the device, talks to `127.0.0.1:8000`, eliminating Mac↔device network from measurements.
+client runs on the device, talks to `127.0.0.1:8621`, eliminating Mac↔device network from measurements.
 Corpus: 20 FLEURS files (10 zh + 10 en, 3-15s, sha256-locked). CER is character-level for zh, WER is word-level for en; both computed with Chinese-number normalization (cn2an) so "15米" and "十五米" compare equal.
 
 ### Latency: Finalize RTF p50 (compute-bound, lower=better)
@@ -326,8 +368,11 @@ V2V forced-EOS llm=0 (warmup 3 + 5 runs): short/zh 323ms; long/zh 876ms; short/e
 - **`SEEED_LOCAL_VOICE_PROFILE=...` overrides PRESET.** Don't pass both. New v1.7 / rk-v1.1 / rpi-v1.1 images do NOT bake a default PROFILE.
 - **HF_ENDPOINT for China users**: set `https://hf-mirror.com` so engine_resolver can pull bundles. Defaults to `https://huggingface.co` (works internationally).
 - **Jetson multilang requires the `qwen3-edgellm-jetson` artifact set** at the path the profile expects. The `-v /tmp/nano-audit:/opt/models/qwen3-edgellm:ro` mount is what supplies it on Nano; for AGX/NX you must `hf download harvestsu/qwen3-edgellm-jetson-artifacts --local-dir <path>` first.
-- **RK image needs librknnrt.so + librkllmrt.so from host** via `-v` bind. The image does NOT bundle the runtime — different RK SoCs need different runtime versions.
-- **Port 8000 conflicts**: if you already have a service on 8000 (e.g. existing jvrpi on harvest-pi), use `-p 8765:8000` or `--network host` carefully.
+- **RK image vendors userspace runtime libs.** Do not bind-mount
+  `librknnrt.so` / `librkllmrt.so` unless intentionally testing a different
+  runtime. If `RK_RUNTIME_STRICT=1` reports a mismatch, remove the override or
+  update the device BSP/runtime/artifact set.
+- **Port conflicts**: default deployments use host port 8621. If that port is already occupied, set `SEEED_LOCAL_VOICE_PORT` for `deploy/install.sh` or override the compose command/port mapping consistently.
 - **`docker logs <name>` can be noisy** during first start (model download progress bars). Filter with `| grep -E "INFO|WARN|ERROR|backend|Application|ready"`.
 
 ## Reload / restart commands

@@ -21,7 +21,7 @@ pretty_name: OpenVoiceStream Perf Corpus
 # OpenVoiceStream — Perf Test Corpus
 
 Fixed 20-file audio corpus used to benchmark
-[`Seeed-Projects/seeed-local-voice`](https://github.com/Seeed-Projects/seeed-local-voice)
+[`Seeed-Projects/openvoicestream`](https://github.com/Seeed-Projects/openvoicestream)
 across Jetson, Rockchip, and Raspberry Pi deployments.
 
 The same `.wav` bytes are pulled by every device, so RTF / latency deltas
@@ -61,7 +61,7 @@ content was altered.
 python bench/perf/corpus/fetch.py --from hf
 python bench/perf/corpus/fetch.py --verify    # SHA256 must match manifest
 
-python bench/perf/perf.py matrix --base-url http://<device>:8000
+python bench/perf/perf.py matrix --base-url http://<device>:8621
 ```
 
 ## License

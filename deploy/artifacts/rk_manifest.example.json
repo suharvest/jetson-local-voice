@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "description": "Example RK artifact manifest. Publish real .rknn/.rkllm/model files to Hugging Face, then set RK_ARTIFACT_REPO_ID or RK_ARTIFACT_MANIFEST.",
+  "hf_repo_id": "harvestsu/seeed-local-voice-rk-artifacts",
+  "revision": "main",
+  "default_set": "rk3588-multilang-2026-05-17",
+  "artifact_sets": {
+    "rk3588-multilang-2026-05-17": {
+      "soc": "rk3588",
+      "profile": "multilang",
+      "root": "/",
+      "runtime": {
+        "rknn_toolkit_lite2": "2.3.2",
+        "librknnrt_sha256": "d31fc19c85b85f6091b2bd0f6af9d962d5264a4e410bfb536402ec92bac738e8",
+        "librkllmrt_sha256": "bbcf28a8666b9fbf7361d6aad892b957920f6ea92400c074899b48f4c5b2c96f"
+      },
+      "files": [
+        {
+          "path": "opt/asr/models/encoder.rknn",
+          "sha256": "REPLACE_WITH_SHA256"
+        },
+        {
+          "path": "opt/asr/models/decoder/decoder_qwen3.fp16.rk3588.rkllm",
+          "sha256": "REPLACE_WITH_SHA256"
+        },
+        {
+          "path": "opt/tts/models/matcha-s64.rknn",
+          "sha256": "REPLACE_WITH_SHA256"
+        },
+        {
+          "path": "opt/tts/models/vocos-16khz-600.rknn",
+          "sha256": "REPLACE_WITH_SHA256"
+        }
+      ]
+    }
+  }
+}

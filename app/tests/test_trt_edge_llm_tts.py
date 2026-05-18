@@ -17,7 +17,7 @@ def _make_wav_bytes(frame_count: int, sample_rate: int = 24000) -> bytes:
 
 
 def test_one_shot_tts_passes_code_predictor_dir(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
     monkeypatch.setenv("EDGE_LLM_TTS_WORKER", "0")
@@ -74,7 +74,7 @@ def test_one_shot_tts_passes_code_predictor_dir(monkeypatch):
 
 
 def test_split_tts_text_handles_cjk_and_latin(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     zh = "你好，很高兴认识你。今天我们来测试一下语音合成的稳定性，看看这段稍微长一点的中文是不是能清楚自然地读出来。"
     zh_parts = tts_mod._split_tts_text(zh, max_chars=24)
@@ -102,7 +102,7 @@ def test_split_tts_text_handles_cjk_and_latin(monkeypatch):
 
 
 def test_split_tts_text_preserves_common_punctuation_and_grammar():
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     cases = [
         ("中文", "真的吗？可以的，请继续！不过，逗号、顿号、冒号：都要保留。", 8, ""),
@@ -143,7 +143,7 @@ def test_split_tts_text_preserves_common_punctuation_and_grammar():
 
 
 def test_segmented_tts_concatenates_one_shot_wavs(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     calls = []
     monkeypatch.setenv("EDGE_LLM_TTS_WORKER", "0")
@@ -202,7 +202,7 @@ def test_segmented_tts_concatenates_one_shot_wavs(monkeypatch):
 
 
 def test_cjk_default_segmentation_prefers_sentence_boundary(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     monkeypatch.delenv("EDGE_LLM_TTS_CJK_SEGMENT_MAX_CHARS", raising=False)
     text = "你好，今天我们继续验证语音合成的稳定性。这个版本应该保持清晰自然，不应该出现逐渐变沙、吞音或者明显的噪声积累。"
@@ -215,7 +215,7 @@ def test_cjk_default_segmentation_prefers_sentence_boundary(monkeypatch):
 
 
 def test_product_backend_bypasses_generic_segmentation(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     calls = []
 
@@ -224,7 +224,7 @@ def test_product_backend_bypasses_generic_segmentation(monkeypatch):
             calls.append((text, kwargs.get("seed")))
             return _make_wav_bytes(240), {"backend": "product_explicit_kv"}
 
-    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_SEED", "42")
+    monkeypatch.setenv("OVS_TTS_SEED", "42")
     backend = tts_mod.TRTEdgeLLMTTSBackend()
     backend._ready = True
     backend._product_backend = FakeProductBackend()
@@ -237,7 +237,7 @@ def test_product_backend_bypasses_generic_segmentation(monkeypatch):
 
 
 def test_qwen3_trt_caps_trt_vocoder_frames_and_passes_seed(monkeypatch):
-    import backends.qwen3_trt as qwen3_mod
+    import app.backends.jetson.qwen3_trt as qwen3_mod
 
     captured = {}
 
@@ -271,7 +271,7 @@ def test_qwen3_trt_caps_trt_vocoder_frames_and_passes_seed(monkeypatch):
 
 
 def test_qwen3_trt_collects_streaming_for_long_offline_requests(monkeypatch):
-    import backends.qwen3_trt as qwen3_mod
+    import app.backends.jetson.qwen3_trt as qwen3_mod
 
     class FakeTokenizer:
         def encode(self, text):
@@ -309,7 +309,7 @@ def test_qwen3_trt_collects_streaming_for_long_offline_requests(monkeypatch):
 
 
 def test_qwen3_trt_product_segments_cjk_punctuation(monkeypatch):
-    import backends.qwen3_trt as qwen3_mod
+    import app.backends.jetson.qwen3_trt as qwen3_mod
 
     class FakeTokenizer:
         def encode(self, text):
@@ -349,7 +349,7 @@ def test_qwen3_trt_product_segments_cjk_punctuation(monkeypatch):
 
 
 def test_qwen3_trt_product_segmentation_keeps_ascii_words_and_punctuation():
-    import backends.qwen3_trt as qwen3_mod
+    import app.backends.jetson.qwen3_trt as qwen3_mod
 
     text = "今天我们继续验证千问语音合成在 Jetson 上的稳定性。"
     parts = qwen3_mod._split_product_tts_text(text, max_chars=20)
@@ -361,7 +361,7 @@ def test_qwen3_trt_product_segmentation_keeps_ascii_words_and_punctuation():
 
 
 def test_product_explicit_kv_backend_is_selected_explicitly(monkeypatch, tmp_path):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     calls = []
 
@@ -374,9 +374,9 @@ def test_product_explicit_kv_backend_is_selected_explicitly(monkeypatch, tmp_pat
             return b"wav", {"backend": "product_explicit_kv"}
 
     fake_module = types.SimpleNamespace(Qwen3TRTBackend=FakeProductBackend)
-    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_BACKEND", "product_explicit_kv")
-    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_MODEL_BASE", str(tmp_path / "models" / "qwen3-tts"))
-    monkeypatch.setenv("SEEED_LOCAL_VOICE_TTS_NATIVE_MODULE_DIR", str(tmp_path / "app_overlay"))
+    monkeypatch.setenv("OVS_TTS_BACKEND", "product_explicit_kv")
+    monkeypatch.setenv("OVS_TTS_MODEL_BASE", str(tmp_path / "models" / "qwen3-tts"))
+    monkeypatch.setenv("OVS_TTS_NATIVE_MODULE_DIR", str(tmp_path / "app_overlay"))
     monkeypatch.setattr(tts_mod.importlib, "import_module", lambda name: fake_module)
     monkeypatch.setattr(tts_mod.importlib, "reload", lambda module: module)
 
@@ -393,7 +393,7 @@ def test_product_explicit_kv_backend_is_selected_explicitly(monkeypatch, tmp_pat
 
 
 def test_old_native_fallback_env_no_longer_changes_backend(monkeypatch, tmp_path):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     required = [
         tmp_path / "worker",
@@ -407,6 +407,7 @@ def test_old_native_fallback_env_no_longer_changes_backend(monkeypatch, tmp_path
         path.touch()
 
     monkeypatch.setenv("EDGE_LLM_TTS_NATIVE_FALLBACK", "1")
+    monkeypatch.delenv("OVS_TTS_BACKEND", raising=False)
     monkeypatch.delenv("SEEED_LOCAL_VOICE_TTS_BACKEND", raising=False)
     monkeypatch.delenv("EDGE_LLM_TTS_BACKEND", raising=False)
     monkeypatch.setattr(tts_mod, "TTS_WORKER_BINARY", str(tmp_path / "worker"))
@@ -423,7 +424,7 @@ def test_old_native_fallback_env_no_longer_changes_backend(monkeypatch, tmp_path
 
 
 def test_edgellm_worker_defaults_match_dual_resident_streaming_profile(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
 
@@ -471,7 +472,7 @@ def test_edgellm_worker_defaults_match_dual_resident_streaming_profile(monkeypat
 
 
 def test_edgellm_worker_legacy_v2v_profile_uses_first_frame_fast_window(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
 
@@ -507,7 +508,7 @@ def test_edgellm_worker_legacy_v2v_profile_uses_first_frame_fast_window(monkeypa
 
 
 def test_edgellm_worker_official_profile_uses_upstream_like_streaming_defaults(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
 
@@ -552,7 +553,7 @@ def test_edgellm_worker_official_profile_uses_upstream_like_streaming_defaults(m
 
 
 def test_edgellm_worker_stateful_profile_uses_small_continuous_chunks(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
 
@@ -594,7 +595,7 @@ def test_edgellm_worker_stateful_profile_uses_small_continuous_chunks(monkeypatc
 
 
 def test_edgellm_worker_stateful_balanced_profile_uses_cp13(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
 
@@ -630,7 +631,7 @@ def test_edgellm_worker_stateful_balanced_profile_uses_cp13(monkeypatch):
 
 
 def test_edgellm_worker_stateful_fast_profile_uses_first4(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     captured = {}
 
@@ -664,7 +665,7 @@ def test_edgellm_worker_stateful_fast_profile_uses_first4(monkeypatch):
 
 
 def test_edgellm_worker_stateful_respects_explicit_cp_groups(monkeypatch):
-    import backends.trt_edge_llm_tts as tts_mod
+    import app.backends.jetson.trt_edge_llm_tts as tts_mod
 
     monkeypatch.setenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV", "1")
     monkeypatch.setenv("EDGE_LLM_TTS_PERF_PROFILE", "balanced")

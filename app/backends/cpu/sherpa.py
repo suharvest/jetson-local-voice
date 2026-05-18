@@ -14,6 +14,7 @@ from typing import Optional
 
 import numpy as np
 
+from app.core.language import detect_zh_en
 from app.core.tts_backend import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ _DEFAULT_TTS_DIRS = {
     "zh_en": "/opt/models/matcha-icefall-zh-en",
     "en": "/opt/models/kokoro-multi-lang-v1_0",
 }
-MODEL_DIR = os.environ.get(
+MODEL_DIR = os.environ.get("SHERPA_TTS_MODEL_DIR") or os.environ.get(
     "TTS_MODEL_DIR", _DEFAULT_TTS_DIRS.get(LANGUAGE_MODE, _DEFAULT_TTS_DIRS["zh_en"])
 )
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "cuda")
@@ -78,6 +79,8 @@ class SherpaBackend(TTSBackend):
     @property
     def capabilities(self) -> set[TTSCapability]:
         caps = {TTSCapability.BASIC_TTS, TTSCapability.STREAMING}
+        if LANGUAGE_MODE == "zh_en":
+            caps.add(TTSCapability.MULTI_LANGUAGE)
         if LANGUAGE_MODE == "en":
             caps.add(TTSCapability.MULTI_SPEAKER)
         return caps
@@ -162,6 +165,7 @@ class SherpaBackend(TTSBackend):
             speed = DEFAULT_SPEED
         if pitch_shift is None:
             pitch_shift = PITCH_SHIFT
+        detected_language = detect_zh_en(text, language)
 
         start = time.time()
         audio = self._tts.generate(text, sid=speaker_id, speed=speed)
@@ -179,6 +183,7 @@ class SherpaBackend(TTSBackend):
             "inference_time": round(elapsed, 3),
             "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
             "sample_rate": audio.sample_rate,
+            "language": detected_language,
         }
         return wav_bytes, meta
 
@@ -196,6 +201,7 @@ class SherpaBackend(TTSBackend):
         pitch = kwargs.get("pitch_shift")
         if pitch is None:
             pitch = PITCH_SHIFT
+        language = detect_zh_en(text, kwargs.get("language"))
 
         audio_queue: queue.Queue[bytes | None] = queue.Queue()
 

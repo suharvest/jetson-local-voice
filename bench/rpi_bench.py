@@ -6,7 +6,7 @@ Modes:
   v2v  -- end-to-end: WS push wav -> wait final -> POST /tts/stream -> first audio byte latency.
 
 All output is structured JSON to stdout. Designed to run inside the docker container
-(or against http://localhost:8000 from inside it).
+(or against http://localhost:8621 from inside it).
 """
 from __future__ import annotations
 
@@ -241,7 +241,7 @@ async def _v2v_once(host: str, wav_path: str) -> dict:
     }
 
 
-def bench_v2v(n: int = 3, host: str = "localhost:8000") -> dict:
+def bench_v2v(n: int = 3, host: str = "localhost:8621") -> dict:
     # Prefer a real speech sample shipped with paraformer test_wavs.
     candidates = [
         "/opt/models/paraformer-streaming/test_wavs/0.wav",
@@ -274,7 +274,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["asr", "tts", "v2v"], required=True)
     p.add_argument("--n", type=int, default=5)
-    p.add_argument("--host", default="localhost:8000")
+    p.add_argument("--host", default="localhost:8621")
     args = p.parse_args()
 
     if args.mode == "asr":

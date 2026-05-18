@@ -4,6 +4,7 @@ Discards warmup rows. Drops `error` rows. Computes mean/p50/p95 per metric,
 grouped by (lang, category) where applicable.
 """
 from __future__ import annotations
+from datetime import datetime
 import json
 import statistics as st
 import time
@@ -138,9 +139,9 @@ def render_markdown(scenario: str, summary: dict, raw: list[dict],
 
 
 def save_results(out_dir: Path, scenario: str, raw: list[dict],
-                 summary: dict, memory: dict | None, meta: dict) -> tuple[Path, Path]:
+    summary: dict, memory: dict | None, meta: dict) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     base = out_dir / f"{scenario}_{stamp}"
     json_path = base.with_suffix(".json")
     md_path = base.with_suffix(".md")

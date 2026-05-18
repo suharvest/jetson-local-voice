@@ -5,7 +5,7 @@ Raspberry Pi. This page shows **measured numbers** for each platform so
 you can pick the device that fits your product, not your spec sheet.
 
 All numbers are **local-mode** (client runs on the device, talks to
-`localhost:8000`), so they reflect what your application code will see —
+`localhost:8621`), so they reflect what your application code will see —
 no network noise.
 
 ---
@@ -54,7 +54,25 @@ no network noise.
 
 ---
 
-## Measured numbers (2026-05-13)
+## Release-gate snapshot (2026-05-17)
+
+These are the current deployment-gate results from `bench/product_eval.py`
+against the latest pushed images. Use this table for product selection; the
+older large-sample benchmark tables below remain useful for trend and capacity
+analysis.
+
+| Target | Image / profile | TTS backend | ASR backend | TTS short zh RTF | ASR short zh error | TTS→ASR round-trip | Notes |
+|---|---|---|---|---:|---:|---|---|
+| Jetson Orin Nano | `jetson-v1.12-highperf` / `jetson-zh-en` | `matcha_trt` | `paraformer_trt` | smoke PASS | closed-loop PASS | PASS | Rerun on 2026-05-17 after Paraformer FP32 encoder, profile selection, preroll, and decode fix. Round-trip similarity 1.00 (`你好，今天天气真不错。` -> `你好今天天气真不错`). |
+| RK3588 | `rk-v1.4-closedloop` / `rk3588-default` | `matcha_rknn` hybrid | `rk:qwen3_asr_rk` | 0.161 | 30.8% | PASS | Rerun on 2026-05-17 15:23:34. Release profile uses Matcha acoustic on ORT and Vocos on RKNN/NPU; full RKNN Matcha remains experimental. Round-trip similarity 1.00. |
+| Raspberry Pi 5 | `rpi-v1.0-onnx` / `rpi5-default` | `sherpa` | `sherpa_asr` | 0.172 | 7.7% | PASS | Rerun on 2026-05-17 15:23:34. CPU-only zh+en path, round-trip similarity 0.80. |
+
+Raw reports:
+
+- `bench/product_results/product_eval_20260517-135525.md` — Jetson Orin Nano
+- `bench/product_results/product_eval_20260517-152334.md` — RK3588 and Raspberry Pi 5
+
+## Historical measured numbers (2026-05-13)
 
 ### Speech recognition
 
@@ -170,7 +188,7 @@ duration before they hear anything.
   FLEURS (CC BY 4.0), plus 10 multilingual smoke clips (ja/ko/es/de/fr).
   Same bytes on every device (SHA-256 locked). Hosted at
   [huggingface.co/datasets/harvestsu/seeed-local-voice-perf-corpus](https://huggingface.co/datasets/harvestsu/seeed-local-voice-perf-corpus).
-- **Mode**: client runs on the device against `127.0.0.1:8000` (loopback).
+- **Mode**: client runs on the device against `127.0.0.1:8621` (loopback).
   Eliminates network from the measurement.
 - **Sample size**: warmup 5 + 10 steady runs per group. p50 reported.
 - **Reproducible**: `bench/perf/run_on_device.sh <node> -- <scenario>`

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Seeed Local Voice 设备性能对比</title>
+<title>OpenVoiceStream 设备性能对比</title>
 <style>
   :root {
     --bg: #fafafa;
@@ -188,7 +188,7 @@
 <div class="wrap">
 
 <header>
-  <h1>Seeed Local Voice · 设备性能对比</h1>
+  <h1>OpenVoiceStream · 设备性能对比</h1>
   <div class="subtitle">同一套 HTTP/WS API，按你的产品场景挑硬件 —— Jetson / Rockchip / Raspberry Pi</div>
   <div class="meta">实测数据 · 2026-05-13 · 测试方法见末尾</div>
 </header>
@@ -406,7 +406,7 @@
 <ul>
   <li><b>测试集</b>：20 条中英短 + 长音频（FLEURS / CC BY 4.0），另外 10 条多语言（ja/ko/es/de/fr）。所有设备拉同样的字节（SHA-256 锁定）。HuggingFace 仓库：
   <a href="https://huggingface.co/datasets/harvestsu/seeed-local-voice-perf-corpus">harvestsu/seeed-local-voice-perf-corpus</a></li>
-  <li><b>测试模式</b>：客户端跑在设备本机，访问 <code>127.0.0.1:8000</code> 回环 —— 消除网络抖动</li>
+  <li><b>测试模式</b>：客户端跑在设备本机，访问 <code>127.0.0.1:8621</code> 回环 —— 消除网络抖动</li>
   <li><b>样本量</b>：每组 5 次预热 + 10 次稳态，取 P50</li>
   <li><b>可复现</b>：<code>bench/perf/run_on_device.sh &lt;设备&gt; -- &lt;场景&gt;</code> 可在任何设备一键重测</li>
   <li><b>归一化</b>：CER/WER 计算使用 <code>jiwer + cn2an</code>（中文数字阿拉伯-汉字对齐）</li>
@@ -424,8 +424,8 @@
 
 <hr style="margin: 48px 0 16px; border: 0; border-top: 1px solid var(--border);">
 <p class="footnote" style="text-align: center;">
-  Seeed Local Voice · 数据测于 2026-05-13 · 详见
-  <a href="https://github.com/Seeed-Projects/seeed-local-voice">GitHub</a>
+  OpenVoiceStream · 数据测于 2026-05-13 · 详见
+  <a href="https://github.com/Seeed-Projects/openvoicestream">GitHub</a>
 </p>
 
 </div>

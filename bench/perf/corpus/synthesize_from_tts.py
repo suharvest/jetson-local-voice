@@ -6,7 +6,7 @@ Run once on a stable device (Jetson with voice_clone preset) to generate
 to manifest.json. Every other device fetches the same bytes via fetch.py.
 
 Usage:
-  python synthesize_from_tts.py --base-url http://localhost:8000
+  python synthesize_from_tts.py --base-url http://localhost:8621
 """
 from __future__ import annotations
 import argparse, json, sys, wave
@@ -33,7 +33,7 @@ def synthesize(base_url: str, text: str, lang: str, voice: str | None) -> bytes:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://localhost:8000")
+    ap.add_argument("--base-url", default="http://localhost:8621")
     ap.add_argument("--voice", default=None, help="TTS voice id (optional)")
     args = ap.parse_args()
 

@@ -1,21 +1,23 @@
 # syntax=docker/dockerfile:1.6
 #
-# Seeed Local Voice — Rockchip RK3576 / RK3588 NPU edition (slim).
+# OpenVoiceStream — Rockchip RK3576 / RK3588 NPU edition (slim).
 #
 # Target: ~950 MB (down from 1.4 GB). Removes only the two heaviest unused
 # dependency chains: librosa (pulls numba/scipy/scikit-learn ~400 MB) and
 # transformers (pulls safetensors/huggingface_hub ~100 MB).
 #
 # Keeps: Kokoro/Matcha CPU fallback (sherpa-onnx + espeak-ng), Silero VAD
-# (onnxruntime), webrtcvad, tokenizers, rknn-toolkit-lite2.
+# (onnxruntime), webrtcvad, tokenizers, rknn-toolkit-lite2, and pinned
+# Rockchip userspace runtime libraries.
 #
 # Build (from repo root):
-#   docker build -f deploy/docker/Dockerfile.rk -t seeed-local-voice:rk .
+#   docker build -f deploy/docker/Dockerfile.rk -t openvoicestream:rk .
 #
 # Run:
 #   docker compose -f deploy/docker-compose.rk.yml up -d
 #
 # Models are NOT baked in — bind-mount via -v at runtime.
+# RK userspace runtime libraries ARE baked in from deploy/rk-runtime/.
 
 FROM debian:12-slim
 
@@ -71,15 +73,20 @@ RUN pip install --no-cache-dir --index-url ${PIP_INDEX} \
 
 COPY app/                          /opt/speech/app/
 COPY configs/                      /opt/speech/configs/
+COPY deploy/artifacts/             /opt/speech/deploy/artifacts/
 COPY voices/                       /opt/speech/voices/
 COPY scripts/                      /opt/speech/scripts/
 COPY third_party/rkvoice-stream/   /opt/speech/third_party/rkvoice-stream/
+COPY deploy/rk-runtime/            /opt/rk-runtime/
 
 # Install rkvoice-stream as editable.
 RUN pip install --no-cache-dir -e /opt/speech/third_party/rkvoice-stream
 
 # Model dirs (bind-mounted at runtime, not baked)
-RUN mkdir -p /opt/tts/models /opt/asr/models /opt/models
+RUN mkdir -p /opt/tts/models /opt/asr/models /opt/asr/lib /opt/models \
+    && ln -sf /opt/rk-runtime/librknnrt.so /usr/lib/librknnrt.so \
+    && ln -sf /opt/rk-runtime/librkllmrt.so /opt/asr/lib/librkllmrt.so \
+    && ln -sf /opt/rk-runtime/librkllmrt.so /usr/lib/librkllmrt.so
 
 # Strip bytecode caches
 RUN find /opt/speech /opt/venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; :
@@ -87,10 +94,14 @@ RUN find /opt/speech /opt/venv -type d -name __pycache__ -exec rm -rf {} + 2>/de
 ENV MODEL_DIR=/opt/models \
     TTS_MODEL_DIR=/opt/tts/models \
     ASR_MODEL_DIR=/opt/asr/models \
-    LD_LIBRARY_PATH=/usr/lib
+    RK_RUNTIME_MANIFEST=/opt/rk-runtime/MANIFEST.json \
+    RKNNRT_LIB_PATH=/usr/lib/librknnrt.so \
+    RKLLM_LIB_PATH=/opt/asr/lib/librkllmrt.so \
+    RK_RUNTIME_STRICT=1 \
+    LD_LIBRARY_PATH=/opt/rk-runtime:/opt/asr/lib:/usr/lib
 
-LABEL org.opencontainers.image.title="Seeed Local Voice (Rockchip)" \
-      org.opencontainers.image.source="https://github.com/suharvest/seeed-local-voice" \
+LABEL org.opencontainers.image.title="OpenVoiceStream (Rockchip)" \
+      org.opencontainers.image.source="https://github.com/suharvest/openvoicestream" \
       org.opencontainers.image.description="Speech service on Rockchip NPU (RK3576 / RK3588)"
 
 WORKDIR /opt/speech

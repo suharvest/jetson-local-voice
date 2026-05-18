@@ -84,15 +84,23 @@ def _get_asr_executor() -> ThreadPoolExecutor:
 
 
 def _default_vad_backend() -> str:
-    return os.environ.get("SEEED_LOCAL_VOICE_VAD_BACKEND", "silero").strip() or "silero"
+    return (
+        os.environ.get("OVS_VAD_BACKEND")
+        or os.environ.get("SEEED_LOCAL_VOICE_VAD_BACKEND")
+        or "silero"
+    ).strip() or "silero"
 
 
 def _default_vad_silence_ms() -> int:
-    raw = os.environ.get("SEEED_LOCAL_VOICE_VAD_SILENCE_MS", "400")
+    raw = (
+        os.environ.get("OVS_VAD_SILENCE_MS")
+        or os.environ.get("SEEED_LOCAL_VOICE_VAD_SILENCE_MS")
+        or "400"
+    )
     try:
         value = int(raw)
     except ValueError:
-        logger.warning("Invalid SEEED_LOCAL_VOICE_VAD_SILENCE_MS=%r; using 400", raw)
+        logger.warning("Invalid OVS_VAD_SILENCE_MS/SEEED_LOCAL_VOICE_VAD_SILENCE_MS=%r; using 400", raw)
         return 400
     return max(0, value)
 
@@ -104,7 +112,7 @@ async def startup():
         from app.core.profile_loader import apply_profile_from_env, current_profile
         apply_profile_from_env()
     except Exception as exc:
-        logger.error("Failed to apply Seeed Local Voice profile: %s", exc)
+        logger.error("Failed to apply OpenVoiceStream profile: %s", exc)
         raise
 
     # Initialise the execution coordinator from the loaded profile's
@@ -112,6 +120,13 @@ async def startup():
     # profile does not declare one — matches the previous behaviour.
     from app.core.coordinator import init_coordinator, get_coordinator
     init_coordinator(current_profile().get("execution_policy", {"mode": "concurrent"}))
+
+    # Rockchip userspace runtime is vendored in the RK image. Validate it
+    # before importing rkvoice-stream backends so version/hash mismatches fail
+    # with a clear operator action instead of opaque native runtime errors.
+    if (current_profile().get("env") or {}).get("LANGUAGE_MODE") == "rk" or os.environ.get("LANGUAGE_MODE") == "rk":
+        from app.core.rk_runtime import check_rk_runtime
+        check_rk_runtime(current_profile())
 
     # Log language mode configuration
     language_mode = os.environ.get("LANGUAGE_MODE", "zh_en")
@@ -580,7 +595,7 @@ async def asr_stream(
     ws: WebSocket,
     language: str = "auto",
     sample_rate: int = 16000,
-    vad: Optional[str] = None,           # default from SEEED_LOCAL_VOICE_VAD_BACKEND
+    vad: Optional[str] = None,           # default from OVS_VAD_BACKEND
     vad_silence_ms: Optional[int] = None,
 ):
     """Streaming ASR via WebSocket.
@@ -760,24 +775,21 @@ async def _asr_stream_backend(
 
     except WebSocketDisconnect:
         logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)
-    except WebSocketDisconnect:
-        logger.debug("ASR stream client disconnected (backend=%s)", asr_be.name)
     except Exception as e:
         logger.error("ASR stream error (backend=%s): %s", asr_be.name, e, exc_info=True)
-        # Surface the error to the client as a structured frame if the socket is
-        # still connected. Skip if the peer already disconnected (common with
-        # slow finalize backends like TRT-EdgeLLM on Jetson).
-        if not isinstance(e, (WebSocketDisconnect, RuntimeError)):
-            try:
-                await ws.send_json({
-                    "type": "error",
-                    "error": f"{type(e).__name__}: {e}",
-                    "backend": asr_be.name,
-                    "is_final": True,
-                    "is_stable": True,
-                })
-            except Exception:
-                pass
+        # Surface backend failures to clients as structured terminal frames.
+        # Otherwise benchmark clients only observe a socket close and lose the
+        # actual failure reason.
+        try:
+            await ws.send_json({
+                "type": "error",
+                "error": f"{type(e).__name__}: {e}",
+                "backend": asr_be.name,
+                "is_final": True,
+                "is_stable": True,
+            })
+        except Exception:
+            pass
     finally:
         try:
             await ws.close()
@@ -845,8 +857,24 @@ async def v2v_stream(ws: WebSocket):
                             "error": "first message must be a config frame"})
         await ws.close(code=1003); return
 
-    asr_language    = cfg.get("asr_language")  # e.g. "zh" / "Chinese" / "en" / None
-    tts_language    = cfg.get("tts_language")
+    asr_language    = cfg.get("asr_language")  # e.g. "zh" / "Chinese" / "en" / "auto" / None
+    tts_language    = cfg.get("tts_language")  # truthy = enable TTS; "auto" = let backend detect
+    # "auto" enables TTS but tells downstream (sentence buffer + backend) to
+    # not assume a language — backends with auto-detect (e.g. qwen3) will pick
+    # one from the text content; SentenceBuffer falls back to a regex splitter.
+    tts_language_norm = None if tts_language == "auto" else tts_language
+    # Normalize common client-supplied aliases to the lowercase full names
+    # qwen3 TTS expects ("chinese"/"english"/...). Sherpa TTS ignores the
+    # value entirely, so this is a no-op there.
+    if tts_language_norm:
+        _TTS_LANG_ALIAS = {
+            "zh": "chinese", "zh-cn": "chinese", "zh-hans": "chinese",
+            "en": "english", "en-us": "english", "en-gb": "english",
+            "ja": "japanese", "jp": "japanese",
+            "ko": "korean", "kr": "korean",
+        }
+        key = tts_language_norm.strip().lower()
+        tts_language_norm = _TTS_LANG_ALIAS.get(key, key)
     tts_voice       = cfg.get("tts_voice")
     tts_speed       = cfg.get("tts_speed")
     sample_rate     = int(cfg.get("sample_rate", 16000))
@@ -899,7 +927,7 @@ async def v2v_stream(ws: WebSocket):
                                 "error": "tts_language requested but no streaming TTS backend ready"})
             await ws.close(code=1011); return
         tts_be = tts_service.get_backend()
-        tts_buffer = v2v_proto.SentenceBuffer(language=tts_language)
+        tts_buffer = v2v_proto.SentenceBuffer(language=tts_language_norm)
 
     logger.info("v2v stream opened (asr=%s tts=%s vad=%s)",
                 asr_language or "off", tts_language or "off", vad_backend if asr_language else "off")
@@ -1124,7 +1152,7 @@ async def v2v_stream(ws: WebSocket):
 
             def _run_synth(s):
                 try:
-                    stream_kwargs = {"language": tts_language}
+                    stream_kwargs = {"language": tts_language_norm}
                     if tts_voice is not None:    stream_kwargs["voice"] = tts_voice
                     if tts_speed is not None:    stream_kwargs["speed"] = tts_speed
                     for chunk in tts_be.generate_streaming(s, **stream_kwargs):

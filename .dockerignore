@@ -2,6 +2,14 @@ wheels/
 benchmarks/
 media/
 deploy/
+!deploy/docker/
+!deploy/docker/**
+!deploy/artifacts/
+!deploy/artifacts/**
+!deploy/jetson-workers/
+!deploy/jetson-workers/**
+!deploy/rk-runtime/
+!deploy/rk-runtime/**
 .git/
 *.md
 LICENSE

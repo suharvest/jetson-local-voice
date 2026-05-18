@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seeed Local Voice — unified perf harness.
+"""OpenVoiceStream — unified perf harness.
 
 Five scenarios, all output one JSON + one Markdown report under results/:
   perf.py asr        --base-url ... --runs 10 --warmup 3
@@ -161,12 +161,13 @@ def cmd_concurrent(args):
         rows = run_concurrent(asr, tts, corpus, prompts,
                               parallel=args.parallel,
                               runs_per_worker=args.runs,
-                              mode=args.mode)
+                              mode=args.mode,
+                              eos_mode=args.eos)
     summary = summarize(rows, group_by=("kind",),
                         metrics=("rtf", "tfd_ms", "wall_ms",
                                  "eos_to_final_ms", "total_ms"))
     meta = {**_common_meta(args, "concurrent"),
-            "parallel": args.parallel, "mode": args.mode}
+            "parallel": args.parallel, "mode": args.mode, "eos": args.eos}
     jp, mp = save_results(RESULTS_DIR,
                           _scenario_tag(args, f"concurrent_{args.mode}_p{args.parallel}"),
                           rows, summary, mem.summary(), meta)
@@ -330,7 +331,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common(sp):
-        sp.add_argument("--base-url", default="http://localhost:8000")
+        sp.add_argument("--base-url", default="http://localhost:8621")
         sp.add_argument("--container", default=None,
                         help="docker container name for memory sampling")
         sp.add_argument("--warmup", type=int, default=3)
@@ -347,7 +348,7 @@ def main():
     sp_asr.add_argument("--eos", choices=["forced", "vad", "eou"], default="forced")
     sp_asr.add_argument("--chunk-ms", type=int, default=250)
     sp_asr.add_argument("--vad-backend", choices=["silero", "webrtcvad"], default="silero",
-                        help="server-side VAD query param for --eos vad on seeed-local-voice")
+                        help="server-side VAD query param for --eos vad on OpenVoiceStream")
     sp_asr.add_argument("--vad-silence-ms", type=int, default=400)
     sp_asr.add_argument("--realtime", action="store_true", default=True)
     sp_asr.add_argument("--no-realtime", dest="realtime", action="store_false")
@@ -365,7 +366,7 @@ def main():
     sp_v2v.add_argument("--voice", default=None)
     sp_v2v.add_argument("--chunk-ms", type=int, default=250)
     sp_v2v.add_argument("--vad-backend", choices=["silero", "webrtcvad"], default="silero",
-                        help="server-side VAD query param for --eos vad on seeed-local-voice")
+                        help="server-side VAD query param for --eos vad on OpenVoiceStream")
     sp_v2v.add_argument("--vad-silence-ms", type=int, default=400)
     sp_v2v.add_argument("--realtime", action="store_true", default=True)
     sp_v2v.add_argument("--no-realtime", dest="realtime", action="store_false")
@@ -384,6 +385,7 @@ def main():
     sp_con.add_argument("--mode", default="asr_tts_simul",
                         choices=["asr_only", "tts_only", "asr_tts_simul"])
     sp_con.add_argument("--voice", default=None)
+    sp_con.add_argument("--eos", choices=["forced", "vad", "eou"], default="forced")
     sp_con.set_defaults(func=cmd_concurrent)
 
     sp_mat = sub.add_parser("matrix"); add_common(sp_mat)
@@ -397,7 +399,7 @@ def main():
     sp_ab.add_argument("--voice", default=None)
     sp_ab.add_argument("--chunk-ms", type=int, default=250)
     sp_ab.add_argument("--vad-backend", choices=["silero", "webrtcvad"], default="silero",
-                       help="server-side VAD query param for --eos vad on seeed-local-voice")
+                       help="server-side VAD query param for --eos vad on OpenVoiceStream")
     sp_ab.add_argument("--vad-silence-ms", type=int, default=400)
     sp_ab.add_argument("--realtime", action="store_true", default=True)
     sp_ab.add_argument("--no-realtime", dest="realtime", action="store_false")
@@ -411,14 +413,14 @@ def main():
     sp_noise.set_defaults(func=cmd_noise)
 
     sp_stab = sub.add_parser("stability")
-    sp_stab.add_argument("--base-url", default="http://localhost:8000")
+    sp_stab.add_argument("--base-url", default="http://localhost:8621")
     sp_stab.add_argument("--container", default=None)
     sp_stab.add_argument("--duration-min", type=float, default=30.0)
     sp_stab.add_argument("--mode", choices=["asr", "tts", "v2v"], default="v2v")
     sp_stab.set_defaults(func=cmd_stability)
 
     sp_clone = sub.add_parser("clone")
-    sp_clone.add_argument("--base-url", default="http://localhost:8000")
+    sp_clone.add_argument("--base-url", default="http://localhost:8621")
     sp_clone.add_argument("--container", default=None)
     sp_clone.add_argument("--refs", required=True,
                           help="dir of reference voice WAVs (e.g., bench/perf/corpus/voices)")
@@ -431,7 +433,7 @@ def main():
     sp_clone.set_defaults(func=cmd_clone)
 
     sp_boot = sub.add_parser("boot")
-    sp_boot.add_argument("--base-url", default="http://localhost:8000")
+    sp_boot.add_argument("--base-url", default="http://localhost:8621")
     sp_boot.add_argument("--container", required=True)
     sp_boot.add_argument("--runs", type=int, default=3)
     sp_boot.add_argument("--health-path", default="/health")
