@@ -731,6 +731,15 @@ class BaseApp:
             # later reset state out from under whatever dispatch we're
             # about to run.
             self._cancel_asr_watchdog()
+            # Clear the per-turn EOS dedupe flag for ALL final paths
+            # (duplicate-of-streamed, empty, and real). Previously it was
+            # only reset in the non-empty branch below, so a duplicate or
+            # empty final would leave the flag set and the next turn's
+            # send_asr_eos_once would early-return → SLV never receives
+            # EOS → no final → state stuck THINKING forever (worse than
+            # the empty-final bug the watchdog was designed to catch,
+            # because the watchdog never even arms).
+            self._eos_sent_this_turn = False
             if evt.duplicate_of_streamed:
                 return
             # SLV closes the WS after every asr_eos-triggered final
